@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MyCraft",
+  "mainBinaryName": "MyCraft",
+  "version": "../package.json",
+  "identifier": "com.mycraft.game",
+  "build": {
+    "beforeBuildCommand": "node scripts/check-desktop.mjs",
+    "beforeDevCommand": "",
+    "devUrl": "http://localhost:8080",
+    "frontendDist": "../public"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "url": "index.html",
+        "devtools": false,
+        "title": "MyCraft",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "capabilities": ["default"],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "Game",
+    "shortDescription": "Clone de Minecraft en monde procédural.",
+    "longDescription": "MyCraft génère un monde de blocs infini : minage, construction, textures procédurales et textures personnalisées importées depuis votre disque.",
+    "copyright": "© MyCraft",
+    "icon": ["icons/icon.png", "icons/icon.ico"]
+  }
+}

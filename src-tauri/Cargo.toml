@@ -1,0 +1,22 @@
+[package]
+name = "mycraft"
+version = "1.0.0"
+description = "MyCraft, clone de Minecraft en monde procédural"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+# Le format de sauvegarde est validé côté Rust comme côté Express. Ces deux caisses
+# sont déjà dans l'arbre de dépendances de Tauri : rien de nouveau à télécharger.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,6 @@
+# Le SDK Windows distribué par xwin n'embarque pas les .pdb du CRT : lld-link
+# émet ~40 avertissements LNK4099 par lien, qui masquent les vraies erreurs.
+# En release tout est stripé de toute façon, ces informations de débogage sont
+# sans usage ici.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/IGNORE:4099"]

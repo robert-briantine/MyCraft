@@ -1,0 +1,20 @@
+node_modules/
+
+# Artefacts de build
+release/
+/build/
+/src-tauri/target/
+/src-tauri/gen/schemas/
+
+# Le lien .build-tools/bin/clang-cl est posé par scripts/build-desktop.sh
+.build-tools/
+
+# Données runtime : saves/ et custom-textures/ sont recréés par server.js
+saves/
+/public/custom-textures/
+
+# Captures et plans de contact produits par les tests
+.qwen/tmp/
+
+*.log
+.DS_Store

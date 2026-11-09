@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Fenêtre de jeu : seule l'ouverture du dialogue natif d'import de textures est autorisée.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}

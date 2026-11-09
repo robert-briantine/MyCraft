@@ -1,0 +1,39 @@
+{
+  "name": "gen",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:e2e": "node tests/village.mjs && node tests/biomes.mjs && node tests/ocean.mjs && node tests/render-collision.mjs && node tests/inventory.mjs && node tests/settings.mjs && node tests/selection.mjs && node tests/persistence.mjs",
+    "test:inventory": "node tests/inventory.mjs",
+    "test:selection": "node tests/selection.mjs",
+    "test:settings": "node tests/settings.mjs",
+    "test:persistence": "node tests/persistence.mjs",
+    "test:village": "node tests/village.mjs",
+    "test:ocean": "node tests/ocean.mjs",
+    "test:biomes": "node tests/biomes.mjs",
+    "test:report": "node tests/contact-sheet.mjs",
+    "check:desktop": "node scripts/check-desktop.mjs",
+    "desktop:icons": "python3 scripts/make-icons.py",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "bash scripts/build-desktop.sh",
+    "desktop:build:portable": "bash scripts/build-desktop.sh --portable",
+    "desktop:build:installer": "bash scripts/build-desktop.sh --installer",
+    "desktop:build:sign": "bash scripts/build-desktop.sh --sign"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "multer": "^2.4.0",
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "playwright-core": "^1.64.1"
+  }
+}
