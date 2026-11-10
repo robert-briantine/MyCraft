@@ -25,10 +25,12 @@ async function loadPublicModule(relative) {
   }
 }
 
-const { createVillageGen, VILLAGE, storeysOf } = await loadPublicModule('public/js/village.js');
+const { createVillageGen, VILLAGE, storeysOf, hauteurPourEtages } = await loadPublicModule('public/js/village.js');
 
 const CHUNK_SIZE = 16;
-const CHUNK_HEIGHT = 64;
+// Même plafond que le jeu : une catégorie d'immeuble jugée sous un plafond plus bas
+// retomberait de elle-même, et le test ne verrait plus la skyline demandée.
+const CHUNK_HEIGHT = 80;
 const BLOCK = {
   AIR: 0, GRASS: 1, DIRT: 2, STONE: 3, COBBLE: 4, PLANKS: 5,
   BRICK: 6, GLASS: 7, GRIT: 8, OBSIDIAN: 9, LOG: 10, LEAVES: 11,
@@ -217,6 +219,277 @@ const surRoute = [...plans.entries()].find(([key, p]) => {
 });
 check('aucun bâtiment n’est posé sur une route ou un caniveau', !surRoute, surRoute ? surRoute[0] : '');
 
+// ------------------------------------------------------------ la cour du bâti
+{
+  // Demandé le 2026-11-09 : « je voudrais que chaque bâtiment ait une cour qui l'entoure
+  // pour assurer l'accès à l'intérieur, cette cour doit faire deux cubes de large ». La
+  // cour se juge en coordonnées monde et sur tout le voisinage : l'emprise qui bouche une
+  // cour peut fort bien appartenir au tronçon d'à côté, qu'un contrôle par tronçon ne voit
+  // jamais.
+  const pad = VILLAGE.courtWidth;
+  const empreintes = [...plans.entries()].map(([key, p]) => {
+    const [cx, cz] = chunkOf(key);
+    return {
+      key,
+      x0: cx * CHUNK_SIZE + p.x0, z0: cz * CHUNK_SIZE + p.z0,
+      x1: cx * CHUNK_SIZE + p.x0 + p.w - 1, z1: cz * CHUNK_SIZE + p.z0 + p.d - 1,
+    };
+  });
+
+  // Une feuille est solide dans ce jeu : un tronc planté dans la cour murait le passage.
+  // On rejoue donc la végétation avec le prédicat que le jeu lui injecte.
+  const { createBiomeGen } = await loadPublicModule('public/js/biomes.js');
+  const foret = createBiomeGen({
+    BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, roll: hashRoll, saltBase: 5 * 7919,
+    isBlocked: (wx, wz) => gen.blocksVegetation(wx, wz),
+  });
+
+  const surRue = [];
+  const collées = [];
+  const souches = [];
+  let coursJugees = 0;
+  for (const e of empreintes) {
+    coursJugees++;
+    for (let wx = e.x0 - pad; wx <= e.x1 + pad; wx++) {
+      for (let wz = e.z0 - pad; wz <= e.z1 + pad; wz++) {
+        const dansLaCour = wx < e.x0 || wx > e.x1 || wz < e.z0 || wz > e.z1;
+        if (!dansLaCour) continue;
+        if (gen.roadKind(wx, wz) && surRue.length < 3) surRue.push(`(${wx},${wz}) cour ${e.key}`);
+        const autre = empreintes.find((o) => o.key !== e.key
+          && wx >= o.x0 && wx <= o.x1 && wz >= o.z0 && wz <= o.z1);
+        if (autre && collées.length < 3) collées.push(`(${wx},${wz}) ${e.key} contre ${autre.key}`);
+        if (foret.treeAt(wx, wz) && souches.length < 3) souches.push(`(${wx},${wz}) cour ${e.key}`);
+      }
+    }
+  }
+  // Les temples aussi ont droit à leur cour. Ils ne sont pas dans `plans` — ils sont
+  // posés par une autre chaîne, après routes et maisons — et leurs règles propres (parvis,
+  // degré) prédataient la cour de deux cubes : mesuré sur le monde du jeu, un cottage se
+  // logeait à une colonne du parvis. On juge donc la **pierre posée** (`templeStone`, hors
+  // tampon de végétation) cellule par cellule, non la boîte englobante de l'ouvrage, qui
+  // inclut le couloir du degré et ferait croire à une invasion là où il n'y a que de l'air.
+  const bornes = empreintes.reduce((a, e) => ({
+    x0: Math.min(a.x0, e.x0), z0: Math.min(a.z0, e.z0),
+    x1: Math.max(a.x1, e.x1), z1: Math.max(a.z1, e.z1),
+  }), { x0: Infinity, z0: Infinity, x1: -Infinity, z1: -Infinity });
+  const pierres = [];
+  for (const t of gen.templesSur(bornes.x0, bornes.z0, bornes.x1, bornes.z1)) {
+    const r = t.half + VILLAGE.templeSteps + 6;
+    const cellules = [];
+    for (let wx = t.ex - r; wx <= t.ex + r; wx++) {
+      for (let wz = t.ez - r; wz <= t.ez + r; wz++) if (gen.templeStone(wx, wz)) cellules.push([wx, wz]);
+    }
+    if (cellules.length) pierres.push({ cle: `temple@${t.ex},${t.ez}`, cellules });
+  }
+  const coursTempleBouchees = [];
+  const coursTempleSurRue = [];
+  for (const t of pierres) {
+    for (const [wx, wz] of t.cellules) {
+      if (coursTempleBouchees.length >= 3 && coursTempleSurRue.length >= 3) break;
+      for (let dx = -pad; dx <= pad; dx++) {
+        for (let dz = -pad; dz <= pad; dz++) {
+          const qx = wx + dx, qz = wz + dz;
+          if (gen.templeStone(qx, qz)) continue;            // la pierre du monument elle-même
+          const envahie = empreintes.find((e) => qx >= e.x0 && qx <= e.x1 && qz >= e.z0 && qz <= e.z1);
+          if (envahie && coursTempleBouchees.length < 3) {
+            coursTempleBouchees.push(`(${qx},${qz}) cour de ${t.cle} sous ${envahie.key}`);
+          }
+          const rue = gen.roadKind(qx, qz);
+          if (rue && coursTempleSurRue.length < 3) coursTempleSurRue.push(`(${qx},${qz}) cour de ${t.cle} sur ${rue}`);
+        }
+      }
+    }
+  }
+  const coursSurPierre = [];
+  for (const e of empreintes) {
+    if (coursSurPierre.length >= 3) break;
+    for (let wx = e.x0 - pad; wx <= e.x1 + pad; wx++) {
+      for (let wz = e.z0 - pad; wz <= e.z1 + pad; wz++) {
+        if (wx >= e.x0 && wx <= e.x1 && wz >= e.z0 && wz <= e.z1) continue;
+        if (gen.templeStone(wx, wz)) coursSurPierre.push(`(${wx},${wz}) cour ${e.key} sur la pierre d'un temple`);
+      }
+    }
+  }
+  // Le prédicat doit aussi se vérifier lui-même : sinon une porte ouverte dans
+  // `blocksVegetation` laisserait pousser la forêt dans les cours sans que le contrôle
+  // ci-dessus ne bronche (le nombre de souches candidates dépend du relief testé).
+  const coursNonGardées = [];
+  for (const e of empreintes) {
+    for (let wx = e.x0 - pad; wx <= e.x1 + pad && coursNonGardées.length < 3; wx++) {
+      for (let wz = e.z0 - pad; wz <= e.z1 + pad; wz++) {
+        if (wx >= e.x0 && wx <= e.x1 && wz >= e.z0 && wz <= e.z1) continue;
+        if (!gen.blocksVegetation(wx, wz)) {
+          coursNonGardées.push(`(${wx},${wz}) cour ${e.key}`);
+          break;
+        }
+      }
+    }
+  }
+  // Une cour est un passage, pas un couloir fermé sur le ciel : quatre cubes d'air au
+  // dessus de ce sur quoi on marche, comme sous un pont ou le long d'une avenue.
+  const sousPoutre = [];
+  for (const [key, p] of plans.entries()) {
+    if (sousPoutre.length >= 3) break;
+    const [cx, cz] = chunkOf(key);
+    const data = emptyData();
+    if (!gen.stampRoads(data, cx, cz) && !gen.stampBuilding(data, cx, cz)) continue;
+    gen.stampStructures(data, cx, cz);
+    const sonde = (lx, lz) => {
+      if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) return;
+      for (let y = Math.min(CHUNK_HEIGHT - VILLAGE.headroom - 1, p.siteH + p.height + 4);
+        y >= Math.max(0, p.siteH - 4); y--) {
+        if (data[idx(lx, y, lz)] === BLOCK.AIR) continue;
+        for (let k = 1; k <= VILLAGE.headroom; k++) {
+          if (y + k >= CHUNK_HEIGHT) break;
+          if (data[idx(lx, y + k, lz)] !== BLOCK.AIR) {
+            sousPoutre.push(`chunk ${cx},${cz} (${lx},${lz}) bouché à y=${y + k}`);
+            return;
+          }
+        }
+        return;
+      }
+    };
+    for (let lx = p.x0 - pad; lx < p.x0 + p.w + pad; lx++) {
+      for (let lz = p.z0 - pad; lz < p.z0 + p.d + pad; lz++) {
+        if (lx >= p.x0 && lx < p.x0 + p.w && lz >= p.z0 && lz < p.z0 + p.d) continue;
+        sonde(lx, lz);
+      }
+    }
+  }
+
+  const detail = (liste, mot) => `${liste.length} ${mot}`
+    + (liste.length ? ` — ${liste.join(' | ')}` : '');
+  check('chaque bâtiment est ceint d’une cour libre de deux cubes',
+    coursJugees > 40 && !surRue.length && !collées.length,
+    `${coursJugees} cours jugées · ${detail(surRue, 'colonnes sur voirie')}`
+    + ` · ${detail(collées, 'emprises collées')}`);
+  check('la cour est gardée par le prédicat de végétation', !coursNonGardées.length,
+    detail(coursNonGardées, 'cour non gardée'));
+  check('aucun arbre ne pousse dans une cour', !souches.length, detail(souches, 'souche'));
+  check('la cour laisse le garde-tête libre', !sousPoutre.length, detail(sousPoutre, 'passage bouché'));
+  check('la cour d’un temple reste libre de bâti et de voirie',
+    pierres.length >= 2 && !coursTempleBouchees.length && !coursTempleSurRue.length,
+    `${pierres.length} temple(s) jugés · ${detail(coursTempleBouchees, 'empiètements')}`
+    + ` · ${detail(coursTempleSurRue, 'colonnes sur voirie')}`);
+  check('aucune emprise ne touche la pierre d’un temple', !coursSurPierre.length,
+    detail(coursSurPierre, 'cour sur pierre'));
+
+  // Le trait de limite. L'arbitrage « seulement dégagée » laisse la cour en terre : pour
+  // qu'elle se lise d'en haut, une assise de pierre à plat en dessine le pourtour. On
+  // rejoue l'estampage sur un terrain rempli comme le fait le jeu — la bordure ne prend
+  // que sur un sol nu sous de l'air libre. Une colonne qui porte autre chose (chaussée,
+  // tablier, seuil pavé, pierre du monument) n'est pas un oubli.
+  const NU = [BLOCK.GRASS, BLOCK.DIRT, BLOCK.SAND, BLOCK.GRIT, BLOCK.MOSS, BLOCK.SNOW];
+  const tamponsCour = new Map();
+  function mondeCour(cx, cz) {
+    const cle = `${cx},${cz}`;
+    let d = tamponsCour.get(cle);
+    if (!d) {
+      d = emptyData();
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+          const h = Math.min(CHUNK_HEIGHT - 1, heightAt(cx * CHUNK_SIZE + lx, cz * CHUNK_SIZE + lz));
+          for (let y = 0; y <= h; y++) d[idx(lx, y, lz)] = y === h ? BLOCK.GRASS : BLOCK.STONE;
+        }
+      }
+      gen.stampRoads(d, cx, cz);
+      gen.stampBuilding(d, cx, cz);
+      gen.stampStructures(d, cx, cz);
+      tamponsCour.set(cle, d);
+    }
+    return d;
+  }
+  const blocCour = (wx, y, wz) => {
+    if (y < 0 || y >= CHUNK_HEIGHT) return BLOCK.AIR;
+    const cx = Math.floor(wx / CHUNK_SIZE);
+    const cz = Math.floor(wz / CHUNK_SIZE);
+    return mondeCour(cx, cz)[idx(wx - cx * CHUNK_SIZE, y, wz - cz * CHUNK_SIZE)];
+  };
+  /** Le sol réellement posé dans une colonne de cour : le sommet d'une MASSE CONTINUE, en
+   *  descendant depuis le haut de ce que le nivellement peut atteindre (il hausse jusqu'au
+   *  déblai qu'un socle supporterait, ne creuse que d'un cube). Le premier bloc plein ne
+   *  suffit pas : au droit d'une porte, le linteau cloué trois cubes au-dessus du seuil
+   *  n'est pas un sol — il ferait voir un ressaut là où la bande est de niveau. */
+  function solDeCour(wx, wz) {
+    const h = heightAt(wx, wz);
+    const plein = (y) => {
+      const b = blocCour(wx, y, wz);
+      return b !== BLOCK.AIR && b !== BLOCK.WATER;
+    };
+    for (let y = Math.min(CHUNK_HEIGHT - 2, h + VILLAGE.maxReliefHouse + 4); y >= Math.max(2, h - 3); y--) {
+      if (plein(y) && plein(y - 1) && plein(y - 2)) return y;
+    }
+    return null;
+  }
+  // Ce qui n'est pas une cour à niveler : voirie, emprise, pierre du monument. Ces colonnes
+  // font borne, le reste vient s'y adosser.
+  const estNue = (wx, wz) => !gen.isOccupied(wx, wz) && !gen.templeStone(wx, wz);
+  // La marche d'appui devant une porte est une surface déclarée, comme la chaussée ou la berge :
+  // elle tient le niveau du seuil pour que la baie ne donne pas dans le vide, quand bien même la
+  // cour soudée avec ses voisines descendrait plus bas. Relevée aussi hors de la fenêtre échantillonnée :
+  // la marche d'un bâtiment voisin non collecté n'est pas un ressaut de cette cour.
+  const paliersDePorte = new Set();
+  for (const [clePlan, p] of scanPlans(gen, RADIUS + 2)) {
+    if (!p.door) continue;
+    const [pcx, pcz] = chunkOf(clePlan);
+    for (const c of [p.door.front, p.door.out]) {
+      if (!c) continue;
+      paliersDePorte.add(`${pcx * CHUNK_SIZE + c.lx},${pcz * CHUNK_SIZE + c.lz}`);
+    }
+  }
+
+  let traitsJuges = 0;
+  let traitsMarques = 0;
+  const traitsOublies = [];
+  // Et le niveau : deux colonnes voisines d'une même cour ne doivent pas se regarder de plus
+  // d'un cube — « la bande autour de bâtiment doit être du même niveau, pas d'escalier
+  // autour d'un bâtiment sur une longueur de 2 cubes ».
+  const ressauts = [];
+  let coursJugeesNiveau = 0;
+  for (const e of empreintes) {
+    const plan = plans.get(e.key);
+    const rives = new Map();
+    for (let wx = e.x0 - pad; wx <= e.x1 + pad; wx++) {
+      for (let wz = e.z0 - pad; wz <= e.z1 + pad; wz++) {
+        if (wx >= e.x0 && wx <= e.x1 && wz >= e.z0 && wz <= e.z1) continue;
+        const t = solDeCour(wx, wz);
+        if (t === null) continue;                                  // flaque : rien à niveler
+        const surLeTrait = wx === e.x0 - pad || wx === e.x1 + pad || wz === e.z0 - pad || wz === e.z1 + pad;
+        if (surLeTrait && estNue(wx, wz)) {
+          traitsJuges++;
+          const dessus = blocCour(wx, t, wz);
+          if (dessus === BLOCK.STONE) traitsMarques++;
+          else if (NU.includes(dessus) && traitsOublies.length < 3) {
+            traitsOublies.push(`(${wx},${wz}) cour ${e.key} restée en ${dessus}`);
+          }
+        }
+        if (!estNue(wx, wz)) continue;
+        if (paliersDePorte.has(`${wx},${wz}`)) continue;
+        rives.set(`${wx},${wz}`, t);
+      }
+    }
+    coursJugeesNiveau++;
+    for (const [cle, t] of rives) {
+      const virgule = cle.indexOf(',');
+      const x = +cle.slice(0, virgule);
+      const z = +cle.slice(virgule + 1);
+      for (const [dx, dz] of [[1, 0], [0, 1]]) {
+        const autre = rives.get(`${x + dx},${z + dz}`);
+        if (autre === undefined || Math.abs(autre - t) <= 1) continue;
+        if (ressauts.length < 3) {
+          ressauts.push(`${e.key} : (${x},${z})=${t} → (${x + dx},${z + dz})=${autre}, seuil ${plan.siteH}`);
+        }
+      }
+    }
+  }
+  check('la limite de la cour est marquée d’une assise de pierre',
+    traitsJuges > 100 && !traitsOublies.length,
+    `${traitsMarques}/${traitsJuges} colonnes marquées · ${detail(traitsOublies, 'limites restées en terre')}`);
+  check('la cour est de niveau, sans escalier sur ses deux cubes',
+    coursJugeesNiveau > 40 && !ressauts.length,
+    `${coursJugeesNiveau} cours jugées · ${detail(ressauts, 'ressaut(s) dans la bande')}`);
+}
+
 const gabaritMaison = [...plans.values()].find((p) => p.kind === 'house'
   && !(p.w >= 4 && p.d >= 4 && p.height >= VILLAGE.houseMinH && p.height <= VILLAGE.houseMaxH));
 const gabaritImmeuble = [...plans.values()].find((p) => p.kind === 'tower'
@@ -263,13 +536,18 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   const roofY = plan.siteH + plan.height + 1;
   const at = (lx, y, lz) => data[idx(lx, y, lz)];
 
-  let dalleOk = true, litOk = true, toitOk = true, toitDegageOk = true, interieurOk = true, faconnOk = true;
+  let dalleOk = true, socleOk = true, toitOk = true, toitDegageOk = true, interieurOk = true, faconnOk = true;
+  let areteVu = false;
   let porte = 0;
   const isPerimeter = (lx, lz) => lx === plan.x0 || lx === plan.x0 + plan.w - 1 || lz === plan.z0 || lz === plan.z0 + plan.d - 1;
   for (let lx = plan.x0; lx < plan.x0 + plan.w; lx++) {
     for (let lz = plan.z0; lz < plan.z0 + plan.d; lz++) {
-      if (at(lx, plan.siteH, lz) !== plan.floor) dalleOk = false;
-      if (at(lx, plan.siteH - 1, lz) !== BLOCK.DIRT) litOk = false;
+      // Le bâtiment s'assoit sur une terrasse plate en pierre grise, bordée d'une arête
+      // de rocher : c'est ce qui fait un îlot plutôt qu'une cabane accrochée à la pente.
+      const arete = isPerimeter(lx, lz);
+      if (at(lx, plan.siteH, lz) !== (arete ? BLOCK.COBBLE : plan.floor)) dalleOk = false;
+      if (arete && at(lx, plan.siteH, lz) === BLOCK.COBBLE) areteVu = true;
+      if (at(lx, plan.siteH - 1, lz) !== BLOCK.STONE) socleOk = false;
       if (at(lx, roofY, lz) !== plan.roof) toitOk = false;
       if (at(lx, roofY + 3, lz) !== BLOCK.AIR) toitDegageOk = false;
       if (!isPerimeter(lx, lz) && at(lx, plan.siteH + 1, lz) !== BLOCK.AIR) interieurOk = false;
@@ -280,7 +558,8 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
     }
   }
   check('le bâtiment est estampé', stamped === true, `retour=${stamped}`);
-  check('la dalle repose sur son lit de terre', dalleOk && litOk, `dalle=${dalleOk} lit=${litOk}`);
+  check('la dalle repose sur son socle de pierre', dalleOk && socleOk && areteVu,
+    `dalle=${dalleOk} remplissage=${socleOk} arete=${areteVu}`);
   check('le toit est une dalle pleine dégagée', toitOk && toitDegageOk, `toit=${toitOk} degage=${toitDegageOk}`);
   check('l’intérieur est évidé au rez-de-chaussée', interieurOk, `interieur=${interieurOk}`);
   check('les murs porteurs ferment le bâtiment', faconnOk, `face haute=${faconnOk}`);
@@ -367,22 +646,37 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
     const at = (lx, y, lz) => data[idx(lx, y, lz)];
     const door = plan.door;
     if (!door) { defaut = `${key} : aucune baie de porte`; break; }
-    // Le seuil suit la rue là où elle s'est haussée par ses escaliers : on le cherche
-    // plutôt qu'on ne le suppose, puis la baie et la tête du joueur se comptent depuis lui.
-    const f = door.front;
-    let seuil = plan.siteH;
-    while (seuil < plan.siteH + 4 && at(f.lx, seuil + 1, f.lz) !== BLOCK.AIR) seuil++;
-    if (at(door.lx, seuil + 1, door.lz) !== BLOCK.AIR || at(door.lx, seuil + 2, door.lz) !== BLOCK.AIR) {
-      defaut = `${key} : la baie est bouchée (seuil ${seuil}, plancher ${plan.siteH})`; break;
+    // La baie se juge au plancher intérieur : c'est là que marche le passant et le linteau
+    // est taillé depuis lui. Deux maisons qui se font face occupent parfois les deux mêmes
+    // cellules d'approche avec des seuils différents — juger la baie au niveau relevé de la
+    // rue reviendrait à reprocher au mur son propre linteau.
+    if (at(door.lx, plan.siteH + 1, door.lz) !== BLOCK.AIR || at(door.lx, plan.siteH + 2, door.lz) !== BLOCK.AIR) {
+      defaut = `${key} : la baie est bouchée (plancher ${plan.siteH})`; break;
     }
-    // Côté rue, la porte ne doit donner ni sur un remblai ni sur le vide.
-    const above = [at(f.lx, seuil + 1, f.lz), at(f.lx, seuil + 2, f.lz)];
-    if (above[0] !== BLOCK.AIR || above[1] !== BLOCK.AIR) {
-      defaut = `${key} : entrée obstruée dehors (${above.join('/')})`; break;
+    // Côté rue, la porte ne doit donner ni sur un remblai ni sur le vide — et sur les
+    // deux colonnes de la cour, pas seulement la première : depuis que la cour fait deux
+    // cubes, c'est la seconde qui prend le passant au sortir du seuil pour le mener au
+    // pavé. Le seuil suit la rue là où elle s'est haussée par ses escaliers : on le
+    // cherche plutôt qu'on ne le suppose, mais une seule marche d'appui est admise.
+    for (const palier of [door.front, door.out]) {
+      if (palier.lx < 0 || palier.lx >= CHUNK_SIZE || palier.lz < 0 || palier.lz >= CHUNK_SIZE) continue;
+      let seuil = plan.siteH;
+      while (seuil < plan.siteH + 4 && at(palier.lx, seuil + 1, palier.lz) !== BLOCK.AIR) seuil++;
+      if (seuil > plan.siteH + 1) {
+        defaut = `${key} : sortie obstruee dehors à (${palier.lx},${palier.lz}) (+${seuil - plan.siteH})`; break;
+      }
+      const above = [at(palier.lx, seuil + 1, palier.lz), at(palier.lx, seuil + 2, palier.lz)];
+      if (above[0] !== BLOCK.AIR || above[1] !== BLOCK.AIR) {
+        defaut = `${key} : entrée obstruee dehors à (${palier.lx},${palier.lz}) (${above.join('/')})`; break;
+      }
+      // L'appui peut manquer d'un cube : la bande entière se juge à cette tolérance, et
+      // descendre d'un cube en sortant reste franchissable. Plus bas, la porte donnerait
+      // dans une cuvette.
+      if (at(palier.lx, seuil, palier.lz) === BLOCK.AIR && at(palier.lx, seuil - 1, palier.lz) === BLOCK.AIR) {
+        defaut = `${key} : pas de seuil devant la porte à (${palier.lx},${palier.lz})`; break;
+      }
     }
-    if (at(f.lx, seuil, f.lz) === BLOCK.AIR) {
-      defaut = `${key} : pas de seuil devant la porte`; break;
-    }
+    if (defaut) break;
   }
   check('tout bâtiment a une entrée franchissable depuis la rue', !defaut,
     defaut || `${plans.size} bâtiments vérifiés`);
@@ -508,9 +802,13 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   check('la ville concentre le bâti', villeChunks > 20 && campagneChunks > 20
     && densiteVille > densiteCampagne * 1.8,
   `ville=${densiteVille.toFixed(2)} bâtiment/tronçon, campagne=${densiteCampagne.toFixed(2)}`);
+  // La campagne ne dépasse pas la plus basse des catégories demandées (3 étages), jeu
+  // de un à deux cubes compris : c'est le sens de « leur fréquence diminue avec le
+  // nombre d'etage » et de « hauteur liée à l'influence », pas un chiffre magique.
+  const plafondCampagne = hauteurPourEtages(VILLAGE.towerFloors[0]) + 2;
   check('les tours de ville sont plus hautes que celles de la campagne',
-    tourDeVille >= 14 && tourDeCampagne <= 12 && tourDeVille > tourDeCampagne,
-    `ville=${tourDeVille}, campagne=${tourDeCampagne}`);
+    tourDeVille >= 14 && tourDeCampagne <= plafondCampagne && tourDeVille > tourDeCampagne,
+    `ville=${tourDeVille}, campagne=${tourDeCampagne} (plafond de la plus basse catégorie ${plafondCampagne})`);
   check('le cœur de ville monte jusqu’à dix étages, la campagne reste basse',
     etagesDeVille >= 10 && etagesDeCampagne <= 3,
     `étages max ville=${etagesDeVille} (hauteur ${tourDeVille}), campagne=${etagesDeCampagne} (hauteur ${tourDeCampagne}), un étage = ${VILLAGE.floorPitch} blocs`);
@@ -908,7 +1206,7 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
     };
 
     const r = { avenues: 0, ressauts: 0, premierRessaut: null, gradins: 0, ecartMax: 0,
-                ressautsNaturels: 0, pave: '', palier: '', tete: '' };
+                ressautsNaturels: 0, pave: '', palier: '', tete: '', plat: 0, marche: 0 };
     // Une avenue existe si son propre axe est tracé : sondé à mi-bloc, loin de toute
     // avenue perpendiculaire, `roadSurface` ne répond hors-voirie que si la ligne manque.
     const ligneExiste = (axis, kk) => (axis === 'x'
@@ -932,6 +1230,10 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
         // croisée relève des deux avenues et c'est ce niveau-là que le joueur foule.
         const L = gen.streetLevel(axis, k, i);
         const pave = gen.roadSurface(wx, wz, true);
+        if (precedent !== null) {
+          const d = Math.abs(L - precedent);
+          if (d === 0) r.plat++; else if (d === 1) r.marche++;
+        }
         if (precedent !== null && Math.abs(L - precedent) > 1) {
           r.ressauts++;
           if (!r.premierRessaut) r.premierRessaut = `profil de l'avenue ${axis}${k} colonne ${i} : ${precedent} → ${L}`;
@@ -996,6 +1298,19 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   check('chaque marche laisse le garde-tête libre',
     !surGorges.tete && !surGradins.tete,
     dit('tete') || `${VILLAGE.headroom - 1} cubes dégagés au-dessus du pavé`);
+
+  // Une avenue praticable n'est pas une avenue commode : le joueur ne grimpe pas pour
+  // plaisir. Le relief est conduit à un cube par colonne, mais la chaussée doit rester
+  // plate le plus longtemps possible entre deux reprises.
+  const partPlat = (m) => (m.plat + m.marche ? m.plat / (m.plat + m.marche) : 0);
+  // Seuil calé sur la mesure : avant le lissage et les paliers, la carte de gradins ne
+  // tenait que 56 % de colonnes à plat (45 % des pas étaient une marche) ; elle tient à
+  // 80 % aujourd'hui, la carte à gorges oscillant entre 82 et 85 dans les deux états.
+  check('la chaussée roule à plat plutôt qu\'en escalier continu',
+    partPlat(surGorges) >= 0.8 && partPlat(surGradins) >= 0.72,
+    `paliers : ${Math.round(100 * partPlat(surGorges))}% des colonnes (carte à gorges) et `
+      + `${Math.round(100 * partPlat(surGradins))}% (carte de gradins) sur `
+      + `${surGorges.avenues + surGradins.avenues} avenues parcourues`);
 
   // Déterminisme propre aux ouvrages : ils sont régénérés depuis les seules coordonnées.
   const summarise = (list) => JSON.stringify(list.map(empreinte).sort());
@@ -1097,11 +1412,11 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
     const cz = Math.floor(wz / CHUNK_SIZE);
     return monde(cx, cz)[idx(wx - cx * CHUNK_SIZE, y, wz - cz * CHUNK_SIZE)];
   };
-  // Le monument ne doit rien emprunter aux façades du village : brique, planches et
-  // roche sont les matériaux de la maison ; marbre (neige), sable et or sont ceux du
-  // temple. Confondre les deux, c'est n'avoir « aucun temple » sous les yeux.
-  const MARBRE = [BLOCK.SNOW, BLOCK.SAND, BLOCK.GOLD, BLOCK.MOSS];
-  const MATERIAUX_DU_VILLAGE = [BLOCK.BRICK, BLOCK.PLANKS, BLOCK.COBBLE, BLOCK.WOOD, BLOCK.STONE];
+  // Le monument se lit en pierre, verre et or. Il partage la pierre grise avec les
+  // soubassements du village — ce qui le distingue n'est donc plus une palette étrangère
+  // mais ce qu'aucune maison ne porte : des vitres, des arches entre ses colonnes et un
+  // faîtage doré. Confondre les deux, c'est n'avoir « aucun temple » sous les yeux.
+  const PIERRE_DU_MONUMENT = [BLOCK.STONE, BLOCK.COBBLE, BLOCK.GLASS, BLOCK.GOLD, BLOCK.MOSS];
 
   /**
    * Du chemin jusqu'au parvis, le joueur ne franchit qu'un cube à la fois : on remonte
@@ -1129,7 +1444,7 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
 
   let sansPorte = 0, interieurBouche = 0, toitAbsent = 0, colonnesTropPeu = 0, axeBouche = 0;
   let voiriePrise = 0, bâtiSurParvis = 0, degreRaide = 0, empriseLibre = 0, degreCoupe = 0;
-  let materiauVillage = 0;
+  let sansVitres = 0, sansArches = 0, sansFaitage = 0, galerieBouchee = 0;
   const exemples = [];
   for (const t of temples.slice(0, 8)) {
     const dir = DIRS[t.door];
@@ -1153,24 +1468,48 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
         }
       }
     }
-    if (!MARBRE.includes(bloc(t.ex, haut + 1, t.ez))) toitAbsent++;
-    // Aucun plan du monument ne doit toucher un matériau de maison.
-    if ([t.wall, t.fill, t.roof, t.altar].some((b) => MATERIAUX_DU_VILLAGE.includes(b))) materiauVillage++;
+    if (!PIERRE_DU_MONUMENT.includes(bloc(t.ex, haut + 1, t.ez))) toitAbsent++;
 
-    // La colonnade : un anneau de fûts, et le passage d'axe laissé libre devant la porte.
+    // Vitres : le naos est percé, une colonne sur deux au-dessus du socle. Une salle
+    // close de pierre ne se lit pas comme un sanctuaire.
+    let vitres = 0;
+    for (let dx = -C; dx <= C; dx++) {
+      for (let dz = -C; dz <= C; dz++) {
+        if (Math.max(Math.abs(dx), Math.abs(dz)) !== C) continue;
+        for (let y = t.socle + 4; y <= haut - 1; y++) {
+          if (bloc(t.ex + dx, y, t.ez + dz) === BLOCK.GLASS) vitres++;
+        }
+      }
+    }
+    if (vitres < 8) sansVitres++;
+
+    // La colonnade : un anneau de fûts espacés, leurs arches entre eux, et le passage
+    // d'axe laissé libre devant la porte. Une galerie dont chaque cellule porte de la
+    // pierre à hauteur d'appui n'est plus une colonnade mais un mur — c'est le défaut
+    // qu'a fait apparaître le calage du pas sur la coordonnée absolue.
     let futs = 0;
+    let arches = 0;
+    let vide = 0;
     const R = t.half - 1;
     for (let dx = -R; dx <= R; dx++) {
       for (let dz = -R; dz <= R; dz++) {
         if (Math.max(Math.abs(dx), Math.abs(dz)) !== R) continue;
-        if (MARBRE.includes(bloc(t.ex + dx, t.socle + 2, t.ez + dz))) futs++;
+        const pied = bloc(t.ex + dx, t.socle + 2, t.ez + dz);
+        if (PIERRE_DU_MONUMENT.includes(pied)) futs++;
+        else if (pied === BLOCK.AIR) vide++;
+        if (PIERRE_DU_MONUMENT.includes(bloc(t.ex + dx, haut - 1, t.ez + dz))) arches++;
       }
     }
+    if (arches === 0) sansArches++;
+    const cellulesAnneau = 8 * R;
+    if (vide < cellulesAnneau / 4) galerieBouchee++;
     // Un fût sur `templeColumnPitch` le long des quatre faces, à moitié moins toléré :
     // une colonnade clairsemée ne se lit plus comme un périptère.
     const futsAttendus = 4 * Math.floor((2 * R + 1) / VILLAGE.templeColumnPitch);
     if (futs < futsAttendus / 2) colonnesTropPeu++;
     if (bloc(t.ex + dir.dx * R, t.socle + 2, t.ez + dir.dz * R) !== BLOCK.AIR) axeBouche++;
+    // Le repère que l'on cherche au-dessus des toits : la clé du comble est d'or.
+    if (bloc(t.ex, haut + 1 + VILLAGE.templeRoofPitch * (C + 1), t.ez) !== BLOCK.GOLD) sansFaitage++;
 
     // Le degré ne reprend jamais plus d'un cube par colonne : c'est la règle du joueur.
     let precedent = t.socle;
@@ -1298,8 +1637,14 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   check('aucun temple ne touche une avenue', voiriePrise === 0, `${voiriePrise} cellule(s) de voirie sous un temple`);
   check('aucun bâtiment ne mord sur un parvis', bâtiSurParvis === 0, `${bâtiSurParvis} chevauchement(s)`);
   check('l\'emprise d\'un temple interdit la végétation', empriseLibre === 0, `${empriseLibre} emprise(s) plantable(s)`);
-  check('le temple n\'emprunte aucun matériau du village', materiauVillage === 0,
-    `${materiauVillage} monument(s) bâti(s) avec la brique, les planches ou la roche des maisons`);
+  check('le naos est percé de vitres', sansVitres === 0,
+    `${sansVitres} monument(s) sans aucune ouverture vitrée`);
+  check('des arches relient les colonnes de la galerie', sansArches === 0,
+    `${sansArches} monument(s) sans clé d\'arche entre deux fûts`);
+  check('la galerie reste une galerie, pas un mur', galerieBouchee === 0,
+    `${galerieBouchee} monument(s) dont la colonnade se ferme en mur continu`);
+  check('le faîtage doré coiffe le monument', sansFaitage === 0,
+    `${sansFaitage} monument(s) sans repère doré au sommet`);
 
   const clefs = (g) => {
     const l = [];
@@ -1314,6 +1659,426 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   const jumeau = makeGen(0);
   check('le temple se régénère à l\'identique', clefs(jumeau) === clefs(gen));
   check('changer la graine déplace les temples', clefs(makeGen(4242)) !== clefs(gen));
+}
+
+// ------------------------------------------------- très hautes montagnes
+// « Des zones de la même taille que les océans de très haute montagne sans immeuble et
+// avec quelques maisons ». Jugé sur le VRAI relief du jeu — même bruit, même graine —
+// puisque ces zones sont un effet du relief : une sonde sur le relief synthétique des
+// sections ci-dessus ne rencontrerait jamais ni le massif, ni ses hameaux.
+{
+  const { SimplexNoise } = await loadPublicModule('public/js/noise.js');
+  const { createTerrain } = await loadPublicModule('public/js/terrain.js');
+  const monde = createTerrain({ noise: new SimplexNoise(42), chunkHeight: CHUNK_HEIGHT });
+  const memoH = new Map();
+  const rel = (x, z) => {
+    const k = `${x},${z}`;
+    let v = memoH.get(k);
+    if (v === undefined) { v = monde.heightAt(x, z); memoH.set(k, v); }
+    return v;
+  };
+  const genM = createVillageGen({
+    BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt: rel, roll: hashRoll, saltBase: 0,
+    seaLevel: monde.RELIEF.seaLevel,
+    waterTopAt: (x, z) => monde.waterTopAt(x, z),
+    alpsAt: (x, z) => monde.alpsIntensity(x, z),
+  });
+  // Le même village, mais aveugle au massif : seul ce contre-témoin dit si l'interdit
+  // d'immeuble mord quelque part, au lieu de célébrer une absence qui ne coûtait rien.
+  const genSans = createVillageGen({
+    BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt: rel, roll: hashRoll, saltBase: 0,
+    seaLevel: monde.RELIEF.seaLevel,
+    waterTopAt: (x, z) => monde.waterTopAt(x, z),
+  });
+
+  let massifsSondes = 0;
+  let batiments = 0;
+  let immeubles = 0;
+  let immeublesAveugles = 0;
+  let hameaux = 0;
+  let monuments = 0;
+  let horsBande = null;
+  const exemples = [];
+  // Un tronçon sur deux de part et d'autre de l'origine : assez de pays pour rencontrer
+  // des massifs — ils en couvrent un cinquième — et compter autre chose que trois
+  // maisons, sans que la suite y passe la nuit. Le jugement se prend au centre du
+  // tronçon, comme dans le générateur.
+  for (let cx = -110; cx <= 110; cx += 2) {
+    for (let cz = -110; cz <= 110; cz += 2) {
+      const baseX = cx * CHUNK_SIZE;
+      const baseZ = cz * CHUNK_SIZE;
+      if (genM.alpage(baseX + (CHUNK_SIZE >> 1), baseZ + (CHUNK_SIZE >> 1)) < VILLAGE.alpsWild) continue;
+      massifsSondes++;
+      const plans = genM.buildingAt(cx, cz);
+      if (plans.length) hameaux++;
+      immeublesAveugles += genSans.buildingAt(cx, cz).filter((p) => p.kind === 'tower').length;
+      for (const p of plans) {
+        batiments++;
+        if (p.kind === 'tower') immeubles++;
+        if (exemples.length < 3) exemples.push(`(${baseX},${baseZ}) ${p.kind} ${p.w}×${p.d}×${p.height}`);
+        for (let lx = p.x0; lx < p.x0 + p.w; lx++) {
+          for (let lz = p.z0; lz < p.z0 + p.d; lz++) {
+            const h = rel(baseX + lx, baseZ + lz);
+            if (!horsBande && (h < VILLAGE.hamletMinGround - 1 || h > VILLAGE.hamletMaxGround + 1)) {
+              horsBande = `(${baseX + lx},${baseZ + lz}) sol ${h}, ${p.kind} de (${baseX},${baseZ})`;
+            }
+          }
+        }
+      }
+      for (const t of genM.templesSur(baseX, baseZ, baseX + CHUNK_SIZE - 1, baseZ + CHUNK_SIZE - 1)) {
+        if (genM.alpage(t.ex, t.ez) >= VILLAGE.alpsWild) monuments++;
+      }
+    }
+  }
+  check('les très hautes montagnes existent', massifsSondes > 300,
+    `${massifsSondes} tronçons sondés sous un très haut massif`);
+  check('aucun immeuble ne s\'élève dans un très haut massif',
+    massifsSondes > 300 && immeubles === 0 && immeublesAveugles > 0,
+    `${immeubles} immeuble(s) sur ${batiments} bâtiment(s) de montagne ; `
+    + `${immeublesAveugles} que le même sol produirait sans la règle du massif`);
+  check('quelques maisons restent au pied de la montagne',
+    batiments >= 12 && hameaux >= 6,
+    `${batiments} maison(s) sur ${massifsSondes} tronçons de massif, ${hameaux} tronçon(s) bâti(s) · `
+    + exemples.join(', '));
+  check('le hameau reste entre le pied du massif et l\'arête', !horsBande, horsBande || '');
+  check('aucun monument ne se dresse sur la glace', monuments === 0, `${monuments} monument(s)`);
+}
+
+// ------------------------------------------------- statues monumentales
+// « Je voudrais que tu ajoute de tres grande status dans les villes , des status a forme
+// humaine , d'elephant de cheval et d'aigle ». Jugé sur le vrai relief du jeu : ce sont les
+// villes du monde que le joueur parcourt qui doivent recevoir les colosses. Et jugé **sur
+// les cubes estampés**, non sur le plan : un gabarit juste dont l'estampage rate la rotation
+// ou franchit une couture de tronçon ne se voit que dans le tampon.
+{
+  const { SimplexNoise } = await loadPublicModule('public/js/noise.js');
+  const { createTerrain } = await loadPublicModule('public/js/terrain.js');
+  const monde = createTerrain({ noise: new SimplexNoise(42), chunkHeight: CHUNK_HEIGHT });
+  const memoH = new Map();
+  const rel = (x, z) => {
+    const k = `${x},${z}`;
+    let v = memoH.get(k);
+    if (v === undefined) { v = monde.heightAt(x, z); memoH.set(k, v); }
+    return v;
+  };
+  const genS = createVillageGen({
+    BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt: rel, roll: hashRoll, saltBase: 0,
+    seaLevel: monde.RELIEF.seaLevel,
+    waterTopAt: (x, z) => monde.waterTopAt(x, z),
+    alpsAt: (x, z) => monde.alpsIntensity(x, z),
+  });
+  // Contre-témoin de l'interdit du massif : sans la porte alpine, des colosses monteraient
+  // sur la glace. Une absence que rien ne produit ne prouve rien.
+  const genNu = createVillageGen({
+    BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt: rel, roll: hashRoll, saltBase: 0,
+    seaLevel: monde.RELIEF.seaLevel,
+    waterTopAt: (x, z) => monde.waterTopAt(x, z),
+  });
+
+  const PIERRES = new Set([BLOCK.STONE, BLOCK.COBBLE, BLOCK.MOSS]);
+  const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];   // miroir de TEMPLE_DIRS du générateur
+
+  // --- inventaire des mailles de statue sur un pays large --------------------
+  const statues = [];
+  let cellulesUrbaines = 0;
+  let surGlace = 0;
+  let surGlaceAveugle = 0;
+  for (let i = -22; i <= 22; i++) {
+    for (let j = -22; j <= 22; j++) {
+      const cell = VILLAGE.statueCell;
+      if (genS.cityInfluence(i * cell + (cell >> 1), j * cell + (cell >> 1)) >= VILLAGE.statueMinCity) {
+        cellulesUrbaines++;
+      }
+      const s = genS.statueAt(i, j);
+      if (!s) continue;
+      statues.push(s);
+      if (genS.alpage(s.ex, s.ez) >= VILLAGE.alpsWild) surGlace++;
+      const n = genNu.statueAt(i, j);
+      if (n && genS.alpage(n.ex, n.ez) >= VILLAGE.alpsWild) surGlaceAveugle++;
+    }
+  }
+  const parForme = {};
+  for (const s of statues) parForme[s.forme] = (parForme[s.forme] || 0) + 1;
+  check('les quatre colosses existent',
+    ['humain', 'elephant', 'cheval', 'aigle'].every((f) => (parForme[f] || 0) >= 3),
+    Object.entries(parForme).map(([k, v]) => `${k} ${v}`).join(' · ') + ` · total ${statues.length}`);
+  check('une statue par ville, pas une par quartier',
+    statues.length >= 40 && cellulesUrbaines > statues.length,
+    `${statues.length} colosses sur ${cellulesUrbaines} mailles urbaines`);
+
+  // Deux colosses ne se touchent pas : l'emprise reste confinée dans sa maille.
+  let touches = null;
+  for (let a = 0; a < statues.length && !touches; a++) {
+    for (let b = a + 1; b < statues.length && !touches; b++) {
+      const p = statues[a];
+      const q = statues[b];
+      if (Math.abs(p.ex - q.ex) > p.hx + q.hx + 2 || Math.abs(p.ez - q.ez) > p.hzAvant + q.hzAvant + 2) continue;
+      touches = `(${p.ex},${p.ez}) ${p.forme} et (${q.ex},${q.ez}) ${q.forme}`;
+    }
+  }
+  check('deux colosses ne se touchent jamais', !touches, touches || '');
+  check('aucun colosse ne se dresse sur la glace',
+    surGlace === 0 && surGlaceAveugle > 0,
+    `${surGlace} sur la glace ; ${surGlaceAveugle} que la même graine y poserait sans la porte du massif`);
+
+  // --- ce que l'estampage écrit vraiment -------------------------------------
+  const tampons = new Map();
+  function blocMonde(wx, wz, y) {
+    const cx = Math.floor(wx / CHUNK_SIZE);
+    const cz = Math.floor(wz / CHUNK_SIZE);
+    const cle = `${cx},${cz}`;
+    let d = tampons.get(cle);
+    if (!d) {
+      d = emptyData();
+      genS.stampRoads(d, cx, cz);
+      genS.stampBuilding(d, cx, cz);
+      genS.stampStructures(d, cx, cz);
+      tampons.set(cle, d);
+    }
+    return d[idx(wx - cx * CHUNK_SIZE, y, wz - cz * CHUNK_SIZE)];
+  }
+
+  /**
+   * Le nuage de pierre du colosse, en coordonnées locales (x latéral, y au-dessus du sol
+   * naturel, z avant). Tout est pris **au-dessus du sol** : le piédestal se coule du terrain
+   * jusqu'à sa table, donc juger depuis le socle ferait entrer le remplissage dans le corps
+   * — et compter un seul pied à une statue à quatre pattes.
+   */
+  function relevé(s) {
+    const dir = DIRS[s.door];
+    const demiZ = Math.max(s.hzAvant, s.hzArriere);
+    const pts = [];
+    for (let lx = -s.hx - 1; lx <= s.hx + 1; lx++) {
+      for (let lz = -demiZ - 1; lz <= demiZ + 1; lz++) {
+        const wx = s.ex + dir[0] * lz + (-dir[1]) * lx;
+        const wz = s.ez + dir[1] * lz + dir[0] * lx;
+        // Toute la colonne, du sol au sommet : s'arrêter au premier bloc ne verrait que le
+        // remplissage du socle et ferait mesurer un colosse haut d'un cube.
+        for (let y = s.sol; y < CHUNK_HEIGHT; y++) {
+          if (PIERRES.has(blocMonde(wx, wz, y))) pts.push([lx, y - s.sol, lz]);
+        }
+      }
+    }
+    return pts;
+  }
+
+  /** Combien de pieds distincts portent la statue : composantes connexes de la bande basse. */
+  function pieds(pts, hauteur) {
+    const base = pts.filter(([, y]) => y <= hauteur && y >= 0);
+    const jeu = new Set(base.map((p) => p.join(',')));
+    const vus = new Set();
+    let n = 0;
+    for (const p of base) {
+      const cle = p.join(',');
+      if (vus.has(cle)) continue;
+      n++;
+      const file = [p];
+      vus.add(cle);
+      while (file.length) {
+        const [x, y, z] = file.pop();
+        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          for (let dy = -1; dy <= 1; dy++) {
+            const q = [x + dx, y + dy, z + dz];
+            const k = q.join(',');
+            if (vus.has(k) || !jeu.has(k)) continue;
+            vus.add(k);
+            file.push(q);
+          }
+        }
+      }
+    }
+    return n;
+  }
+
+  // Échantillon jugé : trois sujets par forme, pris loin de l'origine pour que le comptage
+  // ne repose pas sur un seul coin de carte.
+  const echantillon = [];
+  for (const f of ['humain', 'elephant', 'cheval', 'aigle']) {
+    let pris = 0;
+    for (const s of statues) {
+      if (pris >= 3) break;
+      if (s.forme !== f) continue;
+      if (Math.abs(s.ex) + Math.abs(s.ez) < 400) continue;
+      echantillon.push(s);
+      pris++;
+    }
+  }
+
+  const hauteurs = [];
+  const largeurs = [];
+  const souciSilhouette = [];
+  const souciRoute = [];
+  const souciBati = [];
+  const souciHerbe = [];
+  const souciDegre = [];
+  for (const s of echantillon) {
+    const pts = relevé(s);
+    if (!pts.length) { souciSilhouette.push(`${s.forme} : rien d'estampé`); continue; }
+    // Le monument se juge **du sol naturel au sommet** : c'est ce que voit le joueur qui
+    // lève les yeux depuis la rue. Le corps seul (hors piédestal) sert aux silhouettes.
+    const haut = Math.max(...pts.map((p) => p[1])) + 1;
+    const corps = pts.filter((p) => p[1] > s.plinthH)
+      .map(([x, y, z]) => [x, y - s.plinthH - 1, z]);
+    const hautCorps = corps.length ? Math.max(...corps.map((p) => p[1])) + 1 : 0;
+    const coteX = Math.max(...corps.map((p) => Math.abs(p[0])));
+    const coteZ = Math.max(...corps.map((p) => Math.abs(p[2])));
+    hauteurs.push(haut);
+    largeurs.push(Math.max(coteX, coteZ));
+
+    const versLeHaut = (p) => p[1] >= 0.75 * hautCorps;
+    const lointainX = (p) => Math.abs(p[0]) >= 0.7 * coteX;
+    const avantLointain = (p) => p[2] >= 0.7 * s.hzAvant;
+    const arriereLointain = (p) => p[2] <= -0.7 * s.hzArriere;
+    const bas = (p) => p[1] <= 0.3 * hautCorps;
+    const a = (cond) => corps.some(cond);
+    if (s.forme === 'humain') {
+      if (pieds(corps, 3) !== 2) souciSilhouette.push(`humain : ${pieds(corps, 3)} pied(s) porté(s), attendu 2`);
+      if (!a((p) => versLeHaut(p) && Math.abs(p[0]) <= 0.3 * coteX)) souciSilhouette.push('humain : pas de tête au sommet');
+      if (!a((p) => versLeHaut(p) && lointainX(p))) souciSilhouette.push('humain : pas de bras levé au-dessus de l épaule');
+    } else if (s.forme === 'elephant') {
+      if (pieds(corps, 4) < 3) souciSilhouette.push(`éléphant : ${pieds(corps, 4)} appui(s), attendu au moins 3`);
+      if (!a((p) => avantLointain(p) && bas(p))) souciSilhouette.push('éléphant : rien de pendu devant les pattes de devant');
+      if (!a((p) => arriereLointain(p) && p[1] > 0.3 * hautCorps && p[1] < 0.7 * hautCorps)) souciSilhouette.push('éléphant : pas de queue');
+    } else if (s.forme === 'cheval') {
+      if (pieds(corps, 4) < 3) souciSilhouette.push(`cheval : ${pieds(corps, 4)} appui(s), attendu au moins 3`);
+      if (!a((p) => p[1] >= 0.7 * hautCorps && p[2] >= 0.45 * s.hzAvant)) souciSilhouette.push('cheval : ni encolure ni tête en avant');
+      if (!a(arriereLointain)) souciSilhouette.push('cheval : rien derrière la croupe');
+    } else {
+      // Les deux ailes, pas une seule : la pointe doit se lire à gauche comme à droite,
+      // au-dessus des épaules. L'envergure ne se juge pas contre la profondeur totale —
+      // le perchoir et la queue l'enflent sans rien dire du déploiement.
+      const aile = (sgn) => corps.some((p) => sgn * p[0] >= 0.7 * coteX && p[1] >= 0.45 * hautCorps);
+      if (!aile(1)) souciSilhouette.push('aigle : aile droite absente à mi-hauteur');
+      if (!aile(-1)) souciSilhouette.push('aigle : aile gauche absente à mi-hauteur');
+      if (!a((p) => avantLointain(p) && p[1] >= 0.5 * hautCorps)) souciSilhouette.push('aigle : pas de bec en avant');
+    }
+
+    // La pierre ne doit rien écraser : ni le pavé, ni une maison, ni un tronc.
+    const demiZ = Math.max(s.hzAvant, s.hzArriere);
+    const dir = DIRS[s.door];
+    for (let ax = -demiZ - VILLAGE.statuePad; ax <= demiZ + VILLAGE.statuePad; ax++) {
+      for (let lt = -s.hx - VILLAGE.statuePad; lt <= s.hx + VILLAGE.statuePad; lt++) {
+        const wx = s.ex + dir[0] * ax + (-dir[1]) * lt;
+        const wz = s.ez + dir[1] * ax + dir[0] * lt;
+        const dansPierre = Math.abs(ax) <= (ax >= 0 ? s.hzAvant : s.hzArriere) && Math.abs(lt) <= s.hx;
+        const dansDegre = ax > (ax >= 0 ? s.hzAvant : s.hzArriere)
+          && ax <= (ax >= 0 ? s.hzAvant : s.hzArriere) + s.plinthH + 2
+          && Math.abs(lt) <= VILLAGE.statueStairWidth;
+        if ((dansPierre || dansDegre) && genS.roadKind(wx, wz)) {
+          souciRoute.push(`(${wx},${wz}) sous ${s.forme} de (${s.ex},${s.ez})`);
+        }
+        const porte = ax >= 0 ? s.hzAvant : s.hzArriere;   // devant et derrière ne portent pas pareil
+        if (genS.blocksVegetation(wx, wz) === false
+          && Math.abs(ax) <= porte + 1 && Math.abs(lt) <= s.hx + 1) {
+          souciHerbe.push(`(${wx},${wz}) hors réserve de ${s.forme} de (${s.ex},${s.ez})`);
+        }
+      }
+    }
+    // Aucune emprise de maison dans la pierre ni dans la réserve. Le plan est ramené dans
+    // le repère du colosse : juger une boîte non tournée sous une forme de dix-huit cubes
+    // de long sur sept de large accuserait une maison qui passe, ou en absoudrait une qui
+    // s'adosse à la trompe.
+    const cx0 = Math.floor((s.ex - demiZ - VILLAGE.statuePad) / CHUNK_SIZE);
+    const cx1 = Math.floor((s.ex + demiZ + VILLAGE.statuePad) / CHUNK_SIZE);
+    const cz0 = Math.floor((s.ez - demiZ - VILLAGE.statuePad) / CHUNK_SIZE);
+    const cz1 = Math.floor((s.ez + demiZ + VILLAGE.statuePad) / CHUNK_SIZE);
+    const horsReserve = (cx, cz, p) => {
+      let a0 = Infinity;
+      let a1 = -Infinity;
+      let t0 = Infinity;
+      let t1 = -Infinity;
+      for (const [qx, qz] of [[p.x0, p.z0], [p.x0 + p.w - 1, p.z0],
+        [p.x0, p.z0 + p.d - 1], [p.x0 + p.w - 1, p.z0 + p.d - 1]]) {
+        const dx = cx * CHUNK_SIZE + qx - s.ex;
+        const dz = cz * CHUNK_SIZE + qz - s.ez;
+        const axial = dx * dir[0] + dz * dir[1];
+        const tangent = dx * -dir[1] + dz * dir[0];
+        if (axial < a0) a0 = axial;
+        if (axial > a1) a1 = axial;
+        if (tangent < t0) t0 = tangent;
+        if (tangent > t1) t1 = tangent;
+      }
+      const pad = VILLAGE.courtWidth;
+      return a1 < -s.hzArriere - pad || a0 > s.hzAvant + pad
+        || t1 < -s.hx - pad || t0 > s.hx + pad;
+    };
+    for (let cx = cx0; cx <= cx1; cx++) {
+      for (let cz = cz0; cz <= cz1; cz++) {
+        for (const p of genS.buildingAt(cx, cz)) {
+          if (horsReserve(cx, cz, p)) continue;
+          souciBati.push(`maison ${p.kind} (${cx * CHUNK_SIZE + p.x0},${cz * CHUNK_SIZE + p.z0})`
+            + ` ${p.w}×${p.d} contre ${s.forme} de (${s.ex},${s.ez})`);
+        }
+      }
+    }
+
+    // Le degré, parcouru du dehors vers le socle : un cube de dénivelé entre deux rangées.
+    // On mesure la **surface foulée** (le empilement continu depuis le sol), pas le premier
+    // bloc de pierre en partant du haut : une aile ou un bras en surplomb n'est pas une marche.
+    const rangees = [];
+    for (let hors = s.plinthH + 2; hors >= 1; hors--) {
+      const ax = s.hzAvant + hors;              // le degré est toujours devant
+      let hautRangee = -Infinity;
+      for (let k = -VILLAGE.statueStairWidth; k <= VILLAGE.statueStairWidth; k++) {
+        const wx = s.ex + dir[0] * ax + (-dir[1]) * k;
+        const wz = s.ez + dir[1] * ax + dir[0] * k;
+        // On part du **sol naturel** de la colonne, pas d'une altitude supposée : sur une
+        // place en pente, démarrer trop haut faisait mesurer l'air comme une marche.
+        let y = rel(wx, wz);
+        while (y + 1 < CHUNK_HEIGHT && PIERRES.has(blocMonde(wx, wz, y + 1))) y++;
+        if (y > hautRangee) hautRangee = y;
+      }
+      if (hautRangee > -Infinity) rangees.push(hautRangee);
+    }
+    rangees.push(s.socle);                       // la table du piédestal ferme la montée
+    for (let i = 1; i < rangees.length; i++) {
+      if (rangees[i] - rangees[i - 1] > 1) {
+        souciDegre.push(`${s.forme} de (${s.ex},${s.ez}) : +${rangees[i] - rangees[i - 1]} cubes à la rangée ${i}`);
+        break;
+      }
+    }
+  }
+
+  const mediane = (l) => l.slice().sort((x, y) => x - y)[Math.floor(l.length / 2)] || 0;
+  check('le colosse est très grand',
+    echantillon.length === 12 && mediane(hauteurs) >= 22 && Math.max(...largeurs) >= 12,
+    `${echantillon.length} sujets jugés · hauteur médiane ${mediane(hauteurs)} cubes`
+    + ` · plus grande emprise ${Math.max(...largeurs)} cubes`);
+  check('la silhouette dit ce que représente le colosse', !souciSilhouette.length,
+    souciSilhouette.slice(0, 4).join(' | '));
+  check('le piédestal n écrase aucune avenue', !souciRoute.length, souciRoute.slice(0, 3).join(' | '));
+  check('aucune maison ne s adosse à un colosse', !souciBati.length, souciBati.slice(0, 3).join(' | '));
+  check('rien ne pousse dans la réserve du monument', !souciHerbe.length,
+    souciHerbe.slice(0, 3).join(' | '));
+  check('on monte au pied du colosse sans escalader', !souciDegre.length,
+    souciDegre.slice(0, 3).join(' | '));
+
+  // Déterminisme : le monde n'est sauvé qu'en diff, donc un colosse régénéré doit tomber
+  // cube pour cube — et changer de place quand on change la graine.
+  const clefs = (g) => {
+    const out = [];
+    for (let i = -8; i <= 8; i++) {
+      for (let j = -8; j <= 8; j++) {
+        const s = g.statueAt(i, j);
+        if (s) out.push(`${s.forme}@${s.ex},${s.ez},${s.door},${s.socle}`);
+      }
+    }
+    return out.join('|');
+  };
+  const genBis = createVillageGen({
+    BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt: rel, roll: hashRoll, saltBase: 0,
+    seaLevel: monde.RELIEF.seaLevel,
+    waterTopAt: (x, z) => monde.waterTopAt(x, z),
+    alpsAt: (x, z) => monde.alpsIntensity(x, z),
+  });
+  const genAutre = createVillageGen({
+    BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt: rel, roll: hashRoll, saltBase: 4242,
+    seaLevel: monde.RELIEF.seaLevel,
+    waterTopAt: (x, z) => monde.waterTopAt(x, z),
+    alpsAt: (x, z) => monde.alpsIntensity(x, z),
+  });
+  check('le colosse se régénère à l\'identique', clefs(genBis) === clefs(genS));
+  check('changer la graine déplace les colosses', clefs(genAutre) !== clefs(genS));
 }
 
 process.exit(summary());

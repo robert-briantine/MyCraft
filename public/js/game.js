@@ -9,7 +9,10 @@ import { createTerrain } from './terrain.js';
 
 // ===================== CONSTANTS =====================
 const CHUNK_SIZE = 16;
-const CHUNK_HEIGHT = 64;
+// Porté de 64 à 80 le 2026-11-09 pour que les catégories hautes d'immeuble tiennent :
+// quatorze étages au pas de `floorPitch`, c'est quarante-quatre cubes de corps plus le
+// toit, et le seuil d'une tour de centre-bourg se pose déjà à vingt-cinq cubes.
+const CHUNK_HEIGHT = 80;
 const GRAVITY = 30;
 const JUMP_SPEED = 10;
 const MOVE_SPEED = 8;
@@ -271,6 +274,9 @@ const village = createVillageGen({
   // Rivières : la voirie et le bâti se jugent contre le plan d'eau local de chaque
   // colonne, pas contre la seule ligne de flottaison.
   waterTopAt: (x, z) => terrain.waterTopAt(x, z),
+  // Très hautes montagnes : le village doit savoir où il monte. Ni immeuble ni ville
+  // dans ces zones, seulement quelques hameaux (`VILLAGE.hamlet*`).
+  alpsAt: (x, z) => terrain.alpsIntensity(x, z),
 });
 
 // Forêts, plaines et déserts vivent dans leur propre module, pour la même raison que
@@ -284,7 +290,7 @@ const biomes = createBiomeGen({
   heightAt: getTerrainHeight,
   roll: hashRoll,
   saltBase: (WORLD_SEEDS.trees * 7919) | 0,
-  isBlocked: (wx, wz) => village.isOccupied(wx, wz),
+  isBlocked: (wx, wz) => village.blocksVegetation(wx, wz),
   seaLevel: SEA_LEVEL,
   riverAt: (x, z) => terrain.riverAt(x, z),
 });
@@ -2792,6 +2798,9 @@ window.__mc = {
   biomeParams: biomes.BIOMES,
   // Cellule tenue par la voirie ou l'emprise d'un bâtiment — ce sur quoi rien ne pousse.
   cellOccupied: (wx, wz) => village.isOccupied(wx, wz),
+  // …et tenue en outre par la cour de deux cubes qui ceinture chaque bâtiment : la
+  // bande où aucun arbre ne doit pousser, pour qu'on puisse en faire le tour.
+  cellGenante: (wx, wz) => village.blocksVegetation(wx, wz),
   // Plan du temple de la maille (i,j) et temples recoupant une fenêtre : les suites
   // vérifient le monument dans le monde chargé sans en dupliquer les constantes.
   templeAt: (i, j) => village.templeAt(i, j),

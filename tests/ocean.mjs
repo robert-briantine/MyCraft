@@ -332,7 +332,13 @@ function peutSortir(x0, z0, portee) {
   // juge la plus grande — surface allongée, pas seulement largeur. La densité se rapporte
   // aux **terres** : la moitié de la fenêtre est de la mer, où par définition il n'y a pas
   // de rivière, et un pourcentage sur l'ensemble ne voudrait rien dire.
-  const N = 320;
+  //
+  // La fenêtre fait sept cents cubes de demi-côté depuis que la carte porte des massifs à
+  // l'échelle des océans : à trois cent vingt, un seul massif pouvait remplir tout le
+  // champ et la fenêtre ne comptait plus qu'un cours — ce n'était pas le monde qui avait
+  // peu de rivières (mesuré : densité 0,35 % à ±700 contre 0,16 % à ±320), c'est la
+  // mesure qui tenait dans un seul tirage du relief.
+  const N = 700;
   const vus = new Set();
   let lits = 0, cases = 0, terres = 0, plusGrosse = 0, plusEtendu = 0;
   const largeurs = [];
@@ -403,14 +409,20 @@ function peutSortir(x0, z0, portee) {
   // pas un correctif. Là-haut, seule compte l'absence de végétation dans l'eau.
   let testees = 0, horsSable = 0, plantees = 0;
   const exemples = [];
-  for (let t = 0; t < 6000; t++) {
-    const x = Math.floor(hashRoll(t, 31, t * 7, 777) * 720) - 360;
-    const z = Math.floor(hashRoll(t, 97, t * 11, 555) * 720) - 360;
+  // Même raison d'échelle que la section précédente : le lit occupe un quart de pour cent
+  // des terres, et une boîte de trois cent soixante cubes posée sur un massif n'en
+  // rencontrait plus assez pour juger quoi que ce soit (mesuré : 21 colonnes).
+  for (let t = 0; t < 12000; t++) {
+    const x = Math.floor(hashRoll(t, 31, t * 7, 777) * 1040) - 520;
+    const z = Math.floor(hashRoll(t, 97, t * 11, 555) * 1040) - 520;
     const r = terrain.riverAt(x, z);
     if (!r) continue;
     testees++;
     const h = heightAt(x, z);
-    if (r.d > r.demiLargeur && h > SEA && h <= biomes.BIOMES.treeLine) {
+    // Strictement **sous** la ligne d'arbres : `surfaceFor` rend la roche à partir de
+    // treeLine, donc juger h == treeLine demandait du sable là où le générateur pose la
+    // pierre par définition — deux colonnes à trente-trois cubes, exactement la borne.
+    if (r.d > r.demiLargeur && h > SEA && h < biomes.BIOMES.treeLine) {
       const revetement = biomes.surfaceFor(x, z, h).top;
       if (revetement !== BLOCK.SAND) {
         horsSable++;
@@ -471,94 +483,155 @@ function peutSortir(x0, z0, portee) {
 
   let franchissables = 0, franchis = 0, canaux = 0;
   let sansTablier = 0, chenauxBouches = 0, gardesCourtes = 0, approchesNoyees = 0;
-  const exemples = [];
+  let archesJugees = 0, archesCintrees = 0;
+  // Une liste par contrôle : trois « sans pont » noieraient autrement le détail d'un
+  // chenal comblé ou d'un tablier absent.
+  const exemplesSansPont = [], exemplesGarde = [], exemplesApproche = [];
+  const exemplesTablier = [], exemplesChenal = [], exemplesArche = [];
+
+  /**
+   * Les coupures sont énumérées depuis le **terrain**, non depuis les centres de maille
+   * du générateur : juger l'eau aux seuls points d'échantillonnage de `computeWaterBridge`
+   * reviendrait à ignorer d'office tout ce que le générateur ne propose pas lui-même —
+   * et c'est précisément le défaut qui laissait des avenues en impasse (mesuré le
+   * 2026-11-09 : sept traversées franchissables sur vingt-trois jamais proposées).
+   */
+  const coupures = [];
   for (const axis of ['x', 'z']) {
     const kLo = -Math.ceil(R * CHUNK_SIZE / V.roadSpacing), kHi = -kLo;
-    const segLo = Math.floor(-R * CHUNK_SIZE / V.bridgeCell);
-    const segHi = Math.ceil(R * CHUNK_SIZE / V.bridgeCell);
-    for (let k = kLo; k <= kHi; k++) for (let seg = segLo; seg <= segHi; seg++) {
-      const centre = seg * V.bridgeCell + (V.bridgeCell >> 1);
-      const own = (V.bridgeCell >> 1) - 1;
-      if (!mouille(axis, k, centre)) continue;
-      let ds = centre, de = centre;
-      const borne = own + V.waterMaxSpan + 2;
-      while (ds > centre - borne && mouille(axis, k, ds - 1)) ds--;
-      while (de < centre + borne && mouille(axis, k, de + 1)) de++;
-      if (Math.abs((ds + de) / 2 - centre) > own) continue;
-      const largeur = de - ds + 1;
-      if (largeur < V.waterMinSpan || largeur > V.waterMaxSpan) continue;
-      if (mouille(axis, k, ds - 1) || mouille(axis, k, de + 1)) continue;   // pas de rive
-      franchissables++;
-      const b = village.bridgeAt(axis, k, seg);
-      if (!b || !b.surEau) {
-        if (exemples.length < 3) exemples.push(`${axis}${k}@${seg} · ${largeur} colonnes d’eau sans pont`);
-        continue;
-      }
-      franchis++;
-      let eau = SEA;
-      for (let i = b.ds; i <= b.de; i++) {
-        for (let o = -b.half; o <= b.half; o++) {
-          const c = colonne(axis, k, i, o);
-          eau = Math.max(eau, Math.max(SEA, waterTop(c.wx, c.wz)));
+    const LIM = R * CHUNK_SIZE;
+    const own = (V.bridgeCell >> 1) - 1;
+    for (let k = kLo; k <= kHi; k++) {
+      let i = -LIM;
+      while (i <= LIM) {
+        if (!mouille(axis, k, i)) { i++; continue; }
+        let j = i;
+        while (j + 1 <= LIM && mouille(axis, k, j + 1)) j++;
+        // Traversée franche : une rive sèche des deux côtés. Un cours qui longe
+        // l'avenue, ou que la fenêtre du contrôle coupe en pleine eau, n'est pas une
+        // traversée — il n'a pas de rive d'en face à rejoindre.
+        const franche = !mouille(axis, k, i - 1) && !mouille(axis, k, j + 1);
+        const largeur = j - i + 1;
+        if (franche && largeur >= V.waterMinSpan && largeur <= V.waterMaxSpan) {
+          const seg = Math.round(((i + j) / 2 - (V.bridgeCell >> 1)) / V.bridgeCell);
+          const centre = seg * V.bridgeCell + (V.bridgeCell >> 1);
+          // La maille à qui appartient la coupure, telle que le générateur l'arbitre.
+          if (Math.abs((i + j) / 2 - centre) <= own) coupures.push({ axis, k, seg, ds: i, de: j });
         }
+        i = j + 1;
       }
-      if (b.deckY - eau < V.waterFreeboard) {
-        gardesCourtes++;
-        if (exemples.length < 3) exemples.push(`tablier ${b.deckY} à ${b.deckY - eau} cube(s) de l’eau (${axis}${k}@${seg})`);
+    }
+  }
+
+  for (const { axis, k, seg, ds, de } of coupures) {
+    franchissables++;
+    const b = village.bridgeAt(axis, k, seg);
+    if (!b || !b.surEau || b.from > ds || b.to < de) {
+      if (exemplesSansPont.length < 3) exemplesSansPont.push(`${axis}${k}@${seg} · ${de - ds + 1} colonnes d’eau sans pont`);
+      continue;
+    }
+    franchis++;
+    let eau = SEA;
+    for (let i = b.ds; i <= b.de; i++) {
+      for (let o = -b.half; o <= b.half; o++) {
+        const c = colonne(axis, k, i, o);
+        eau = Math.max(eau, Math.max(SEA, waterTop(c.wx, c.wz)));
       }
-      for (const [i, niveau] of b.ramp) {
-        const c = colonne(axis, k, i, 0);
-        const plan = Math.max(SEA, waterTop(c.wx, c.wz));
-        if (heightAt(c.wx, c.wz) < plan || niveau < plan + 1
-          || b.deckY - niveau > V.bridgeMaxRamp) {
-          approchesNoyees++;
-          if (exemples.length < 3) exemples.push(`approche ${i} à ${niveau} pour un plan d’eau à ${plan}`);
-          break;
-        }
-      }
-      // Sous une travée (ni pile ni tympan), entre le lit et le tablier, il ne doit y
-      // avoir que de l'eau et du vide : un bloc posé là est une digue. La colonne jugée
-      // est sur l'axe **et** mouillée — au droit d'un banc sec il n'y a pas de chenal à
-      // ouvrir, et le sol naturel qui y règne n'est pas une digue.
-      let mi = null;
-      for (let i = b.ds; i <= b.de; i++) {
-        const c0 = colonne(axis, k, i, 0);
-        if (heightAt(c0.wx, c0.wz) >= Math.max(SEA, waterTop(c0.wx, c0.wz))) continue;
-        if (village.bridgeUnderside(b, i).pier) continue;
-        mi = i;
+    }
+    if (b.deckY - eau < V.waterFreeboard) {
+      gardesCourtes++;
+      if (exemplesGarde.length < 3) exemplesGarde.push(`tablier ${b.deckY} à ${b.deckY - eau} cube(s) de l’eau (${axis}${k}@${seg})`);
+    }
+    for (const [i, niveau] of b.ramp) {
+      const c = colonne(axis, k, i, 0);
+      const plan = Math.max(SEA, waterTop(c.wx, c.wz));
+      if (heightAt(c.wx, c.wz) < plan || niveau < plan + 1
+        || b.deckY - niveau > V.waterMaxRamp) {
+        approchesNoyees++;
+        if (exemplesApproche.length < 3) exemplesApproche.push(`approche ${i} à ${niveau} pour un plan d’eau à ${plan}`);
         break;
       }
-      if (mi === null) continue;
-      canaux++;
-      const c = colonne(axis, k, mi, 0);
-      const cx = Math.floor(c.wx / CHUNK_SIZE), cz = Math.floor(c.wz / CHUNK_SIZE);
-      const data = monde(cx, cz);
-      const lx = c.wx - cx * CHUNK_SIZE, lz = c.wz - cz * CHUNK_SIZE;
-      const bloc = (y) => data[idx(lx, y, lz)];
-      if (!REVETEMENTS_DE_VOIRIE.includes(bloc(b.deckY))) {
-        sansTablier++;
-        if (exemples.length < 3) exemples.push(`pas de chaussée au tablier ${b.deckY} (${c.wx},${c.wz}) mais bloc ${bloc(b.deckY)}`);
-      }
-      const sol = heightAt(c.wx, c.wz);
-      for (let y = Math.max(sol + 1, 0); y < b.deckY; y++) {
-        if (bloc(y) !== BLOCK.WATER && bloc(y) !== BLOCK.AIR) {
-          chenauxBouches++;
-          if (exemples.length < 3) exemples.push(`chenal comblé (${c.wx},${c.wz}) à y=${y} : bloc ${bloc(y)}`);
+    }
+    // Sous la **clé** de l'arc — la colonne où l'ouverture est la plus haute — entre le
+    // lit et le soffite, il ne doit y avoir que de l'eau et du vide : un bloc posé là est
+    // une digue. Juger la première travée venue jugerait les naissances, qui sont de la
+    // maçonnerie par destination (mesuré le 2026-11-09 : le contrôle accusait de « chenal
+    // comblé » un pont qui venait précisément de recevoir ses arcs). La colonne jugée est
+    // sur l'axe **et** mouillée — au droit d'un banc sec il n'y a pas de chenal à ouvrir,
+    // et le sol naturel qui y règne n'est pas une digue.
+    let mi = null, cle = null, naissances = 0;
+    for (let i = b.ds; i <= b.de; i++) {
+      const c0 = colonne(axis, k, i, 0);
+      if (heightAt(c0.wx, c0.wz) >= Math.max(SEA, waterTop(c0.wx, c0.wz))) continue;
+      const u = village.bridgeUnderside(b, i);
+      if (u.pier) continue;
+      if (cle === null || u.open > cle) { cle = u.open; mi = i; }
+      if (u.open < b.clearance) naissances++;
+    }
+    if (mi === null) continue;
+    canaux++;
+    archesJugees++;
+    // Une travée se lit cintrée quand sa clé garde l'ouverture pleine et qu'au moins deux
+    // colonnes voisines descendent sous le soffite : les naissances de l'arc.
+    if (cle >= b.clearance && naissances >= 2) archesCintrees++;
+    else if (exemplesArche.length < 3) {
+      exemplesArche.push(`${axis}${k}@${seg} : ouverture max ${cle} pour ${b.clearance} de garde, `
+        + `${naissances} naissance(s) sous le soffite`);
+    }
+    const c = colonne(axis, k, mi, 0);
+    const cx = Math.floor(c.wx / CHUNK_SIZE), cz = Math.floor(c.wz / CHUNK_SIZE);
+    const data = monde(cx, cz);
+    const lx = c.wx - cx * CHUNK_SIZE, lz = c.wz - cz * CHUNK_SIZE;
+    const bloc = (y) => data[idx(lx, y, lz)];
+    if (!REVETEMENTS_DE_VOIRIE.includes(bloc(b.deckY))) {
+      sansTablier++;
+      if (exemplesTablier.length < 3) exemplesTablier.push(`pas de chaussée au tablier ${b.deckY} (${c.wx},${c.wz}) mais bloc ${bloc(b.deckY)}`);
+    }
+    // Ce qui fait une digue, ce n'est pas la maçonnerie de l'arc — elle ne descend
+    // jamais à ou sous le plan d'eau, c'est sa règle — mais tout cube plein posé **dans
+    // la colonne d'eau**. Chaque colonne mouillée de la travée est donc jugée jusqu'au
+    // plan d'eau inclus, et non jusqu'au soffite de la colonne jugée : mesuré le
+    // 2026-11-09, juger sous une simple naissance d'arc faisait passer l'épaule du pont
+    // pour un comblement. Seules les piles ont le droit de tremper.
+    let noye = null;
+    for (let i = b.ds; i <= b.de && !noye; i++) {
+      if (village.bridgeUnderside(b, i).pier) continue;
+      const cc = colonne(axis, k, i, 0);
+      if (heightAt(cc.wx, cc.wz) >= Math.max(SEA, waterTop(cc.wx, cc.wz))) continue;
+      const dcx = Math.floor(cc.wx / CHUNK_SIZE), dcz = Math.floor(cc.wz / CHUNK_SIZE);
+      const dd = monde(dcx, dcz);
+      const dlx = cc.wx - dcx * CHUNK_SIZE, dlz = cc.wz - dcz * CHUNK_SIZE;
+      const bl = (y) => dd[idx(dlx, y, dlz)];
+      for (let y = Math.max(heightAt(cc.wx, cc.wz) + 1, 0); y <= b.floorH; y++) {
+        if (bl(y) !== BLOCK.WATER && bl(y) !== BLOCK.AIR) {
+          noye = ` (${cc.wx},${cc.wz}) à y=${y} : bloc ${bl(y)}`;
           break;
         }
       }
     }
+    if (noye) {
+      chenauxBouches++;
+      if (exemplesChenal.length < 3) exemplesChenal.push(`chenal comblé${noye}`);
+    }
   }
   check('une avenue coupée par l’eau est portée par un pont',
     franchissables >= 8 && franchis >= Math.round(franchissables * 0.6),
-    `${franchis}/${franchissables} coupures franchies sur ${R * 2 + 1}² tronçons`);
+    `${franchis}/${franchissables} coupures franchies sur ${R * 2 + 1}² tronçons`
+    + `${exemplesSansPont.length ? ` — ${exemplesSansPont.join(' | ')}` : ''}`);
   check('le tablier garde sa hauteur au-dessus de l’eau', gardesCourtes === 0,
-    `${gardesCourtes} tablier(s) à moins de ${V.waterFreeboard} cubes du plan d’eau`);
+    `${gardesCourtes} tablier(s) à moins de ${V.waterFreeboard} cubes du plan d’eau`
+    + `${exemplesGarde.length ? ` — ${exemplesGarde.join(' | ')}` : ''}`);
   check('le chenal reste libre sous le tablier',
     canaux >= 4 && sansTablier === 0 && chenauxBouches === 0 && approchesNoyees === 0,
     `${canaux} travée(s) jugée(s) : ${sansTablier} tablier(s) absent(s), ${chenauxBouches} chenal(aux) `
     + `comblé(s), ${approchesNoyees} approche(s) dans l’eau`
-    + `${exemples.length ? ` — ${exemples.join(' | ')}` : ''}`);
+    + `${exemplesTablier.length + exemplesChenal.length + exemplesApproche.length ? ' — '
+      + [...exemplesTablier, ...exemplesChenal, ...exemplesApproche].join(' | ') : ''}`);
+  check('les ponts sur l’eau portent des arches',
+    archesJugees >= 4 && archesCintrees >= Math.round(archesJugees * 0.8),
+    `${archesCintrees}/${archesJugees} travée(s) cintrée(s) — clé à ouverture pleine et naissances `
+    + `descendant sous le soffite`
+    + `${exemplesArche.length ? ' — ' + exemplesArche.join(' | ') : ''}`);
 }
 
 // ============================================================ 5. déterminisme
@@ -616,6 +689,48 @@ const avancer = (frames, dt = 1 / 60) => page.evaluate(({ frames, dt }) => {
   for (let i = 0; i < frames; i++) mc.step(dt);
   return true;
 }, { frames, dt });
+
+/**
+ * Sortir de l'eau — en marchant, ou en montant sur Espace. Ce que l'on juge, c'est que le
+ * joueur se retrouve **au sec**, pas qu'il ait touché la colonne désignée par la recherche à
+ * la spirale : la berge la plus haute peut être à trente cubes (cinq secondes de nage n'y
+ * suffisent pas) ou derrière un ressaut que le pas d'un cube ne franchit pas, et un joueur
+ * qui ressort vingt cubes plus loin est sorti de l'eau. Plusieurs caps sont donc courus
+ * depuis le même point d'eau et le meilleur garde la main — la règle déjà employée pour la
+ * vitesse de nage. Le départ est remis à chaque cap : sans cela, une sortie réussie au
+ * premier cap masquerait sept noyades.
+ */
+async function sortieEau({ x, z, y, caps, frames = 600, saut = false }) {
+  let meilleur = null;
+  let reussis = 0;
+  for (const cap of caps) {
+    await page.evaluate(({ x, z, y, cap }) => {
+      const mc = window.__mc;
+      mc.camera.position.set(x + 0.5, y, z + 0.5);
+      mc.player.velocity.set(0, 0, 0);
+      mc.player.flyMode = false;
+      mc.streamAll();
+      mc.look(cap, 0);
+      mc.releaseAll();
+    }, { x, z, y, cap });
+    await page.evaluate((a) => {
+      window.__mc.press('KeyW');
+      if (a.saut) window.__mc.press('Space');
+    }, { saut });
+    await avancer(frames);
+    await page.evaluate(() => window.__mc.releaseAll());
+    await avancer(30);                   // repose les touches : Espace tenu ferait échantillonner
+    const s = await etat();               // le joueur en l'air alors qu'il est sur la berge
+    const dist = Math.hypot(s.x - (x + 0.5), s.z - (z + 0.5));
+    // Au sec, et pas n'importe où : à moins de soixante cubes du point d'eau, on est encore
+    // dans le pays que la nappe borde. Sans cette borne, un joueur charrié hors du monde
+    // passerait pour un nageur sorti de l'eau.
+    const sec = s.onGround && !s.nage && !s.sousLEau && dist >= 2 && dist <= 60;
+    if (sec) reussis++;
+    if (!meilleur || (sec && !meilleur.sec)) meilleur = { ...s, sec, cap, dist };
+  }
+  return { meilleur, reussis, tries: caps.length };
+}
 
 const SEA_B = await page.evaluate(() => window.__mc.SEA_LEVEL);
 check('le navigateur connaît la même ligne de flottaison que le relief', SEA_B === SEA,
@@ -833,24 +948,18 @@ if (site && site.bord) {
   // entre dans la mer doit pouvoir en ressortir sans sauter ni voler.
   const { x, z, sx, sz } = site.bord;
   // Le cap regardé fixe la direction de marche : caméra orientée -Z à yaw 0, on vise
-  // la berge avec θ = atan2(−Δx, −Δz).
+  // la berge avec θ = atan2(−Δx, −Δz). Autour de ce cap, quatre autres sont courus :
+  // juger un seul relèverait du tirage de la loterie, non d'une invariant du monde.
   const cap = Math.atan2(-(sx - x), -(sz - z)) * 180 / Math.PI;
-  await page.evaluate(({ x, z, cap }) => {
-    const mc = window.__mc;
-    mc.camera.position.set(x + 0.5, mc.SEA_LEVEL, z + 0.5);
-    mc.player.velocity.set(0, 0, 0);
-    mc.player.flyMode = false;
-    mc.streamAll();
-    mc.look(cap, 0);
-  }, { x, z, cap });
-  await page.evaluate(() => window.__mc.press('KeyW'));
-  await avancer(300, 1 / 60);
-  await page.evaluate(() => window.__mc.releaseAll());
-  const sorti = await etat();
-  const approche = Math.hypot(sorti.x - (sx + 0.5), sorti.z - (sz + 0.5));
+  const sortie = await sortieEau({
+    x, z, y: SEA, caps: [cap, cap + 40, cap - 40, cap + 90, cap - 90], frames: 600,
+  });
+  const approche = Math.hypot(sortie.meilleur.x - (sx + 0.5), sortie.meilleur.z - (sz + 0.5));
   check('on sort de l’eau en marchant',
-    sorti.onGround && !sorti.nage && sorti.feet >= SEA + 0.9 && approche <= 2.5,
-    `pieds ${sorti.feet.toFixed(2)} (berge attendue à ${SEA + 1}) · à ${(approche).toFixed(1)} cube de la berge · au sol=${sorti.onGround} · nage=${sorti.nage}`);
+    sortie.meilleur.sec && sortie.meilleur.feet >= SEA + 0.9,
+    `${sortie.reussis}/${sortie.tries} cap(s) mènent au sec · meilleur pieds ${sortie.meilleur.feet.toFixed(2)}`
+    + ` au sol=${sortie.meilleur.onGround} nage=${sortie.meilleur.nage}`
+    + ` · à ${(approche).toFixed(1)} cube de la berge visée`);
 
   // Teinte d'immersion : la tête sous l'eau change l'image. On l'éprouve en pleine
   // eau — poser le joueur sous la ligne au-dessus d'un haut-fond d'un cube ne le
@@ -917,35 +1026,23 @@ if (site && site.bord) {
     check('on nage dans une rivière', nageRiv.nage === true && nageRiv.feet > riv.sol,
       `nage=${nageRiv.nage} · pieds ${nageRiv.feet.toFixed(2)} au-dessus du lit ${riv.sol}`);
 
-    await page.evaluate((cap) => window.__mc.look(cap, 0), cap);
-    await page.evaluate(() => window.__mc.press('KeyW'));
-    await avancer(300, 1 / 60);
-    await page.evaluate(() => window.__mc.releaseAll());
-    const sorti = await etat();
-    check('on sort d’une rivière en marchant',
-      sorti.onGround && !sorti.nage && sorti.feet >= riv.top,
-      `pieds ${sorti.feet.toFixed(2)} (berge attendue à ${riv.top}) · au sol=${sorti.onGround} · nage=${sorti.nage}`);
+    const sec = await sortieEau({
+      x: riv.x, z: riv.z, y: riv.top - 0.6,
+      caps: [cap, cap + 40, cap - 40, cap + 90, cap - 90], frames: 600,
+    });
+    check('on sort d’une rivière en marchant', sec.meilleur.sec,
+      `${sec.reussis}/${sec.tries} cap(s) mènent au sec · meilleur pieds ${sec.meilleur.feet.toFixed(2)}`
+      + ` pour un plan d’eau à ${riv.top} · au sol=${sec.meilleur.onGround} nage=${sec.meilleur.nage}`);
 
     // L'autre sortie annoncée par le HUD : Espace fait monter le corps. Un joueur pris
     // sur une berge raide doit pouvoir s'en extraire sans marcher.
-    await page.evaluate(({ x, z, top }) => {
-      const mc = window.__mc;
-      mc.camera.position.set(x + 0.5, top - 0.6, z + 0.5);
-      mc.player.velocity.set(0, 0, 0);
-      mc.player.flyMode = false;
-      mc.streamAll();
-    }, riv);
-    await avancer(30, 1 / 60);
-    await page.evaluate(() => { window.__mc.press('KeyW'); window.__mc.press('Space'); });
-    await avancer(300, 1 / 60);
-    await page.evaluate(() => window.__mc.releaseAll());
-    // On laisse retomber les touches : Espace tenu fait sauter le joueur, et l'échantillon
-    // pris à la dernière image le surprendrait en l'air alors qu'il est sorti du cours.
-    await avancer(45, 1 / 60);
-    const grimpe = await etat();
-    check('on sort d’une rivière en montant sur Espace',
-      grimpe.onGround && !grimpe.nage && grimpe.feet >= riv.top,
-      `pieds ${grimpe.feet.toFixed(2)} (berge attendue à ${riv.top}) · au sol=${grimpe.onGround} · nage=${grimpe.nage}`);
+    const grimpe = await sortieEau({
+      x: riv.x, z: riv.z, y: riv.top - 0.6,
+      caps: [cap, cap + 40, cap - 40, cap + 90, cap - 90], frames: 420, saut: true,
+    });
+    check('on sort d’une rivière en montant sur Espace', grimpe.meilleur.sec,
+      `${grimpe.reussis}/${grimpe.tries} cap(s) mènent au sec · meilleur pieds ${grimpe.meilleur.feet.toFixed(2)}`
+      + ` pour un plan d’eau à ${riv.top} · au sol=${grimpe.meilleur.onGround} nage=${grimpe.meilleur.nage}`);
   }
 }
 

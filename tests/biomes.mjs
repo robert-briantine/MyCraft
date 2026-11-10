@@ -119,11 +119,16 @@ for (let cx = -CARRE; cx <= CARRE; cx++) {
       }
       runs.push(longueur);
     }
-    for (let lx = 0; lx < CHUNK_SIZE; lx += 4) {
-      for (let lz = 0; lz < CHUNK_SIZE; lz += 4) {
-        compteur[gen.biomeAt(baseX + lx, baseZ + lz)]++;
-      }
-    }
+  }
+}
+// Les parts se mesurent sur un carré de trois mille huit cents cubes, soit plusieurs
+// mailles de la forêt macro (900 cubes) : juger une zone à l'échelle d'un océan sur
+// huit cents cubes, c'est lire un seul tirage et l'appeler statistique — mesuré sur une
+// telle fenêtre, 78 % de forêt là où la carte n'en porte qu'un cinquième.
+const CARRE_PART = 120;
+for (let cx = -CARRE_PART; cx <= CARRE_PART; cx++) {
+  for (let cz = -CARRE_PART; cz <= CARRE_PART; cz++) {
+    compteur[gen.biomeAt(cx * CHUNK_SIZE + 8, cz * CHUNK_SIZE + 8)]++;
   }
 }
 const total = compteur.foret + compteur.plaine + compteur.desert;
@@ -138,6 +143,65 @@ check('les trois zones existent',
 check('une zone se traverse à pied, elle ne grésille pas d’un cube à l’autre',
   mediane >= 8,
   `longueur médiane d’un tenant le long d’une colonne : ${mediane} cubes`);
+
+// ---------------------------------------------------------------------------
+// 1 bis. La forêt macro tient l'échelle d'un bassin marin — « ajoute des zones de la
+//        même taille que les océans de forêt » : une nappe que le joueur traverse des
+//        minutes durant sans changer de pays, non un damier de bouquets.
+// ---------------------------------------------------------------------------
+{
+  const PAS = 8;
+  const PORTee = 1600;
+  const n = Math.floor(2 * PORTee / PAS) + 1;
+  const cle = (i, j) => i * n + j;
+  const masque = new Uint8Array(n * n);
+  let sousFutaie = 0;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      if (gen.grandeForet((i - n / 2) * PAS, (j - n / 2) * PAS)) {
+        masque[cle(i, j)] = 1;
+        sousFutaie++;
+      }
+    }
+  }
+  const vus = new Uint8Array(n * n);
+  const file = [];
+  let best = null;
+  for (let s = 0; s < n * n; s++) {
+    if (!masque[s] || vus[s]) continue;
+    file.length = 0;
+    file.push(s);
+    vus[s] = 1;
+    let minI = n, maxI = -1, minJ = n, maxJ = -1, taille = 0;
+    while (file.length) {
+      const c = file.pop();
+      const i = Math.floor(c / n);
+      const j = c % n;
+      taille++;
+      if (i < minI) minI = i;
+      if (i > maxI) maxI = i;
+      if (j < minJ) minJ = j;
+      if (j > maxJ) maxJ = j;
+      for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const ni = i + di;
+        const nj = j + dj;
+        if (ni < 0 || nj < 0 || ni >= n || nj >= n) continue;
+        const k = cle(ni, nj);
+        if (!masque[k] || vus[k]) continue;
+        vus[k] = 1;
+        file.push(k);
+      }
+    }
+    if (!best || taille > best.taille) {
+      best = { taille, largeur: (maxI - minI + 1) * PAS, profondeur: (maxJ - minJ + 1) * PAS };
+    }
+  }
+  check('la grande forêt tient l’échelle d’un bassin marin',
+    !!best && best.largeur >= 150 && best.profondeur >= 150 && sousFutaie / (n * n) > 0.05,
+    best ? `plus grande nappe ${best.largeur}×${best.profondeur} cubes · `
+      + `${(sousFutaie / (n * n) * 100).toFixed(0)} % de la carte sous futaie imposée`
+      : 'aucune grande forêt rencontrée');
+}
 
 // ---------------------------------------------------------------------------
 // 2. Le revêtement suit la zone et l’altitude.
@@ -240,6 +304,38 @@ check('rien ne pousse à hauteur d’homme sous les arbres', feuilleTropBasse ==
   `${feuilleTropBasse} feuille(s) sous ${BIOMES.headroom} cubes de garde-tête`);
 
 // ---------------------------------------------------------------------------
+// 3 bis. Sous bois, l'arbre est plus grand que dans les villes — « dans les forêts met
+//        des arbres plus grands que dans les villes ». Le verger qui borde les rues
+//        reste le petit sujet d'avant ; la futaie doit le dépasser nettement, sinon la
+//        forêt ne se lit pas comme un autre pays que la banlieue.
+// ---------------------------------------------------------------------------
+{
+  const futaie = [];
+  const verger = [];
+  // Les souches ne tombent qu'en un point tiré de leur maille de quatre cubes : on
+  // parcourt donc les mailles elles-mêmes, et l'on sonde leurs seize colonnes — la
+  // moitié des appels ne sont que le refus immédiat de `treeAt`. L'échantillon court sur
+  // près de trois mille cubes : à deux cents cubes près, on ne comparerait que la zone
+  // où le hasard a mis la forêt (mesuré sur une telle fenêtre : deux sujets de plaine).
+  const MAILLE = BIOMES.treeCell;
+  for (let i = -350; i <= 350; i += 5) {
+    for (let j = -350; j <= 350; j += 5) {
+      for (let dx = 0; dx < MAILLE; dx++) {
+        for (let dz = 0; dz < MAILLE; dz++) {
+          const a = gen.treeAt(i * MAILLE + dx, j * MAILLE + dz);
+          if (a) (a.futaie ? futaie : verger).push(a.tronc);
+        }
+      }
+    }
+  }
+  const med = (l) => (l.length ? l.slice().sort((x, y) => x - y)[Math.floor(l.length / 2)] : 0);
+  check('la futaie de forêt dépasse le verger des villes',
+    futaie.length > 200 && verger.length > 40 && med(futaie) >= med(verger) + 3,
+    `tronc médian : forêt ${med(futaie)} cubes (${futaie.length} sujets), `
+    + `plaine ${med(verger)} cubes (${verger.length} sujets)`);
+}
+
+// ---------------------------------------------------------------------------
 // 4. On se promène dans la forêt : l’air est libre partout sauf dans les troncs,
 //    et un tronc trouvé en chemin a toujours un voisin où déborder. Une feuille est
 //    solide dans ce jeu — compter dessus comme de l'air serait mentir au joueur.
@@ -311,6 +407,10 @@ for (let cx = -5; cx <= 5; cx++) {
     }
     for (let lx = 0; lx < CHUNK_SIZE; lx++) {
       for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+        // Même garde que la boucle précédente : ce que la suite juge, c'est la voirie.
+        // Sans elle on comptait chaque arbre du carré exploré et le contrôle ne pouvait
+        // passer que par chance — là où le hasard ne plantait rien près de l'origine.
+        if (!surVoirie(cx * CHUNK_SIZE + lx, cz * CHUNK_SIZE + lz)) continue;
         if (gen.treeAt(cx * CHUNK_SIZE + lx, cz * CHUNK_SIZE + lz)) arbreSurVoirie++;
       }
     }
@@ -391,7 +491,12 @@ check('les couronnes ne se coupent pas aux frontières de tronçon', manquants =
 // ---------------------------------------------------------------------------
 const { SimplexNoise } = await loadPublicModule('public/js/noise.js');
 const { createTerrain } = await loadPublicModule('public/js/terrain.js');
-const monde = createTerrain({ noise: new SimplexNoise(42), chunkHeight: CHUNK_HEIGHT });
+// La hauteur du MONDE du jeu (`game.js`, CHUNK_HEIGHT = 80), non celle des tampons de
+// tronçon ci-dessus. Le plafond du relief se déduit de cette valeur : à 64, toute la
+// section ne voyait que des sommets à cinquante-six cubes et jugerait infranchissable un
+// pays alpin dont le joueur ne voit jamais les crêtes à soixante-six.
+const HAUTEUR_MONDE = 80;
+const monde = createTerrain({ noise: new SimplexNoise(42), chunkHeight: HAUTEUR_MONDE });
 const memoMonde = new Map();
 const rel = (x, z) => {
   const cle = `${x},${z}`;
@@ -487,5 +592,107 @@ check('un sommet enneigé se gravit à pied depuis son pied',
     ? grimpees.map((g) => `(${g.x},${g.z}) à ${g.h} : `
       + `${g.ok ? `${g.colonnes} colonnes explorées` : g.raison}`).join(' | ')
     : 'aucun pic de montagne rencontré');
+
+// ---------------------------------------------------------------------------
+// 7 bis. Les très hautes montagnes. Le carré ci-dessus (±1200 cubes) peut fort bien ne
+//   contenir aucun massif alpin — l'échelle est celle des océans, donc le hasard de la
+//   graine décide. Et le pays alpin est exactement là où le relief s'affranchit du
+//   plafond ordinaire : le juger sur les seuls massifs habituels laisserait sans contrôle
+//   le relèvement de quarante-six cubes et l'écrête `min(h, alpsTop)`.
+//
+//   La porte est `alpsIntensity >= 0,06`, la même que lit le village pour se taire :
+//   c'est le pays que le joueur doit lire comme sauvage, pas une statistique interne.
+// ---------------------------------------------------------------------------
+const SAUVAGE = 0.06;
+const hauteursAlpes = [];
+let sondees = 0;
+let picAlpin = null;
+for (let x = -2048; x <= 2048; x += 8) {
+  for (let z = -2048; z <= 2048; z += 8) {
+    sondees++;
+    if (monde.alpsIntensity(x, z) < SAUVAGE) continue;
+    const y = rel(x, z);
+    hauteursAlpes.push(y);
+    if (!picAlpin || y > picAlpin.h) picAlpin = { x, z, h: y };
+  }
+}
+hauteursAlpes.sort((a, b) => a - b);
+const p99Alpes = hauteursAlpes.length ? hauteursAlpes[Math.floor(0.99 * hauteursAlpes.length)] : 0;
+check('le pays alpin porte de très hautes montagnes',
+  hauteursAlpes.length > 4000 && hauteursAlpes.length / sondees >= 0.05
+    && p99Alpes >= 55 && picAlpin && picAlpin.h >= 64,
+  `${(hauteursAlpes.length / sondees * 100).toFixed(1)} % de la carte sous la porte sauvage`
+    + ` · p99 ${p99Alpes} cubes · pic ${picAlpin ? `${picAlpin.h} à (${picAlpin.x},${picAlpin.z})` : 'aucun'}`);
+
+let grimpeAlpine = { ok: false, raison: 'aucun massif alpin rencontré' };
+if (picAlpin) {
+  // Un plateau dont la neige dépasse le rayon laisse les seize points de départ au-dessus
+  // de la ligne : on élargit jusqu'à trouver un pied.
+  for (const rayon of [240, 360, 500]) {
+    const r = grimpe(picAlpin.x, picAlpin.z, rayon);
+    if (r.ok || r.raison !== 'aucun pied sous la neige') {
+      grimpeAlpine = { ...r, rayon };
+      break;
+    }
+  }
+}
+check('le plus haut pic alpin se gravit à pied depuis son pied',
+  !!picAlpin && grimpeAlpine.ok,
+  picAlpin
+    ? `(${picAlpin.x},${picAlpin.z}) à ${picAlpin.h} cubes : `
+      + `${grimpeAlpine.ok ? `gravit en ${grimpeAlpine.rayon} cubes de rayon` : grimpeAlpine.raison}`
+    : 'aucun massif alpin sur ±2048 cubes');
+
+// Ce que les Alpes doivent répondre, ce n'est pas « le monde n'a aucun mur » — il en a,
+// et beaucoup, avant elles : sur trois fenêtres de ±300 cubes, **11 %** des colonnes
+// sèches adjacentes diffèrent de deux cubes ou plus (jusqu'à dix), le creusement des
+// sillons en cause ; le saut du joueur s'arrête à 1,67 cube (`JUMP_SPEED 10`, `GRAVITY
+// 30`). Ce chiffre-là est une affaire distincte, mesurée et signalée, pas la faute du
+// nouveau relief. Ce qui lui revient, c'est de ne rien ajouter aux murs déjà là : même
+// emprise géométrique, mesure avec et sans le relèvement alpin.
+const trempe = (t, x, z) => t.heightAt(x, z) > t.waterTopAt(x, z);
+function murs(t, cx, cz, rayon) {
+  let paires = 0, mauvais = 0, pire = 0;
+  for (let x = cx - rayon; x <= cx + rayon; x++) {
+    for (let z = cz - rayon; z <= cz + rayon; z++) {
+      if (monde.alpsIntensity(x, z) < SAUVAGE) continue;
+      if (!trempe(t, x, z)) continue;
+      const h = t.heightAt(x, z);
+      for (const [dx, dz] of [[1, 0], [0, 1]]) {
+        if (!trempe(t, x + dx, z + dz)) continue;
+        paires++;
+        const d = Math.abs(t.heightAt(x + dx, z + dz) - h);
+        if (d >= 2) mauvais++;
+        if (d > pire) pire = d;
+      }
+    }
+  }
+  return { paires, mauvais, pire, taux: paires ? mauvais / paires : 0 };
+}
+let mursAvec = null;
+let mursSans = null;
+if (picAlpin) {
+  const table = monde.RELIEF;
+  mursAvec = murs(monde, picAlpin.x, picAlpin.z, 260);
+  const lift = table.alpsLift;
+  const crag = table.alpsCrag;
+  table.alpsLift = 0;
+  table.alpsCrag = 0;
+  // Terrain neuf : les tracés de rivière sont mémoïsés par instance et le sol change sous
+  // leurs pieds — rejouer sur la même instance comparerait deux mondes différents.
+  const nu = createTerrain({ noise: new SimplexNoise(42), chunkHeight: HAUTEUR_MONDE });
+  mursSans = murs(nu, picAlpin.x, picAlpin.z, 260);
+  table.alpsLift = lift;
+  table.alpsCrag = crag;
+}
+check('les Alpes n\'ajoutent pas de murs que le pays ordinaire ne connaissait déjà',
+  !!mursAvec && mursAvec.paires > 20000 && mursSans.paires > 20000
+    && mursAvec.taux <= mursSans.taux * 1.25 + 0.005
+    && mursAvec.pire <= Math.max(mursSans.pire, 2) + 2,
+  mursAvec
+    ? `avec ${mursAvec.mauvais}/${mursAvec.paires} (${(mursAvec.taux * 100).toFixed(2)} %, pire `
+      + `${mursAvec.pire}) · sans ${mursSans.mauvais}/${mursSans.paires} (${(mursSans.taux * 100).toFixed(2)} %, `
+      + `pire ${mursSans.pire})`
+    : 'aucun massif alpin jaugé');
 
 process.exit(summary() > 0 ? 1 : 0);

@@ -36,6 +36,23 @@ export const RELIEF = {
   mountainCragFreq: 0.005,    // arêtes larges : du relief, pas du gravier
   mountainGrainFade: 18,      // le grain disparaît à mesure qu'on monte
 
+  // Très hautes montagnes. Demandé le 2026-11-09 : « des zones de la même taille que
+  // les océans de très haute montagne ». Même échelle que `oceanFreq`, donc mêmes
+  // dimensions — la plus grande nappe marine jointoyante mesure ~290×290 cubes sur le
+  // monde du jeu, et c'est l'empreinte visée ici. Coordonnées décalées des deux autres
+  // champs : posées sur les mêmes, les Alpes ne s'ouvriraient que dans les vallées déjà
+  // soulevées, ou se noieraient dans les bassins.
+  alpsFreq: 0.0011,
+  alpsOffsetX: -7300,
+  alpsOffsetZ: 5100,
+  alpsThreshold: 0.34,        // sous cette valeur, le pays reste ce qu'il est (~18 % de la carte)
+  alpsLift: 46,               // relèvement maximal au cœur : les pics visent ~66 cubes
+  alpsTop: 66,                // plafond visé des sommets — le joueur garde sa tête sous 72
+  alpsCrestFreq: 0.0022,      // crêtes intérieures : sans elles, le cœur est un plateau
+  alpsCrag: 4,                // arêtes sur les hauteurs
+  alpsCragFreq: 0.004,
+  alpsGrainFade: 40,          // le grain se retire bien plus haut que sur un massif ordinaire
+
   // Mer. `seaLevel` est la seule référence du projet : le village n'y bâtit pas, le
   // sable la borde (la ligne de sable du biome est à 20, soit quatre cubes de plage),
   // l'eau la remplit jusqu'à ce cube inclus. La couverture se lit sur les coordonnées
@@ -144,6 +161,33 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
     return RELIEF.oceanDepth * t * t * (3 - 2 * t);
   }
 
+  /**
+   * Intensité du très haut massif, de 0 (le pays ordinaire) à 1 (le cœur). Le village
+   * s'y cale pour n'y bâtir ni immeuble ni hameau dru : c'est la zone que le joueur
+   * doit lire comme sauvage sur des centaines de cubes, pas comme un accident.
+   */
+  function alpsIntensity(x, z) {
+    const c = noise.octave((x + RELIEF.alpsOffsetX) * RELIEF.alpsFreq,
+      (z + RELIEF.alpsOffsetZ) * RELIEF.alpsFreq, 3, 0.5);
+    if (c <= RELIEF.alpsThreshold) return 0;
+    return Math.min(1, (c - RELIEF.alpsThreshold) / (1 - RELIEF.alpsThreshold));
+  }
+
+  /**
+   * Relèvement dû au très haut massif, en cubes. Miroir exact du `massifLift` — rien
+   * sous le seuil, une sigmoïde ensuite — avec en plus une **crête** intérieure : sans
+   * elle, le cœur du massif était une table d'attente à son plafond, et non une chaîne.
+   */
+  function alpsLift(x, z) {
+    const t = alpsIntensity(x, z);
+    if (t <= 0) return 0;
+    const crete = 0.55 + 0.45 * Math.abs(noise.noise2D(
+      (x + 900) * RELIEF.alpsCrestFreq, (z - 700) * RELIEF.alpsCrestFreq));
+    const socle = RELIEF.alpsLift * t * t * (3 - 2 * t) * crete;
+    const crag = Math.abs(noise.noise2D(x * RELIEF.alpsCragFreq, z * RELIEF.alpsCragFreq));
+    return Math.round(socle + RELIEF.alpsCrag * crag * t);
+  }
+
   function rawHeight(x, z) {
     const base = noise.octave(x * 0.01, z * 0.01, 5, 0.5);
     const hills = noise.octave(x * 0.003, z * 0.003, 3, 0.4) * RELIEF.hillsAmp;
@@ -151,7 +195,9 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
     const t = Math.min(1, ridge / RELIEF.valleyWidth);
     const valley = 1 - t * t * (3 - 2 * t);
     const lift = massifLift(x, z);
+    const alps = alpsLift(x, z);
     const sink = oceanBasin(x, z);
+    const rise = lift + alps;
     // Le grain se retire à mesure qu'on monte : laissé entier, il suffisait à créer un
     // ressaut de deux cubes tous les dix pas sur un versant, et le marcheur — qui ne
     // franchit qu'un cube par colonne — butait sur une pente pourtant douce. Même raison
@@ -159,12 +205,18 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
     // un ressaut de deux cubes entre la dernière colonne noyée et la plage, et on
     // restait pris dans la mer sans pouvoir en sortir.
     const presDuRivage = Math.abs(RELIEF.baseHeight + base * RELIEF.baseAmp + hills
-      - RELIEF.valleyDepth * valley + lift - sink - RELIEF.seaLevel);
+      - RELIEF.valleyDepth * valley + rise - sink - RELIEF.seaLevel);
     const rive = Math.min(1, Math.max(0.2, presDuRivage / RELIEF.shoreGrainFade));
-    const grain = (lift > 0 ? Math.max(0.25, 1 - lift / RELIEF.mountainGrainFade) : 1) * rive;
+    const fondu = alps > 0 ? RELIEF.alpsGrainFade : RELIEF.mountainGrainFade;
+    const plancher = alps > 0 ? 0.15 : 0.25;
+    const grain = (rise > 0 ? Math.max(plancher, 1 - rise / fondu) : 1) * rive;
     const detail = noise.noise2D(x * 0.05, z * 0.05) * RELIEF.detailAmp * grain;
-    const h = RELIEF.baseHeight + base * RELIEF.baseAmp + hills
-      - RELIEF.valleyDepth * valley + detail + lift - sink;
+    let h = RELIEF.baseHeight + base * RELIEF.baseAmp + hills
+      - RELIEF.valleyDepth * valley + detail + rise - sink;
+    // Le sommet vise `alpsTop` : au-dessus, on ne remonte plus rien. Un plan constant
+    // ne casse pas la franchissabilité — le minimum de deux fonctions à un cube par
+    // colonne reste à un cube par colonne — mais il écrase l'arête, d'où la crête.
+    if (alps > 0) h = Math.min(h, RELIEF.alpsTop);
     return Math.max(RELIEF.minGround, Math.min(plafond, Math.floor(h)));
   }
 
@@ -253,7 +305,11 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
           x += dx / n * RELIEF.riverStep;
           z += dz / n * RELIEF.riverStep;
         }
-        if (!avorte && pts.length >= RELIEF.riverMinSteps) {
+        // Un cours se définit par son exutoire : s'il ne s'est pas déversé dans la mer,
+        // c'est un lac dessiné en rase campagne — un tracé qui s'arrête faute de pente y
+        // laissait un lit de six cents colonnes sans débouché (mesuré, fenêtre ±700).
+        const aboutit = pts.length && pts[pts.length - 1].surface <= RELIEF.seaLevel;
+        if (!avorte && aboutit && pts.length >= RELIEF.riverMinSteps) {
           const seaux = new Map();
           const bout = pts.length - 1;
           for (const p of pts) {
@@ -368,5 +424,6 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
     return riv ? Math.max(RELIEF.seaLevel, riv.surface) : RELIEF.seaLevel;
   }
 
-  return { heightAt: groundAt, rawHeight, riverAt, waterTopAt, massifLift, oceanBasin, RELIEF };
+  return { heightAt: groundAt, rawHeight, riverAt, waterTopAt, massifLift, oceanBasin,
+    alpsLift, alpsIntensity, RELIEF };
 }

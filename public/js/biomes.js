@@ -26,9 +26,22 @@ export const BIOMES = {
   climateCell: 150,
   climateDetail: 3,      // un octave serré divise la maille : frontières découpées
   dryLimit: -0.10,       // sous ce seuil de fraîcheur, le sable prend le terrain
-  wetLimit: 0.06,        // au-dessus, les arbres ; entre les deux, l'herbe rase
+  // 0,06 jusqu'ici. Remonté à 0,10 quand la forêt macro est venue s'y superposer : sans
+  // ce resserrement, la couche nouvelle mangeait la plaine (mesuré sur trois mille
+  // cubes : plaine 20 % contre 25 % avant, forêt 51 %). La plaine doit rester le pays
+  // que l'on traverse entre deux bois, pas un reliquat.
+  wetLimit: 0.10,
   forestMin: 0.10,       // part de forêt visée (contrôlée par la suite, pas imposée)
   desertMin: 0.08,       // …et part de désert
+
+  // Forêts à l'échelle des océans. Demandé le 2026-11-09 : « ajoute des zones de la
+  // même taille que les océans de forêt ». Le climat ci-dessus dessine des zones de
+  // quelques dizaines de tronçons ; ici la maille est celle d'un bassin marin — 900
+  // cubes, l'équivalent de `RELIEF.oceanFreq` — donc une forêt que l'on traverse une
+  // demi-heure sans changer de pays. Le seuil est haut : sous lui, rien n'est imposé
+  // et le climat garde la main, sinon la carte entière devenait boisée.
+  forestMacroCell: 900,
+  forestMacroLimit: 0.78,
 
   // Bouquets : la forêt va par taches, pas en nappe égale — on y trouve des clairières.
   // Le peuplement doit descendre assez bas pour qu'un bouquet retenu se remplisse : à
@@ -56,6 +69,19 @@ export const BIOMES = {
   crownBigChance: 0.22,  // part des grands sujets à couronne large
   headroom: 4,
   maxSlope: 2,           // un arbre ne prend pas racine dans une pente raide
+
+  // Futaie de forêt. Demandé le 2026-11-09 : « dans les forêts mets des arbres plus
+  // grands que dans les villes ». Le sujet de plaine — celui qui borde les rues du
+  // village — reste le petit verger d'avant ; sous bois, le tronc monte presque du
+  // double et la couronne s'élargit. Le garde-tête ne descend jamais sous `headroom`,
+  // seulement il est pris plus haut : on marche debout sous les futaies comme sous les
+  // pommiers, c'est l'échelle qui change, pas la règle de franchissement.
+  futaieTrunkMin: 9,
+  futaieTrunkMax: 13,
+  futaieCrownRadius: 3,
+  futaieCrownBigRadius: 4,
+  futaieCrownBigChance: 0.3,
+  futaieHeadroom: 5,
 
   // Étages d'altitude, partagés avec le village (qui n'y bâtit pas). Entre la limite
   // des arbres et la ligne de neige la roche reste nue : sans cet étage intermédiaire,
@@ -110,6 +136,7 @@ export function createBiomeGen({
   const SALT_PICK = S(4505);
   const SALT_SHAPE = S(4606);
   const SALT_SNAG = S(4707);
+  const SALT_MACRO = S(4808);
 
   const fade = (t) => t * t * (3 - 2 * t);
 
@@ -134,11 +161,25 @@ export function createBiomeGen({
   }
 
   /**
+   * La grande forêt : une zone à l'échelle d'un bassin marin (`forestMacroCell`, soit
+   * l'équivalent de `RELIEF.oceanFreq`), indépendante du climat. Fonction pure des
+   * coordonnées, comme tout le reste du module — une souche jugée depuis le tronçon
+   * voisin doit trouver la même lisière des deux côtés.
+   */
+  function grandeForet(x, z) {
+    return bruit(x, z, BIOMES.forestMacroCell, SALT_MACRO) >= BIOMES.forestMacroLimit;
+  }
+
+  /**
    * Zone dominante en un point : `desert`, `plaine` ou `foret`. Fonction pure des
    * coordonnées absolues — un arbre planté à la frontière d'une zone régénérée depuis
    * un autre tronçon doit trouver la même zone des deux côtés.
    */
   function biomeAt(x, z) {
+    // La grande forêt commande d'abord : sous une futaie de trois cents cubes, un
+    // climat sec ne peut pas décider du sable — ce serait une forêt coupée net en son
+    // milieu, et non une zone que l'on traverse à pied.
+    if (grandeForet(x, z)) return 'foret';
     const frais = climat(x, z, BIOMES.climateCell, SALT_WET)
       - climat(x, z, BIOMES.climateCell, SALT_HEAT);
     if (frais < BIOMES.dryLimit) return 'desert';
@@ -224,11 +265,19 @@ export function createBiomeGen({
     // Ni sur la grève, ni au-dessus de la limite des arbres : un arbre qui pousserait
     // sur la roche nue contredirait l'étage qu'affiche le revêtement en dessous.
     if (h >= BIOMES.treeLine || h <= BIOMES.sandLine) return null;
+    // Sous bois, ce n'est plus le même sujet : la futaie vise le double du verger de
+    // plaine qui borde les rues du village. Le garde-tête se prend plus haut, jamais
+    // plus bas — `headroom` reste le plancher absolu de la circulation sous feuillage.
+    const futaie = biome === 'foret';
+    const troncMin = futaie ? BIOMES.futaieTrunkMin : BIOMES.trunkMin;
+    const troncMax = futaie ? BIOMES.futaieTrunkMax : BIOMES.trunkMax;
+    const grandRayon = futaie ? BIOMES.futaieCrownBigRadius : BIOMES.crownBigRadius;
+    const petitRayon = futaie ? BIOMES.futaieCrownRadius : BIOMES.crownRadius;
     // Ni dans une pente raide, ni sur la voirie ni sous un bâti. La sonde court sur la
     // **couronne**, pas sur la seule souche : ses neuf points couvrent le plus grand
     // rayon possible, faute de quoi un pan de feuillage resterait suspendu au-dessus
     // d'une avenue ou scellé dans le mur d'une maison.
-    const R = BIOMES.crownBigRadius;
+    const R = grandRayon;
     for (let dx = -R; dx <= R; dx += R) {
       for (let dz = -R; dz <= R; dz += R) {
         if (Math.abs(relief(wx + dx, wz + dz) - h) > BIOMES.maxSlope) return null;
@@ -238,29 +287,39 @@ export function createBiomeGen({
         if (surCours(wx + dx, wz + dz)) return null;
       }
     }
-    const rayon = roll(wx, 11, wz, SALT_SHAPE) < BIOMES.crownBigChance
-      ? BIOMES.crownBigRadius : BIOMES.crownRadius;
+    const rayon = roll(wx, 11, wz, SALT_SHAPE)
+      < (futaie ? BIOMES.futaieCrownBigChance : BIOMES.crownBigChance) ? grandRayon : petitRayon;
     // La couronne se cale sur le **point haut** de son empreinte, pas sur la souche :
     // sur un versant, caler à quatre cubes du pied ferait pendre le feuillage à deux
     // cubes du sol du voisin du côté montant, et une feuille est solide — on buterait
     // dedans. Le tronc s'allonge d'autant, c'est ce qu'on attend d'un arbre en pente.
+    //
+    // Et l'empreinte se juge colonne par colonne, non par échantillon : c'est exactement
+    // la région où le feuillage sera écrit, alors que la sonde rapide ci-dessus ne tombe
+    // qu'à neuf points espacés du plus grand rayon — rien dans ce calcul n'empêche un
+    // bord de couronne de retomber sur une avenue de sept colonnes entre deux sondes.
+    // (Vérifié en rejouant la suite sur une copie amputée de cette boucle : 0 souche sur
+    // la voirie, donc l'échantillonné ne faillissait pas ici — mais ne le garantissait
+    // pas.) La couronne déborde d'un cube en diagonale, et c'est ce cube-là qui sinon
+    // pendrait au-dessus d'une corniche plus haute que lui.
     let sol = h;
-    // Le périmètre sondé est celui où le feuillage sera réellement écrit : la couronne
-    // déborde d'un cube en diagonale, et c'est ce cube-là qui sinon pendrait au-dessus
-    // d'une corniche plus haute que lui.
     for (let dx = -rayon - 1; dx <= rayon + 1; dx++) {
       for (let dz = -rayon - 1; dz <= rayon + 1; dz++) {
         const v = relief(wx + dx, wz + dz);
+        if (Math.abs(v - h) > BIOMES.maxSlope) return null;
+        if (isBlocked(wx + dx, wz + dz)) return null;
+        if (surCours(wx + dx, wz + dz)) return null;
         if (v > sol) sol = v;
       }
     }
-    const hauteur = BIOMES.trunkMin + Math.floor(
-      roll(wx, 12, wz, SALT_SHAPE) * (BIOMES.trunkMax - BIOMES.trunkMin + 1),
+    const hauteur = troncMin + Math.floor(
+      roll(wx, 12, wz, SALT_SHAPE) * (troncMax - troncMin + 1),
     );
-    const couronne = Math.max(sol + BIOMES.headroom, h + hauteur);   // première assise de feuilles
+    const vide = futaie ? BIOMES.futaieHeadroom : BIOMES.headroom;
+    const couronne = Math.max(sol + vide, h + hauteur);   // première assise de feuilles
     const tronc = couronne - h;
-    if (tronc > BIOMES.trunkMax + BIOMES.maxSlope) return null;
-    return { x: wx, z: wz, sol: h, faîte: sol, tronc, rayon, couronne };
+    if (tronc > troncMax + BIOMES.maxSlope) return null;
+    return { x: wx, z: wz, sol: h, faîte: sol, tronc, rayon, couronne, futaie };
   }
 
   /** Écrit un bloc s'il ne détruit rien : la végétation pousse dans le vide. */
@@ -281,7 +340,9 @@ export function createBiomeGen({
     const baseX = cx * CHUNK_SIZE;
     const baseZ = cz * CHUNK_SIZE;
     const cellules = CHUNK_SIZE * CHUNK_SIZE;
-    const marge = BIOMES.crownBigRadius + 1;
+    // La marge est le plus grand rayon des deux étages de sujet, pas celui de la plaine :
+    // une futaie née à six cubes hors du tronçon fait malgré tout pendre sa couronne ici.
+    const marge = Math.max(BIOMES.crownBigRadius, BIOMES.futaieCrownBigRadius) + 1;
     const i0 = Math.floor((baseX - marge) / BIOMES.treeCell);
     const i1 = Math.floor((baseX + CHUNK_SIZE + marge) / BIOMES.treeCell);
     const j0 = Math.floor((baseZ - marge) / BIOMES.treeCell);
@@ -352,5 +413,5 @@ export function createBiomeGen({
     }
   }
 
-  return { BIOMES, biomeAt, peuplement, surfaceFor, treeAt, stampVegetation };
+  return { BIOMES, biomeAt, peuplement, surfaceFor, treeAt, stampVegetation, grandeForet };
 }

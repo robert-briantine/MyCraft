@@ -536,10 +536,20 @@ const frame = await page.evaluate(() => {
   // rues et les murs taillés du village sont gris : « terrain » ne veut plus dire
   // « brun », donc on compte là tout ce qui n'est ni ciel ni noir.
   let belowSamples = 0, groundBelow = 0;
+  // Le haut de l'image doit être du ciel. Un seul pixel n'y suffisait pas : un arbre, une
+  // flèche ou un pan de massif qui entre dans le cadre noie la mesure d'un unique échantillon,
+  // alors que le ciel occupe encore les trois quarts de la bande. C'est donc une proportion
+  // qui juge, et elle est prise sur les quatorze premiers pour cent de la hauteur.
+  const bandeCiel = Math.max(8, Math.round(h * 0.14));
+  let cielSamples = 0, ciel = 0;
   for (let y = 0; y < h; y += 3) {
     for (let x = 0; x < w; x += 3) {
       const i = (y * w + x) * 4;
       const r = px[i], g = px[i + 1], b = px[i + 2];
+      if (y >= h - bandeCiel) {
+        cielSamples++;
+        if (b > 150 && b > r + 10) ciel++;
+      }
       const bucket = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3);
       uniq.add(bucket);
       const lum = 0.299 * r + 0.587 * g + 0.114 * b;
@@ -573,6 +583,7 @@ const frame = await page.evaluate(() => {
     earthyFrac: earthy / samples,
     bluishFrac: bluish / samples,
     groundFrac: belowSamples ? groundBelow / belowSamples : 0,
+    cielFrac: cielSamples ? ciel / cielSamples : 0,
     skyPixel: pixelAt(w >> 1, 8),
     groundPixel: pixelAt(w >> 1, h - 12),
   };
@@ -583,9 +594,9 @@ check('l’image rendue est riche et correctement exposée',
   `${frame.uniq} couleurs (${frame.uniqTerrain} sous l’horizon), luminance ${frame.lum.toFixed(0)}, ` +
   `noirs écrasés ${(frame.crushedFrac * 100).toFixed(1)}%`);
 check('ciel en haut, végétation et sol en bas',
-  frame.skyPixel[2] > frame.skyPixel[0] && frame.skyPixel[2] > 150 &&
-  frame.greenishFrac > 0.05 && frame.groundFrac > 0.6,
-  `ciel=[${frame.skyPixel}] sol=[${frame.groundPixel}] vert=${(frame.greenishFrac * 100).toFixed(1)}% `
+  frame.cielFrac > 0.5 && frame.greenishFrac > 0.05 && frame.groundFrac > 0.6,
+  `bande du haut = ${(frame.cielFrac * 100).toFixed(0)}% de ciel · ciel=[${frame.skyPixel}] `
+  + `sol=[${frame.groundPixel}] vert=${(frame.greenishFrac * 100).toFixed(1)}% `
   + `bas rempli=${(frame.groundFrac * 100).toFixed(0)}% (dont brun=${(frame.earthyFrac * 100).toFixed(1)}%)`);
 
 await page.evaluate(() => {
@@ -1237,7 +1248,36 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
           const wx = dirX ? x + d : x + lat;
           const wz = dirZ ? z + d : z + lat;
           if (mc.biomeAt(wx, wz) !== 'foret') return false;
-          if (mc.cellOccupied(wx, wz)) return false;
+          // `cellGenante` et non `cellOccupied` : la cour de deux cubes qui ceinture
+          // chaque bâtiment reste du domaine bâti ; une promenade « sous les arbres » ne
+          // doit pas se jouer dans une cour où l'arbre n'a justement pas le droit de
+          // pousser.
+          if (mc.cellGenante(wx, wz)) return false;
+        }
+      }
+      return true;
+    };
+
+    /**
+     * Le couloir est-il praticable à pied ? Un promeneur ne descend pas une falaise dans
+     * l'eau : mesuré le 2026-11-09, la sonde avait choisi un couloir plongeant de dix-neuf
+     * cubes en douze colonnes jusque dans un lac, où le joueur finit les pieds en l'air —
+     * le contrôle mesurait alors une chute, non une traversée. Le couloir doit donc rester
+     * sec et conduire à plat : un cube de dénivelé par colonne, la marche que le joueur
+     * franchit sans sauter, la règle même des avenues.
+     */
+    const couloirPraticable = (x, z, dirX, dirZ, distance) => {
+      const dernier = [null, null, null];
+      for (let d = 0; d <= distance; d++) {
+        for (let lat = -1; lat <= 1; lat++) {
+          const wx = dirX ? x + d : x + lat;
+          const wz = dirZ ? z + d : z + lat;
+          const h = mc.getTerrainHeight(wx, wz);
+          if (mc.world.getBlock(wx, h, wz) === mc.BLOCK.WATER
+            || mc.world.getBlock(wx, h + 1, wz) === mc.BLOCK.WATER) return false;
+          const i = lat + 1;
+          if (dernier[i] !== null && Math.abs(dernier[i] - h) > 1) return false;
+          dernier[i] = h;
         }
       }
       return true;
@@ -1303,6 +1343,7 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
         const n = compteTroncs(c.x, c.z, dx, dz, DISTANCE);
         if (n === 0) continue;                             // hors d'une futaie : rien à prouver
         if (!couloirBoise(c.x, c.z, dx, dz, DISTANCE)) continue;
+        if (!couloirPraticable(c.x, c.z, dx, dz, DISTANCE)) continue;
         if (!meilleur || n < meilleur.troncs) meilleur = { dx, dz, troncs: n };
       }
       if (!meilleur) continue;
@@ -1340,12 +1381,24 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
         if (mc.world.getBlock(t.ex + dir.dx * (C - 2), y, t.ez + dir.dz * (C - 2)) === mc.BLOCK.AIR) vide++;
         else break;
       }
-      // Départ : deux colonnes au-delà du degré, sur le terrain naturel.
-      const departX = t.ex + dir.dx * (t.half + TP.templeSteps + 2);
-      const departZ = t.ez + dir.dz * (t.half + TP.templeSteps + 2);
-      placer(departX + 0.5, mc.getTerrainHeight(departX, departZ) + 1, departZ + 0.5);
+      // Départ : deux colonnes au-delà de la dernière marche **réellement posée**, sur la
+      // surface du monde construit. Le relief brut ignore le remblai du degré : poser le
+      // joueur à « getTerrainHeight + 1 » sous une marche, c'est l'enterrer dans la pierre
+      // — et un joueur noyé dans le solide ne gravit rien du tout (mesuré : pieds 17 pour
+      // un parvis à 43, le long d'un degré que la pente avait fait s'allonger).
+      const portee = t.degre && t.degre.length ? t.degre.length : TP.templeSteps + 4;
+      const departX = t.ex + dir.dx * (t.half + portee + 2);
+      const departZ = t.ez + dir.dz * (t.half + portee + 2);
+      let yDep = null;
+      // Le premier solide en descendant peut être une branche : la surface se reconnaît à
+      // ce qu'elle repose sur deux cubes pleins.
+      for (let y = 79; y >= 2 && yDep === null; y--) {
+        if (solid(departX, y, departZ) && solid(departX, y - 1, departZ) && solid(departX, y - 2, departZ)) yDep = y;
+      }
+      if (yDep === null) continue;                // colonne sans sol maillé : on passe
+      placer(departX + 0.5, yDep + 1, departZ + 0.5);
       let attente2 = 0;
-      while (attente2++ < 3000 && !solid(departX, mc.getTerrainHeight(departX, departZ), departZ)) {
+      while (attente2++ < 3000 && !solid(departX, yDep, departZ)) {
         mc.streamAll();
         mc.step(1 / 60);
       }
