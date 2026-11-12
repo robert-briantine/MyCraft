@@ -65,9 +65,14 @@ check('la valeur est expliquée en clair',
   s0.label);
 
 // ============================================================ 2. the default really drives the world
+// L'enveloppe du voile se lit en fractions de la portée : `far = rayon × CHUNK_SIZE ×
+// 0,98`. Repoussée depuis 0,85 — à cette valeur le plein jour lavait les cubes de moyen
+// distance dans la teinte de brume (« les cubes à l'horizon sont tous blancs en pleine
+// journée ») — elle doit rester sous `camera.far`, sinon le relief se tranche net au lieu
+// de se fondre.
 check('la distance par défaut pilote le monde et le brouillard',
   s0.r === s0.def && s0.inRange === (2 * s0.r + 1) ** 2 &&
-  s0.fogNear < s0.fogFar && Math.abs(s0.fogFar - s0.r * CS * 0.85) < 0.01 &&
+  s0.fogNear < s0.fogFar && Math.abs(s0.fogFar - s0.r * CS * 0.98) < 0.01 &&
   s0.camFar >= s0.fogFar,
   `${s0.inRange} tronçons, brouillard ${s0.fogNear.toFixed(0)}–${s0.fogFar.toFixed(0)}, loin ${s0.camFar}`);
 
@@ -82,7 +87,7 @@ check('augmenter le curseur charge plus de terrain, sans recharger la page',
   grown.inRange === (2 * grown.r + 1) ** 2 && grown.meshes > beforeGrow,
   `${s0.r} → ${grown.r} chunks · ${grown.inRange} tronçons · ${grown.meshes} meshes`);
 check('le brouillard suit la nouvelle portée',
-  Math.abs(grown.fogFar - grown.r * CS * 0.85) < 0.01 && grown.fogFar > s0.fogFar,
+  Math.abs(grown.fogFar - grown.r * CS * 0.98) < 0.01 && grown.fogFar > s0.fogFar,
   `${s0.fogFar.toFixed(0)} → ${grown.fogFar.toFixed(0)}`);
 check('l’affichage texte suit le curseur',
   grown.label.startsWith(`${grown.r} chunk`) &&

@@ -45,6 +45,99 @@
   }
   #settings .setting-note { margin-top: 10px; font-size: 11px; color: #8f98a5; }
 
+  /* ---- world generation: compact entry on the start screen ---- */
+  .worldgen-entry { margin-top: 14px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .worldgen-entry button {
+    font-family: inherit; font-size: 13px; color: #fff; cursor: pointer;
+    background: #37573b; border: 1px solid #4c7352; border-radius: 3px; padding: 7px 16px;
+  }
+  .worldgen-entry button:hover { background: #436b49; }
+  #worldgen-resume { margin: 0; font-size: 11px; color: #8f98a5; }
+
+  /* ---- world generation: full-screen editor (3D render paused behind) ---- */
+  #worldgen-screen {
+    position: fixed; inset: 0; z-index: 200;
+    display: flex; flex-direction: column; gap: 12px;
+    padding: 14px 18px 16px; background: #10131a; color: #e6ecf3;
+  }
+  #worldgen-screen[hidden] { display: none; }
+  #worldgen-screen .wg-head {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    border-bottom: 1px solid #2c3138; padding-bottom: 8px;
+  }
+  #worldgen-screen .wg-head h2 { margin: 0; font-size: 1.2em; letter-spacing: 1px; color: #cfe8c4; }
+  #worldgen-screen .wg-status { flex: 1 1 280px; margin: 0; font-size: 11px; color: #8f98a5; }
+  #worldgen-screen .wg-head button {
+    font-family: inherit; font-size: 12px; color: #fff; cursor: pointer;
+    background: #2c3138; border: 1px solid #3d434d; border-radius: 3px; padding: 5px 12px;
+  }
+  #worldgen-screen .wg-head button:hover { background: #3a414b; }
+  #worldgen-screen .wg-body {
+    flex: 1 1 auto; min-height: 0;
+    display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 18px;
+  }
+  #worldgen-screen .wg-map-pane { min-width: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 8px; }
+  #worldgen-screen .wg-cadre { display: grid; place-items: center; min-height: 0; }
+  #worldgen-map {
+    display: block; image-rendering: pixelated;
+    border: 1px solid #3d434d; background: #0c0e12;
+  }
+  #worldgen-screen .wg-aide summary {
+    cursor: pointer; font-size: 11px; letter-spacing: 0.5px; color: #7fbf6a; outline-offset: 2px;
+  }
+  #worldgen-screen .wg-note { margin: 6px 0 0; font-size: 11px; line-height: 1.45; color: #7f8894; max-width: 78ch; }
+  #worldgen-screen .wg-side {
+    display: flex; flex-direction: column; gap: 12px;
+    min-height: 0; overflow-y: auto; padding-right: 6px;
+  }
+  #worldgen-screen .worldgen-readout {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 3px 12px; font-size: 12px; color: #a8b2bf;
+  }
+  #worldgen-screen .worldgen-stat { display: flex; gap: 6px; align-items: baseline; }
+  #worldgen-screen .worldgen-stat span { flex: 1 1 auto; }
+  #worldgen-screen .worldgen-stat b { color: #d9f2d0; font-weight: normal; }
+  #worldgen-screen .worldgen-stat i { color: #7f8894; font-style: normal; font-size: 10px; }
+  #worldgen-screen .worldgen-group {
+    margin: 12px 0 5px; font-size: 10px; letter-spacing: 1px; color: #7fbf6a;
+    border-bottom: 1px solid #2c3138; padding-bottom: 2px;
+  }
+  #worldgen-screen .worldgen-row {
+    display: grid; grid-template-columns: 112px 1fr 104px; gap: 10px;
+    align-items: center; padding: 3px 0;
+  }
+  #worldgen-screen .worldgen-row label { font-size: 12px; }
+  #worldgen-screen .worldgen-row input[type="range"] { accent-color: #5b5; height: 20px; }
+  #worldgen-screen .worldgen-row input[type="number"] {
+    width: 96px; font-family: inherit; font-size: 12px; color: #fff;
+    background: #23272e; border: 1px solid #3d434d; border-radius: 3px; padding: 4px 6px;
+  }
+  #worldgen-screen .worldgen-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: #5b5; justify-self: start; }
+  #worldgen-screen .worldgen-row output { font-size: 11px; color: #a8b2bf; text-align: right; }
+  #worldgen-screen .worldgen-row .worldgen-hint {
+    grid-column: 2 / -1; font-size: 10px; color: #7f8894; line-height: 1.35;
+  }
+  #worldgen-screen .worldgen-row.hors-service { opacity: 0.4; }
+  #worldgen-screen .worldgen-nom { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+  #worldgen-screen .worldgen-nom label { width: 112px; flex: 0 0 auto; }
+  #worldgen-screen .worldgen-nom input {
+    flex: 1 1 auto; min-width: 0; font-family: inherit; font-size: 12px; color: #fff;
+    background: #23272e; border: 1px solid #3d434d; border-radius: 3px; padding: 5px 7px;
+  }
+  #worldgen-screen .worldgen-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  #worldgen-screen .worldgen-actions button {
+    font-family: inherit; font-size: 12px; color: #fff; cursor: pointer;
+    background: #37573b; border: 1px solid #4c7352; border-radius: 3px; padding: 7px 12px;
+  }
+  #worldgen-screen .worldgen-actions button:hover { background: #436b49; }
+  #worldgen-screen #worldgen-apply { background: #4a3030; border-color: #6d4444; }
+  #worldgen-screen #worldgen-apply:hover { background: #5f3a3a; }
+  #worldgen-screen #worldgen-apply.confirm { background: #7a3030; border-color: #a04040; }
+  @media (max-width: 900px) {
+    #worldgen-screen .wg-body { grid-template-columns: minmax(0, 1fr); }
+    #worldgen-screen .wg-side { overflow-y: visible; }
+  }
+
   /* ---- saved worlds (start screen) ---- */
   #worlds {
     margin-top: 18px; width: min(520px, 86vw); text-align: left;
@@ -87,6 +180,14 @@
     position: fixed; right: 12px; bottom: 12px; z-index: 50;
     font-size: 11px; color: #9fb0a5; text-shadow: 0 0 2px #000;
     pointer-events: none;
+  }
+
+  /* L'heure du monde, en haut à droite — c'est aussi le témoin que lit la suite de
+     tests pour vérifier que le cycle tourne et s'arrête où on le pose. */
+  #clock {
+    position: fixed; right: 12px; top: 12px; z-index: 50;
+    font-size: 12px; color: #dfe8e0; text-shadow: 0 0 3px #000;
+    letter-spacing: 0.4px; pointer-events: none;
   }
 
   #crosshair {
@@ -223,8 +324,19 @@
       <input type="range" id="render-distance" min="2" max="32" step="1" value="4">
       <output id="render-distance-value" for="render-distance">—</output>
     </div>
+    <div class="setting-row">
+      <label for="day-length">Durée du jour</label>
+      <input type="range" id="day-length" min="60" max="3600" step="30" value="480">
+      <output id="day-length-value" for="day-length">—</output>
+    </div>
     <p class="setting-note">Aperçu en direct derrière ce panneau · valeur mémorisée entre les sessions</p>
+    <p class="setting-note">Le soleil se lève à l'est, culmine à midi et se couche derrière le relief ; la nuit tombe sur le monde et les lanternes des villes s'allument. Sous terre il fait noir en toute heure — posez-y une lanterne.</p>
   </details>
+
+  <div class="worldgen-entry">
+    <button id="worldgen-open" title="Ouvrir l'écran de réglage du monde">🗺 Régler la génération du monde</button>
+    <p id="worldgen-resume" class="setting-note"></p>
+  </div>
 
   <div id="worlds">
     <div class="worlds-head">
@@ -243,6 +355,60 @@
   <button class="start-btn" id="start-btn">Cliquer pour jouer</button>
 </div>
 
+<!-- Écran de réglage du monde : il occupe toute la fenêtre et, pendant qu'il est
+     ouvert, la boucle d'animation ne rend plus le monde — rien de visible derrière. -->
+<div id="worldgen-screen" hidden>
+  <div class="wg-head">
+    <h2>Génération du monde</h2>
+    <p id="worldgen-status" class="wg-status"></p>
+    <button id="worldgen-close" title="Fermer l'écran (Échap)">✕ Fermer</button>
+  </div>
+  <div class="wg-body">
+    <div class="wg-map-pane">
+      <div class="wg-cadre">
+        <canvas id="worldgen-map" width="216" height="216" aria-label="Carte du monde vue de dessus"></canvas>
+      </div>
+      <!-- Déplié, ce texte volerait trente pixels de carte par ligne : il reste clos,
+           mais la réponse est là quand le joueur se demande pourquoi le sable survit. -->
+      <details class="wg-aide">
+        <summary>Pourquoi ces chiffres</summary>
+        <p class="wg-note">
+          La carte est un aperçu calculé — relief et climat, sans les rivières. Les chiffres
+          mesurés portent sur le cœur de l'île ; ils peuvent différer de la valeur visée quand
+          le grand boisé ou le talus côtier fixent une limite, et c'est alors la mesure qui a
+          raison. Une île plus petite qu'un grand boisé (900 cubes) se décrit mal : les parts
+          disent ce quartier, pas le monde. Le curseur « Désert » ne gouverne que la zone
+          aride du climat : toute colonne sous la ligne de grève reste du sable, c'est la
+          plage — la ligne « Sable au sol » en donne la part, et son curseur à elle est
+          « Largeur de la plage », compté en cubes au-dessus de l'eau (son plafond est la
+          grève d'aujourd'hui, car le village lotit juste au-dessus). Les trois curseurs
+          « Types de ville » sont des parts relatives, pas un partage à cent : ils disent
+          quelle sorte de centre-bourg tire une maille, et chaque sorte porte son rayon
+          d'influence, sa hauteur maximale et sa fréquence de blocs d'immeubles — c'est la
+          ligne « Plus grande agglomération » qui en donne la mesure. Rien n'est appliqué
+          avant le
+          clic sur un bouton : changer de fiche, c'est refaire le relief sous les blocs déjà
+          posés.
+        </p>
+      </details>
+    </div>
+    <div class="wg-side">
+      <div id="worldgen-readout" class="worldgen-readout"></div>
+      <div id="worldgen-fields" class="worldgen-fields"></div>
+      <div class="worldgen-nom">
+        <label for="worldgen-name">Nom du nouveau monde</label>
+        <input id="worldgen-name" type="text" maxlength="48" placeholder="laisser vide : la date du jour"
+               autocomplete="off" spellcheck="false" aria-label="Nom du nouveau monde" />
+      </div>
+      <div class="worldgen-actions">
+        <button id="worldgen-reset" title="Rétablir les réglages du monde d'aujourd'hui">Valeurs par défaut</button>
+        <button id="worldgen-new" title="Crée un monde neuf avec ces réglages, sans toucher à celui en cours">Nouveau monde avec ces réglages</button>
+        <button id="worldgen-apply" title="Efface la sauvegarde de ce monde et le refait avec ces réglages">Régénérer ce monde</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="crosshair">+</div>
 <div id="underwater"></div>
 <div id="swim-hint">🌊 Vous nagez — Espace pour monter, Majuscule pour couler</div>
@@ -250,6 +416,8 @@
 <div id="hotbar"></div>
 
 <div id="info"></div>
+
+<div id="clock">—</div>
 
 <div id="save-status">💾 —</div>
 

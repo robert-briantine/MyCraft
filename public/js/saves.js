@@ -60,8 +60,13 @@ export function cleanWorldName(rawName) {
  * Serialise l'état persistant. `edits` est la Map "x,y,z" -> blockId du monde ;
  * les clés sont découpées une seule fois et écrites en tableau plat de quatruples,
  * format le plus compact et le plus rapide à relire.
+ *
+ * `monde` est la fiche de génération (parts de forêt, de désert, rayon de l'île…).
+ * Elle voyage avec le monde parce que le fichier ne porte que le diff du joueur : sans
+ * elle, un monde créé avec une île de 900 cubes se régénérerait sur les constantes par
+ * défaut et les blocs posés par le joueur se retrouveraient ailleurs.
  */
-export function encodeSave({ seed, name, player, edits }) {
+export function encodeSave({ seed, name, player, edits, monde = null }) {
   const cells = [];
   for (const [key, id] of edits) {
     const first = key.indexOf(',');
@@ -72,6 +77,7 @@ export function encodeSave({ seed, name, player, edits }) {
   return JSON.stringify({
     version: SAVE_VERSION,
     seed,
+    monde: monde && typeof monde === 'object' ? monde : null,
     // Nom d'affichage, distinct du slot qui doit rester un nom de fichier sûr.
     // Placé dans l'en-tête pour qu'un listage n'ait jamais à lire le diff.
     name: cleanWorldName(name),
@@ -136,6 +142,10 @@ export function decodeSave(text, { isValidBlock, height = 64 } = {}) {
 
   return {
     seed: Number.isFinite(raw.seed) ? raw.seed : null,
+    // Renvoyé tel quel : la fiche appartient au jeu, qui la nettoie avec ses propres
+    // bornes (`clampMonde`). Le magasin n'a rien à en savoir, et un fichier écrit par
+    // une version plus ancienne du jeu n'en porte simplement pas.
+    monde: raw.monde && typeof raw.monde === 'object' && !Array.isArray(raw.monde) ? raw.monde : null,
     name: typeof raw.name === 'string' ? raw.name.slice(0, MAX_NAME_LENGTH) : null,
     savedAt: Number.isFinite(raw.savedAt) ? raw.savedAt : 0,
     player,

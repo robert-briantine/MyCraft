@@ -1,7 +1,14 @@
 lit le code dans modele-game.ts
 générer les config ressources  dans un fichier json modifiable
 
-le dureeJetpack est la duree pendant laquelle le jetpack peut etre actif , quand on presse espace on monte tant que la dureeJetpack est superieur a sero , quand il est a zero on redescend si on ne presse pas espace il se recharge
+le autonomieJetpack est la duree pendant laquelle le jetpack peut etre actif ,
+Il consomme de l'energie , l'configNiveauJoueur[autonomieJetpack] donne le temps pour une cellule d'energie
+
+quand on presse espace on monte tant que l'energie' est superieur a zero , quand elle est a zero on redescend si on ne presse pas espace il se recharge
+quand on saute de haut on peu amortir la chute
+
+
+
 
 
 ajouter les ressources dans le monde
@@ -9,17 +16,18 @@ les ressources ne sont pas des cubes mais des losange 3D de differente couleur q
 la vie et l'energie  n'ai pas sous terre elle est forcement visible elle peut etre dans les batiment ou les maison ou dans la rue
 
 le dimand et l'or sont sous terre
-pour acquerir les ressources il faut entre en collision avec et aussi que non sacEstPlein()
+toute les ressources dans un rayon  configNiveauJoueur[rayonAttractionRessource] sous attirée et recupérer automatiquement  et non sacEstPlein()
 
-quand on selection dans la zone de destruction les ressources tombe dans le fond tous les bloque de la selection arrive dans l'inventaire
 
-afficher a l'ecran la quantite des 4 ressources
 
-volumeDestruction = 8 et volumeDestruction = 8 pour construire 
+à l'écran afficher l'energie et la vie
+
+
+
 
 dx dy  dz sont la dimension de zone d'action
- dx*dy*dz <= volumeDestruction pour detuire et recolté
- dx*dy*dz <= volumeConstruction pour construire
+ dx*dy*dz <= transport pour detuire et recolté ajouter a l'inventaire
+ dx*dy*dz <= transport pour construire
 
 
 

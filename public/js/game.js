@@ -2,17 +2,30 @@ import * as THREE from '../vendor/three/three.module.js';
 import { PointerLockControls } from '../vendor/three/examples/jsm/controls/PointerLockControls.js';
 import { createTextureAtlas } from './textures.js';
 import { createSaveStore, encodeSave, decodeSave, setNameInSave, slugify, cleanWorldName, AUTOSAVE_INTERVAL_MS } from './saves.js';
-import { createVillageGen } from './village.js';
+import { createVillageGen, VILLAGE } from './village.js';
 import { createBiomeGen } from './biomes.js';
 import { SimplexNoise } from './noise.js';
-import { createTerrain } from './terrain.js';
+import { createTerrain, RELIEF } from './terrain.js';
+import {
+  MONDE_DEFAULTS, MONDE_FIELDS, clampMonde, memesMondes, mondeSeeds, mondeStorageKey,
+  reliefOverrides, biomesOverrides, villageOverrides,
+} from './world-config.js';
+import { createMondePreview } from './world-preview.js';
+import { creerEclairage, LAMPE_PORTEE, PLANCHER_NUIT } from './eclairage.js';
+import {
+  etatDuCiel, creerHorloge, heureAffichee, bornerDuree,
+  DUREE_JOUR_DEFAUT, DUREE_JOUR_BORNES, HEURE_DEPART,
+} from './ciel.js';
 
 // ===================== CONSTANTS =====================
 const CHUNK_SIZE = 16;
 // Porté de 64 à 80 le 2026-11-09 pour que les catégories hautes d'immeuble tiennent :
 // quatorze étages au pas de `floorPitch`, c'est quarante-quatre cubes de corps plus le
 // toit, et le seuil d'une tour de centre-bourg se pose déjà à vingt-cinq cubes.
-const CHUNK_HEIGHT = 80;
+// Porté de 80 à 128 le 2026-11-11, quand les appartements ont reçu 4 cubes d'air sous
+// plafond (baies de 4×4) : l'étage passe de 3 à 5 cubes, quatorze étages en demandent
+// soixante-douze, et un seuil de centre-bourg à vingt-six cubes n'a plus de marge à 80.
+const CHUNK_HEIGHT = 128;
 const GRAVITY = 30;
 const JUMP_SPEED = 10;
 const MOVE_SPEED = 8;
@@ -79,11 +92,35 @@ const WORLD_BOOT_BUDGET = 169;    // 13×13 cells built synchronously under the 
 const CHUNK_FRAME_MS = 10;        // wall-clock ceiling for world building per frame
 const CHUNK_MESH_WATERMARK = 64;  // stop generating when this many chunks await meshing
 
+// ---- fiche du monde (écran de génération) ----
+// Le slot se lit dans l'URL : c'est lui qui porte l'identité du monde, donc c'est lui
+// qui choisit la fiche de génération. La fiche vit dans `localStorage` sous une clé par
+// monde ET dans le fichier de sauvegarde ; ici on ne lit que le magasin local, parce
+// que le relief doit être posé avant le premier tronçon, donc avant que la disquette
+// ait répondu. La relecture du fichier garde un œil sur l'écart (voir `bootWorld`).
+const SAVE_PARAMS = new URLSearchParams(window.location.search);
+const SAVE_SLOT = SAVE_PARAMS.get('world') || 'default';
+
+function lireFicheDuMonde(slot) {
+  try {
+    const brut = localStorage.getItem(mondeStorageKey(slot));
+    return clampMonde(brut ? JSON.parse(brut) : null);
+  } catch (e) {
+    // Une fiche illisible n'est pas un motif de ne pas jouer : le monde d'aujourd'hui.
+    return clampMonde(null);
+  }
+}
+
+const MONDE = lireFicheDuMonde(SAVE_SLOT);
+
 // ---- world persistence ----
 // The whole terrain is a pure function of these seeds, so the disk only ever has
 // to carry the player's diff. Recording them in the save file is what makes a
 // future seed change detectable instead of silently mangling saved worlds.
-const WORLD_SEEDS = { terrain: 42, trees: 123, buildings: 777, caves: 999 };
+// Elles dérivent de la graine saisie à l'écran de génération (`mondeSeeds`) ; la
+// dérivation est calée pour que la graine par défaut rende exactement les graines
+// d'hier — 42, 123, 777, 999 — et qu'un monde ancien se régénère à l'identique.
+const WORLD_SEEDS = mondeSeeds(MONDE.graine);
 const WORLD_LOAD_TIMEOUT_MS = 5000;   // never hold the start screen hostage to a dead store
 const PLAYER_SAVE_MOVE_SQ = 0.25 * 0.25; // how far the player must travel to warrant a write
 
@@ -102,13 +139,21 @@ function clampRenderDistance(value) {
 function loadSettings() {
   let raw = null;
   try { raw = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || 'null'); } catch (e) { raw = null; }
-  const stored = raw && typeof raw === 'object' ? raw.renderDistance : undefined;
-  return { renderDistance: clampRenderDistance(stored) };
+  const stored = raw && typeof raw === 'object' ? raw : {};
+  return {
+    renderDistance: clampRenderDistance(stored.renderDistance),
+    // La durée de la journée se règle comme la profondeur de champ ; à son défaut le
+    // monde tourne à la cadence du projet, et un réglage absent du disque n'y change rien.
+    dureeJour: bornerDuree(stored.dureeJour ?? DUREE_JOUR_DEFAUT),
+  };
 }
 
 function saveSettings() {
   try {
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ renderDistance: settings.renderDistance }));
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
+      renderDistance: settings.renderDistance,
+      dureeJour: settings.dureeJour,
+    }));
   } catch (e) {
     /* private mode: the setting simply does not survive */
   }
@@ -122,14 +167,26 @@ const BLOCK = {
   LEAVES: 5, SAND: 6, WATER: 7, PLANKS: 8, BRICK: 9,
   COAL: 10, IRON: 11, GOLD: 12, DIAMOND: 13,
   SNOW: 14, GRIT: 15, COBBLE: 16, GLASS: 17,
-  MOSS: 18, LAVA: 19, OBSIDIAN: 20
+  MOSS: 18, LAVA: 19, OBSIDIAN: 20,
+  LAMP_POST: 21, LAMP_GLOW: 22,
+  // Quatre appliques murales, une par face d'adossement — le monde ne porte aucune
+  // rotation de bloc, l'orientation vit donc dans l'identifiant.
+  LAMP_WALL_O: 23, LAMP_WALL_E: 24, LAMP_WALL_N: 25, LAMP_WALL_S: 26,
 };
 
 // Block metadata.
-//   solid   -> stops the player (glass and leaves do, water and lava do not)
-//   opaque  -> hides neighbour faces and casts ambient occlusion
-//   pass    -> 'opaque' | 'translucent' | 'cutout' (alpha tested foliage)
-//   tiles   -> atlas tile names per face family
+//   solid    -> stops the player (glass and leaves do, water and lava do not)
+//   opaque   -> hides neighbour faces and casts ambient occlusion
+//   pass     -> 'opaque' | 'translucent' | 'cutout' (alpha tested foliage)
+//   tiles    -> atlas tile names per face family
+//   box      -> sub-cube geometry [x0,y0,z0,x1,y1,z1] in 0..1; the mesher draws that
+//               box instead of the full cube, which is what lets a lamp post read as a
+//               post. Box blocks are never culled by their neighbours.
+//   emissive -> rendered with its own unlit material: it carries its light and stays
+//               bright at midnight (a Lambert surface would just go grey with ambient)
+//   breakable-> cassable alors que le bloc ne bloque pas la marche : le rayon de visée
+//               s'y arrête quand même. Sans ce drapeau, une applique murale — non solide
+//               par construction — serait impossible à viser donc à détruire.
 const T = (side, top = side, bottom = side) => ({ side, top, bottom });
 
 const BLOCK_INFO = {
@@ -153,11 +210,62 @@ const BLOCK_INFO = {
   [BLOCK.MOSS]:      { name: 'Mousse',     colors: [0x3a6b35], solid: true,  opaque: true,  tiles: T('moss') },
   [BLOCK.LAVA]:      { name: 'Lave',       colors: [0xff4500], solid: false, opaque: false, pass: 'translucent', liquid: true, tiles: T('lava') },
   [BLOCK.OBSIDIAN]:  { name: 'Obsidienne', colors: [0x1a1a2e], solid: true,  opaque: true,  tiles: T('obsidian') },
+  // Le lampadaire est un bloc en deux parties, cassables et posables séparément : le
+  // pied de fonte (un quart de cube de section) et la lanterne qui le coiffe. La
+  // lanterne est émissive — elle porte sa lumière — et c'est `eclairage.js` qui cuit
+  // son halo dans les sommets des blocs qu'elle entoure.
+  [BLOCK.LAMP_POST]: { name: 'Pied de lampadaire', colors: [0x3a3f47], solid: true, opaque: false, tiles: T('lamp_post'), box: [0.4, 0, 0.4, 0.6, 1, 0.6] },
+  [BLOCK.LAMP_GLOW]: { name: 'Lanterne', colors: [0xffb733], solid: true, opaque: false, emissive: true, tiles: T('lamp_glow'), box: [0.28, 0.02, 0.28, 0.72, 0.86, 0.72] },
+  // Appliques murales — demandé le 2026-11-11 : « dans les immeubles tu mis les lumières
+  // devant les portes, il faudrait ajouter une lumière qui soit mise sur les murs pour
+  // éviter de bloquer le passage ». Un candélabre occupe **toute sa case** à la marche —
+  // la collision se juge à la cellule, pas à la boîte fine du poteau — donc dans un
+  // couloir d'immeuble de deux cubes il condamnait le seuil des portes. L'applique est
+  // scellée au mur et n'est **pas solide** : on passe à travers, comme l'eau. Elle reste
+  // cassable grâce à `breakable`, qui la rend visible au rayon de visée malgré son
+  // absence de solidité (l'eau et la lave, elles, traversent le rayon).
+  // Les quatre boîtes s'adossent chacune à une face, dans l'ordre de MURALE_DIRS : ouest,
+  // est, nord, sud. Une applique saillit de 0.32 hors du mur et occupe le haut de la case,
+  // à hauteur de lampe — jamais le cube entier, qui lui barrerait le passage.
+  ...Object.fromEntries([
+    [[0, 0.62, 0.28, 0.32, 0.98, 0.72], BLOCK.LAMP_WALL_O],
+    [[0.68, 0.62, 0.28, 1, 0.98, 0.72], BLOCK.LAMP_WALL_E],
+    [[0.28, 0.62, 0, 0.72, 0.98, 0.32], BLOCK.LAMP_WALL_N],
+    [[0.28, 0.62, 0.68, 0.72, 0.98, 1], BLOCK.LAMP_WALL_S],
+  ].map(([boite, id], face) => [id, {
+    name: 'Applique murale', colors: [0xffcb5e],
+    solid: false, opaque: false, breakable: true, emissive: true,
+    tiles: T('lamp_wall'), box: boite,
+    // Une applique est un seul objet pour le joueur : la face qui la colle au mur se lit
+    // sur le voisin au moment de la pose (`appliqueOriente`), donc les trois autres
+    // identifiants ne sont que des variantes de la première et n'ont rien à faire au
+    // catalogue — quatre icônes identiques ne laisseraient que deviner laquelle choisir.
+    variant: face > 0,
+  }])),
 };
 
 for (const info of Object.values(BLOCK_INFO)) {
   if (!info.pass) info.pass = 'opaque';
 }
+
+// Matériaux qui comptent comme de la roche pour l'éclairage : une cellule coiffée de
+// l'un d'eux est sous terre, une cellule coiffée de planches ou de brique est une pièce.
+const ROCHE_NATURELLE = new Set([
+  BLOCK.STONE, BLOCK.DIRT, BLOCK.GRASS, BLOCK.COBBLE, BLOCK.GRIT, BLOCK.SAND,
+  BLOCK.SNOW, BLOCK.MOSS, BLOCK.OBSIDIAN, BLOCK.COAL, BLOCK.IRON, BLOCK.GOLD, BLOCK.DIAMOND,
+]);
+
+// Les blocs qui portent un halo : la lanterne du candélabre et les quatre appliques
+// murales. Une seule liste, sinon le maillage cuit le halo des unes et oublie celui des
+// autres — `estLampe`, `lampesAutour` et le ré-emmaillage de `setBlocksBulk` doivent
+// connaître les mêmes identifiants.
+const LANTERNE_IDS = new Set([
+  BLOCK.LAMP_GLOW, BLOCK.LAMP_WALL_O, BLOCK.LAMP_WALL_E, BLOCK.LAMP_WALL_N, BLOCK.LAMP_WALL_S,
+]);
+const estLanterne = (id) => LANTERNE_IDS.has(id);
+// Les quatre appliques, dans l'ordre de leurs faces d'adossement (−x, +x, −z, +z).
+const APPLIQUES = [BLOCK.LAMP_WALL_O, BLOCK.LAMP_WALL_E, BLOCK.LAMP_WALL_N, BLOCK.LAMP_WALL_S];
+const MURALE_DIRS = [[-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1]];
 
 // Hotbar contents are player-editable through the inventory and persisted.
 const HOTBAR_SIZE = 9;
@@ -168,11 +276,20 @@ const DEFAULT_HOTBAR = [BLOCK.GRASS, BLOCK.DIRT, BLOCK.STONE, BLOCK.WOOD, BLOCK.
 const BLOCK_GROUPS = [
   { label: 'NATUREL', ids: [BLOCK.GRASS, BLOCK.DIRT, BLOCK.STONE, BLOCK.COBBLE, BLOCK.SAND, BLOCK.GRIT, BLOCK.SNOW, BLOCK.MOSS] },
   { label: 'CONSTRUCTION', ids: [BLOCK.WOOD, BLOCK.PLANKS, BLOCK.BRICK, BLOCK.GLASS, BLOCK.OBSIDIAN] },
+  // Les quatre faces d'adossement ne forment qu'un seul meuble dans la palette : le monde
+  // ne porte aucune rotation de bloc, donc c'est le mur visé qui choisit l'identifiant
+  // (voir World.appliqueOriente). Proposer quatre icônes serait demander au joueur de
+  // choisir une orientation qu'il ne peut pas voir d'avance.
+  { label: 'ÉCLAIRAGE', ids: [BLOCK.LAMP_POST, BLOCK.LAMP_GLOW, BLOCK.LAMP_WALL_O] },
   { label: 'VÉGÉTAUX', ids: [BLOCK.LEAVES] },
   { label: 'MINERAIS', ids: [BLOCK.COAL, BLOCK.IRON, BLOCK.GOLD, BLOCK.DIAMOND] },
   { label: 'LIQUIDES', ids: [BLOCK.WATER, BLOCK.LAVA] },
 ];
-const ALL_BLOCKS = Object.keys(BLOCK_INFO).map(Number);
+// Le catalogue posable : chaque bloc qui n'est pas une variante déclarée doit tenir sa
+// case en palette, sinon il devient introuvable pour le joueur. Les faces d'adossement
+// d'une applique en sont l'exemple — une seule icône, la pose lit le mur pour choisir la
+// face — tout en restant cassables et reconnues par le halo.
+const ALL_BLOCKS = Object.keys(BLOCK_INFO).map(Number).filter((id) => !BLOCK_INFO[id].variant);
 
 function loadHotbar() {
   try {
@@ -191,12 +308,56 @@ function loadHotbar() {
 // celle-ci a cessé d'être dupliquée ici et dans un module mort.
 const worldNoise = new SimplexNoise(WORLD_SEEDS.terrain);
 const caveNoise = new SimplexNoise(WORLD_SEEDS.caves);
+// Le plafond des boyaux, tiré d'un bruit distinct : sans lui `isCave` creusait la colonne
+// du socle jusqu'à trois cubes de la surface, et chaque grotte devenait un puits de jour.
+// Mesuré avant ce correctif, le fond d'une galerie à six cubes sous la terre tenait 0,87
+// de lumière du ciel — aucune mine ne pouvait donc jamais devenir noire.
+const caveToitNoise = new SimplexNoise(WORLD_SEEDS.caves + 31);
 
 // ==================== TERRAIN GENERATION ====================
 // Le profil du monde — plateaux, sillons plissés, massifs soulevés jusqu'à la neige —
 // vit dans `terrain.js`, sans dépendance : les suites Node jugent ainsi exactement le
 // relief que le navigateur dessine, et non une copie qui aurait dérivé.
-const terrain = createTerrain({ noise: worldNoise, chunkHeight: CHUNK_HEIGHT });
+
+// Les fabriques servent aussi à l'aperçu de l'écran de génération, qui doit juger la
+// fiche en cours de réglage et non celle du disque. Elles ne tirent rien au hasard :
+// seules la graine et la fiche entrent dans le monde.
+function fabriquerRelief(monde, seuils = null) {
+  return createTerrain({
+    noise: new SimplexNoise(mondeSeeds(monde.graine).terrain),
+    chunkHeight: CHUNK_HEIGHT,
+    relief: reliefOverrides(monde, { chunkHeight: CHUNK_HEIGHT, seuils }),
+  });
+}
+
+function fabriquerClimat(monde) {
+  const t = fabriquerRelief(monde);
+  return createBiomeGen({
+    BLOCK, CHUNK_SIZE, CHUNK_HEIGHT,
+    heightAt: (x, z) => t.rawHeight(x, z),
+    roll: hashRoll,
+    saltBase: (mondeSeeds(monde.graine).trees * 7919) | 0,
+    seaLevel: t.RELIEF.seaLevel,
+  });
+}
+
+const apercuDuMonde = createMondePreview({
+  creerRelief: (m) => fabriquerRelief(m),
+  creerClimat: fabriquerClimat,
+  chunkHeight: CHUNK_HEIGHT,
+  // La ligne de flottaison ne descend pas sous le plancher du relief et ne monte pas
+  // jusqu'à l'altitude où le village commence à bâtir : au-delà, il n'y aurait plus ni
+  // plage praticable ni terrain lotissable.
+  merBornes: { min: RELIEF.minGround + 2, max: VILLAGE.minGround },
+});
+
+// Un monde laissé en l'état ne paie ni l'échantillonnage ni la bissection : c'est le
+// cas de tous les mondes déjà enregistrés, antérieurs à cet écran.
+const MONDE_SEUILS = memesMondes(MONDE, MONDE_DEFAULTS)
+  ? {}
+  : apercuDuMonde.seuils(MONDE);
+
+const terrain = fabriquerRelief(MONDE, MONDE_SEUILS);
 
 // La ligne de flottaison vient du relief : c'est lui qui décide où la terre s'arrête,
 // le village et les biomes consultent la même valeur.
@@ -209,7 +370,15 @@ function getTerrainHeight(x, z) {
 function isCave(x, y, z) {
   if (y < 4 || y > CHUNK_HEIGHT - 4) return false;
   const n = caveNoise.octave(x * 0.04, z * 0.04, 3, 0.5);
-  return n > 0.35 && y < getTerrainHeight(x, z);
+  if (n <= 0.35) return false;
+  // Le boyau a un toit : sans lui le vide monte jusqu'à la couche de terre et la colonne
+  // toute entière sert de conduit à la lumière du ciel, ce qui rendait l'underground
+  // méconnaissable — une galerie creusée par le joueur restait en pleine lumière.
+  // Le plafond oscille entre douze et trente-quatre cubes et reste toujours sous quatre
+  // cubes de roche, jamais visible depuis la surface.
+  const toit = Math.min(getTerrainHeight(x, z) - 4,
+    12 + Math.round((caveToitNoise.octave(x * 0.02, z * 0.02, 2, 0.5) + 1) * 11));
+  return y < toit;
 }
 
 /**
@@ -277,6 +446,8 @@ const village = createVillageGen({
   // Très hautes montagnes : le village doit savoir où il monte. Ni immeuble ni ville
   // dans ces zones, seulement quelques hameaux (`VILLAGE.hamlet*`).
   alpsAt: (x, z) => terrain.alpsIntensity(x, z),
+  // Densité urbaine et catégories d'immeuble réglées à l'écran de génération.
+  reglages: villageOverrides(MONDE),
 });
 
 // Forêts, plaines et déserts vivent dans leur propre module, pour la même raison que
@@ -293,6 +464,9 @@ const biomes = createBiomeGen({
   isBlocked: (wx, wz) => village.blocksVegetation(wx, wz),
   seaLevel: SEA_LEVEL,
   riverAt: (x, z) => terrain.riverAt(x, z),
+  // Parts de forêt et de désert réglées à l'écran, converties en seuils de climat par
+  // l'étalonnage de l'aperçu.
+  reglages: biomesOverrides(MONDE, MONDE_SEUILS),
 });
 
 // ==================== TEXTURE ATLAS ====================
@@ -331,6 +505,31 @@ function tileNameFor(info, kind) {
 }
 
 // ==================== WORLD ====================
+/**
+ * Ajoute à un matériau éclairé le canal de lumière des lanternes : un attribut de
+ * sommet `aLampe`, additionné en sortie de fragment après l'éclairage de scène.
+ *
+ * L'accroche se fait sur `<dithering_fragment>`, un include stable du Lambert qui
+ * tombe tout à la fin du shader — plutôt que de toucher à la boucle de lumières, dont
+ * la forme change d'une version de Three à l'autre. Si l'include venait à disparaître,
+ * le remplacement ne ferait simplement rien : les lampes cesseraient d'éclairer, ce que
+ * le contrôle de pixels de la suite `ciel` voit immédiatement.
+ */
+function brancherCanalLampe(material, uniforme) {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uLampe = uniforme;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aLampe;\nvarying float vLampe;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLampe = aLampe;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vLampe;\nuniform vec3 uLampe;')
+      .replace('#include <dithering_fragment>',
+        '#include <dithering_fragment>\ngl_FragColor.rgb += uLampe * vLampe;');
+  };
+  // Deux matériaux qui ne diffèrent que par ce patch doivent quand même deux programmes.
+  material.customProgramCacheKey = () => 'lampe';
+}
+
 class World {
   constructor(scene) {
     this.scene = scene;
@@ -338,6 +537,7 @@ class World {
     this.modifiedBlocks = new Map(); // key: "x,y,z" -> blockId (player modifications)
     this.onEdit = null;              // save layer hooks this: the diff just changed
     this._overrideIndex = null;      // chunkKey -> Map(cellIndex -> id), see _indexOverrides
+    this._lampIndex = null;          // lanternes posées par le joueur, voir lampesAutour
     this.pendingChunks = 0;          // in-range cells still waiting to be generated
     this.dirtyKeys = new Set();      // chunks awaiting a (re)mesh
     this._offsetRadius = null;       // cached nearest-first offset table, keyed by radius
@@ -357,6 +557,22 @@ class World {
       depthWrite: true,
       side: THREE.DoubleSide,
     });
+    // Les blocs qui portent leur lumière (la lanterne) ne doivent pas pâlir avec
+    // l'ambiante : un Lambert à minuit rendrait un gris. Matériau non éclairé.
+    this.matGlow = new THREE.MeshBasicMaterial({
+      map: atlas.texture,
+      vertexColors: true,
+      transparent: false,
+      side: THREE.FrontSide,
+    });
+    // Le halo des lanternes arrive en addition, après l'éclairage de scène : la couleur
+    // de sommet sert d'albédo et porte déjà l'obscurité des grottes, donc une lumière
+    // multipliée par cet albédo n'éclairerait jamais une galerie noire. Un attribut
+    // propre au maillage (`aLampe`) et un uniforme partagé entre les deux matériaux
+    // éclairés font le travail — éteindre les lampes de ville ne coûte qu'une valeur.
+    this.uniformeLampe = { value: new THREE.Color(0xffb066) };
+    brancherCanalLampe(this.matOpaque, this.uniformeLampe);
+    brancherCanalLampe(this.matTrans, this.uniformeLampe);
   }
 
   getChunkKey(cx, cz) {
@@ -394,10 +610,25 @@ class World {
   setBlocksBulk(cells) {
     const touched = new Set();
     for (const [x, y, z, blockId] of cells) {
-      this.modifiedBlocks.set(`${x},${y},${z}`, blockId);
+      const etaitLampe = estLanterne(this.getBlock(x, y, z));
+      // Une applique posée par le joueur s'oriente toute seule : on choisit la face dont
+      // le mur est plein derrière elle, faute de quoi elle flotterait adossée au vide.
+      const id = APPLIQUES.includes(blockId) ? this.appliqueOriente(x, y, z, blockId) : blockId;
+      this.modifiedBlocks.set(`${x},${y},${z}`, id);
       this._touchedChunks(x, y, z, touched);
+      // Poser ou arracher une lanterne change l'éclairage des tronçons d'à côté, pas
+      // seulement de celui qui la porte : son halo porte à neuf cubes, et un tronçon
+      // voisin maillé avant resterait clair là où le nouveau-né éteint tout — ou
+      // s'obscurcirait pour une lanterne que le joueur vient d'arracher.
+      if (estLanterne(id) || etaitLampe) {
+        const cx = Math.floor(x / CHUNK_SIZE), cz = Math.floor(z / CHUNK_SIZE);
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dz = -1; dz <= 1; dz++) this.markChunkDirty(cx + dx, cz + dz);
+        }
+      }
     }
     this._overrideIndex = null;
+    this._lampIndex = null;          // voir lampesAutour : même cycle de vie que l'index
 
     for (const key of touched) {
       const comma = key.indexOf(',');
@@ -429,6 +660,7 @@ class World {
   applyEdits(edits) {
     this.modifiedBlocks = new Map(edits);
     this._overrideIndex = null;
+    this._lampIndex = null;          // voir lampesAutour : même cycle de vie que l'index
     const touched = new Set();
     for (const key of this.modifiedBlocks.keys()) {
       const first = key.indexOf(',');
@@ -450,6 +682,7 @@ class World {
   clearEdits() {
     this.modifiedBlocks = new Map();
     this._overrideIndex = null;
+    this._lampIndex = null;          // voir lampesAutour : même cycle de vie que l'index
     for (const key of this.chunks.keys()) this.dirtyKeys.add(key);
   }
 
@@ -499,6 +732,30 @@ class World {
   isLiquid(x, y, z) {
     const info = BLOCK_INFO[this.getBlock(x, y, z)];
     return !!(info && info.liquid);
+  }
+
+  /**
+   * Ce que le rayon de visée peut atteindre. Un bloc non solide comme l'eau se traverse
+   * sans s'arrêter ; une applique murale, elle, doit se laisser viser — sinon rien ne
+   * permet jamais de la casser, ni d'en reposer une ailleurs.
+   */
+  isTargetable(x, y, z) {
+    const info = BLOCK_INFO[this.getBlock(x, y, z)];
+    return !!(info && (info.solid || info.breakable));
+  }
+
+  /**
+   * L'identifiant d'applique qu'impose le mur derrière la cellule : la face dont le voisin
+   * est plein. Le joueur vise une face, la case visée est toujours l'air collé à cette
+   * face, donc le mur trouvé est exactement celui qu'il regardait. À défaut de mur — pose
+   * en rase campagne — l'applique garde la face demandée.
+   */
+  appliqueOriente(x, y, z, demande) {
+    for (let i = 0; i < APPLIQUES.length; i++) {
+      const [dx, dy, dz] = MURALE_DIRS[i];
+      if (this.isSolid(x + dx, y + dy, z + dz)) return APPLIQUES[i];
+    }
+    return demande;
   }
 
   generateChunkData(cx, cz) {
@@ -579,6 +836,10 @@ class World {
     // porter en tablier, et leurs plans ont déjà écarté les entrées de bâtiment. En
     // fin de chaîne, l'avenue reste toujours praticable.
     village.stampStructures(data, cx, cz);
+    // Les candélabres viennent après tous les ouvrages : ils s'assoient sur le pavé que
+    // la voirie vient de poser et renoncent si un arc ou un tablier occupe déjà leur
+    // colonne. Avant elle, ils se feraient raser par le garde-tête d'une avenue.
+    village.stampLamps(data, cx, cz);
 
     this.chunks.set(key, { data, meshes: [], cx, cz });
     return this.chunks.get(key);
@@ -598,6 +859,75 @@ class World {
     if (!bucket) return overrides;
     for (const [idx, id] of bucket) overrides[idx] = id;
     return overrides;
+  }
+
+  /**
+   * Toutes les lanternes dont la portée touche ce tronçon, en coordonnées monde.
+   *
+   * Deux origines : celles que le village pose le long des avenues — lui seul sait où
+   * la voirie passe — et celles posées par le joueur. Celles du village sont vérifiées
+   * bloc par bloc avant d'être retenues : une lanterne arrachée par le joueur reste
+   * dans le plan du village, et sans ce contrôle son halo survivrait à sa propre casse.
+   */
+  lampesAutour(cx, cz) {
+    const baseX = cx * CHUNK_SIZE, baseZ = cz * CHUNK_SIZE;
+    const R = LAMPE_PORTEE + 1;
+    const vues = new Set();
+    const lampes = [];
+    const retenir = (x, y, z) => {
+      const k = `${x},${y},${z}`;
+      if (vues.has(k)) return;
+      vues.add(k);
+      lampes.push([x, y, z]);
+    };
+
+    // Les listes du village sont des **candidates** : elles énumèrent tout ce qui pourrait
+    // porter une lumière dans la zone, quitte à en compter de retirées depuis. Seule la
+    // cellule réellement remplie par un luminaire compte ici. Un candélabre est rendu
+    // `{ wx, wz, y }` avec `y` au pied du poteau — la lumière vient de la lanterne posée
+    // juste au-dessus ; une applique murale n'a pas de pied, sa cellule est déjà la source.
+    const source = (l) => {
+      const x = l.wx, y = l.murale ? l.y : l.y + 1, z = l.wz;
+      if (estLanterne(this.getBlock(x, y, z))) retenir(x, y, z);
+    };
+
+    if (village.lampadairesSur) {
+      for (const l of village.lampadairesSur(baseX - R, baseZ - R, baseX + CHUNK_SIZE + R, baseZ + CHUNK_SIZE + R)) {
+        source(l);
+      }
+    }
+    // Lanternes d'intérieur — pièces de maison, étages d'immeuble, nef des temples. Sans
+    // cette seconde liste, une lanterne estampée dans un bâtiment éclairerait les murs
+    // du voisinage mais jamais la pièce qui la porte : `lampadairesSur` ne connaît que
+    // la voirie.
+    if (village.lampesInterieuresSur) {
+      for (const l of village.lampesInterieuresSur(baseX - R, baseZ - R, baseX + CHUNK_SIZE + R, baseZ + CHUNK_SIZE + R)) {
+        source(l);
+      }
+    }
+    // Appliques murales des couloirs d'immeuble — mêmes candidates, même garde.
+    if (village.appliquesMuralesSur) {
+      for (const l of village.appliquesMuralesSur(baseX - R, baseZ - R, baseX + CHUNK_SIZE + R, baseZ + CHUNK_SIZE + R)) {
+        source(l);
+      }
+    }
+    if (!this._lampIndex) {
+      const index = [];
+      for (const [clef, id] of this.modifiedBlocks) {
+        if (!estLanterne(id)) continue;
+        const a = clef.indexOf(','), b = clef.indexOf(',', a + 1);
+        if (b < 0) continue;
+        index.push([+clef.slice(0, a), +clef.slice(a + 1, b), +clef.slice(b + 1)]);
+      }
+      this._lampIndex = index;
+    }
+    for (const [x, y, z] of this._lampIndex) {
+      if (Math.abs(x + 0.5 - (baseX + CHUNK_SIZE / 2)) <= CHUNK_SIZE / 2 + R
+        && Math.abs(z + 0.5 - (baseZ + CHUNK_SIZE / 2)) <= CHUNK_SIZE / 2 + R) {
+        retenir(x, y, z);
+      }
+    }
+    return lampes;
   }
 
   rebuildChunk(cx, cz) {
@@ -636,8 +966,58 @@ class World {
     };
 
     const buckets = {
-      opaque: { positions: [], normals: [], uvs: [], colors: [], indices: [], count: 0 },
-      trans:  { positions: [], normals: [], uvs: [], colors: [], indices: [], count: 0 },
+      opaque: { positions: [], normals: [], uvs: [], colors: [], lumieres: [], indices: [], count: 0 },
+      trans:  { positions: [], normals: [], uvs: [], colors: [], lumieres: [], indices: [], count: 0 },
+      glow:   { positions: [], normals: [], uvs: [], colors: [], lumieres: [], indices: [], count: 0 },
+    };
+
+    // Les deux champs d'éclairage cuits dans les sommets : la lumière du ciel, qui
+    // s'éteint au fond des galeries, et le halo des lanternes, qui doit survivre à
+    // cette extinction (d'où leur séparation — voir `eclairage.js`). La couverture
+    // « bâtiment » vient du village : sans elle, une tour de pierre serait jugée une
+    // grotte habitée et ses appartements deviendraient noirs en plein midi.
+    // Masque des cellules tenues par un bâtiment, indexé comme les données du tronçon :
+    // une table de clés « x,y,z » coûterait des dizaines de milliers de chaînes par
+    // remaillage dans un quartier dense, pour répondre à quelques milliers de questions.
+    const tenuBati = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        for (const p of village.buildingAt(cx + dx, cz + dz) || []) {
+          const bx = (cx + dx) * CHUNK_SIZE + p.x0;
+          const bz = (cz + dz) * CHUNK_SIZE + p.z0;
+          const yBas = Math.max(0, (p.siteH ?? 0) - 1);
+          const yHaut = Math.min(CHUNK_HEIGHT - 1, (p.siteH ?? 0) + (p.height || 6) + 1);
+          for (let x = bx; x < bx + p.w; x++) {
+            const lx = x - baseX;
+            if (lx < 0 || lx >= CHUNK_SIZE) continue;
+            for (let z = bz; z < bz + p.d; z++) {
+              const lz = z - baseZ;
+              if (lz < 0 || lz >= CHUNK_SIZE) continue;
+              const base = lx + lz * CHUNK_SIZE;
+              for (let y = yBas; y <= yHaut; y++) tenuBati[base + y * CHUNK_SIZE * CHUNK_SIZE] = 1;
+            }
+          }
+        }
+      }
+    }
+    const ecl = creerEclairage({
+      CHUNK_SIZE, CHUNK_HEIGHT,
+      opaqueAt,
+      rocheAt: (wx, wy, wz) => ROCHE_NATURELLE.has(blockAt(wx, wy, wz)),
+      estLampe: estLanterne,
+      estBati: (wx, wy, wz) => {
+        const lx = wx - baseX, lz = wz - baseZ;
+        if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE || wy < 0 || wy >= CHUNK_HEIGHT) return false;
+        return tenuBati[lx + lz * CHUNK_SIZE + wy * CHUNK_SIZE * CHUNK_SIZE] === 1;
+      },
+    });
+    const cielDuTroncon = ecl.champCiel(baseX, baseZ);
+    const halo = ecl.champLampes(this.lampesAutour(cx, cz), baseX, baseZ);
+    const haloEn = (wx, wy, wz) => {
+      const lx = wx - baseX, lz = wz - baseZ;
+      if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) return 0;
+      if (wy < 0 || wy >= CHUNK_HEIGHT) return 0;
+      return halo[lx + lz * CHUNK_SIZE + wy * CHUNK_SIZE * CHUNK_SIZE];
     };
 
     // Classic voxel AO: the two side neighbours and the diagonal one sitting on
@@ -656,6 +1036,8 @@ class World {
       return AO_LEVELS[3 - occ];
     };
 
+    const CUBE = [0, 0, 0, 1, 1, 1];
+
     for (let lx = 0; lx < CHUNK_SIZE; lx++) {
       for (let lz = 0; lz < CHUNK_SIZE; lz++) {
         for (let y = 0; y < CHUNK_HEIGHT; y++) {
@@ -667,7 +1049,10 @@ class World {
           if (!finalBlockId) continue;
 
           const info = BLOCK_INFO[finalBlockId];
-          const bucket = info.pass === 'opaque' ? buckets.opaque : buckets.trans;
+          const estBox = !!info.box;
+          const boite = estBox ? info.box : CUBE;
+          const bucket = info.emissive ? buckets.glow
+            : (info.pass === 'opaque' ? buckets.opaque : buckets.trans);
           const cullSameId = info.pass !== 'cutout';
 
           for (const face of FACES) {
@@ -677,27 +1062,37 @@ class World {
             const neighbor = blockAt(nx, ny, nz);
 
             let visible;
-            if (neighbor === BLOCK.AIR) visible = true;
+            if (estBox) visible = true;               // une boîte ne se fait pas manger par sa voisine
+            else if (neighbor === BLOCK.AIR) visible = true;
             else if (BLOCK_INFO[neighbor].opaque) visible = false;
             else visible = !cullSameId || neighbor !== finalBlockId;
             if (!visible) continue;
 
             const rect = atlas.uvRect(tileNameFor(info, face.kind));
             // Translucent blocks keep their own tint rather than being darkened
-            // twice (the texture already carries the colour).
-            const faceLight = info.pass === 'opaque' ? aoLevel : null;
+            // twice (the texture already carries the colour). Sub-cube props skip AO
+            // too: a quarter-cube post surrounded by air would only pick up noise.
+            const faceLight = info.pass === 'opaque' && !estBox ? aoLevel : null;
+            // Le bloc qui porte sa lumière n'a rien à recevoir du ciel ni des lampes.
+            const clarte = info.emissive ? 1 : cielDuTroncon(nx, ny, nz);
+            const lueur = info.emissive ? 0 : haloEn(nx, ny, nz);
 
             for (let c = 0; c < 4; c++) {
               const corner = face.corners[c];
               const uv = face.uvs[c];
-              bucket.positions.push(wx + corner[0], y + corner[1], wz + corner[2]);
+              bucket.positions.push(
+                wx + boite[0] + corner[0] * (boite[3] - boite[0]),
+                y + boite[1] + corner[1] * (boite[4] - boite[1]),
+                wz + boite[2] + corner[2] * (boite[5] - boite[2])
+              );
               bucket.normals.push(face.dir[0], face.dir[1], face.dir[2]);
               bucket.uvs.push(
                 rect.u0 + uv[0] * (rect.u1 - rect.u0),
                 rect.v0 + uv[1] * (rect.v1 - rect.v0)
               );
-              const light = face.shade * (faceLight ? faceLight(face, wx, y, wz, corner) : 1);
+              const light = face.shade * clarte * (faceLight ? faceLight(face, wx, y, wz, corner) : 1);
               bucket.colors.push(light, light, light);
+              bucket.lumieres.push(face.shade * lueur);
             }
 
             bucket.indices.push(
@@ -710,18 +1105,24 @@ class World {
       }
     }
 
-    for (const bucket of [buckets.opaque, buckets.trans]) {
+    const materiaux = [
+      [buckets.opaque, this.matOpaque, 0],
+      [buckets.trans, this.matTrans, 1],
+      [buckets.glow, this.matGlow, 1],
+    ];
+    for (const [bucket, materiau, ordre] of materiaux) {
       if (bucket.count === 0) continue;
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(bucket.positions, 3));
       geometry.setAttribute('normal', new THREE.Float32BufferAttribute(bucket.normals, 3));
       geometry.setAttribute('uv', new THREE.Float32BufferAttribute(bucket.uvs, 2));
       geometry.setAttribute('color', new THREE.Float32BufferAttribute(bucket.colors, 3));
+      geometry.setAttribute('aLampe', new THREE.Float32BufferAttribute(bucket.lumieres, 1));
       geometry.setIndex(bucket.indices);
       geometry.computeBoundingSphere();
 
-      const mesh = new THREE.Mesh(geometry, bucket === buckets.opaque ? this.matOpaque : this.matTrans);
-      mesh.renderOrder = bucket === buckets.opaque ? 0 : 1;
+      const mesh = new THREE.Mesh(geometry, materiau);
+      mesh.renderOrder = ordre;
       this.scene.add(mesh);
       chunk.meshes.push(mesh);
     }
@@ -1418,9 +1819,14 @@ const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerH
 // Fog and the far plane have to follow the configured view depth: too little fog
 // and chunks pop in un-blurred at the edge, too much and a short distance just
 // greys out. Both are derived from the same number so they never disagree.
+//
+// Le départ du voile était pris à 45 % et sa fin à 85 % de la portée : mesuré à midi,
+// toute le relief au-delà de la moitié du champ rendu rendait la seule couleur de brume
+// — l'utilisateur voyait « des cubes tous blancs à l'horizon ». Le brouillard ne garde
+// que sa vraie tâche, dissoudre la lisière ; le milieu du champ garde ses matières.
 function applyFogForDistance(radius) {
-  scene.fog.near = Math.max(6, radius * CHUNK_SIZE * 0.45);
-  scene.fog.far = radius * CHUNK_SIZE * 0.85;
+  scene.fog.near = Math.max(6, radius * CHUNK_SIZE * 0.62);
+  scene.fog.far = radius * CHUNK_SIZE * 0.98;
   camera.far = Math.max(200, radius * CHUNK_SIZE * 2);
   camera.updateProjectionMatrix();
 }
@@ -1438,6 +1844,357 @@ scene.add(ambientLight);
 const sunLight = new THREE.DirectionalLight(0xfff4e0, 0.5);
 sunLight.position.set(50, 100, 50);
 scene.add(sunLight);
+
+// ==================== CIEL, SOLEIL ET LANTERNES ====================
+// Le modèle du ciel est pur (`ciel.js`) ; tout ici se contente de le consommer. Rien
+// n'est re-maillé pour faire la nuit : l'heure ne pilote que les lumières de scène, la
+// brume et les objets du ciel. Les deux canaux cuits dans les sommets (obscurité des
+// grottes, halo des lanternes) sont indépendants de l'heure, sauf l'uniforme qui allume
+// ou éteint les lanternes.
+const horloge = creerHorloge({ duree: settings.dureeJour });
+let etatCiel = etatDuCiel(horloge.heure());
+
+// Les objets du ciel suivent la caméra et se paient le luxe d'un test de profondeur
+// désactivé avec un ordre de rendu négatif : ils sont peints avant le terrain, qui les
+// recouvre — le soleil se couche donc derrière une colline au lieu de la traverser.
+const PLANETE_CIEL = new THREE.Group();
+PLANETE_CIEL.renderOrder = -10;
+scene.add(PLANETE_CIEL);
+
+const domeGeo = new THREE.SphereGeometry(1, 32, 16);
+const domeUniformes = {
+  uZenith: { value: new THREE.Color(0x87ceeb) },
+  uHorizon: { value: new THREE.Color(0xcfe6f5) },
+  uDirectionSoleil: { value: new THREE.Vector3(0, 1, 0) },
+  uHalo: { value: 0 },
+};
+const dome = new THREE.Mesh(domeGeo, new THREE.ShaderMaterial({
+  uniforms: domeUniformes,
+  side: THREE.BackSide,
+  depthWrite: false,
+  depthTest: false,
+  fog: false,
+  vertexShader: /* glsl */`
+    varying vec3 vDir;
+    void main() {
+      vDir = normalize(position);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: /* glsl */`
+    uniform vec3 uZenith;
+    uniform vec3 uHorizon;
+    uniform vec3 uDirectionSoleil;
+    uniform float uHalo;
+    varying vec3 vDir;
+    void main() {
+      float t = clamp(vDir.y * 1.35 + 0.08, 0.0, 1.0);
+      vec3 col = mix(uHorizon, uZenith, pow(t, 0.65));
+      // Le renard autour de l'astre : un lavis chaud, serré contre lui et d'amplitude
+      // bornée. Large (pow(face, 6)) et franc (×0,85), il blanchissait toute la bande
+      // d'horizon dès que le soleil la frôlait — une centaine de degrés de ciel partait
+      // au blanc, ce que l'utilisateur décrivait comme « à l'horizon tout est blanc ».
+      float face = max(dot(normalize(vDir), normalize(uDirectionSoleil)), 0.0);
+      col += uHalo * pow(face, 18.0) * vec3(0.55, 0.30, 0.13);
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+}));
+dome.renderOrder = -10;
+PLANETE_CIEL.add(dome);
+
+const disqueGeo = new THREE.CircleGeometry(1, 40);
+// Rayons apparents des astres, en radians — l'échelle est recalculée avec la distance
+// pour qu'ils gardent cette taille quelle que soit la profondeur de champ réglée.
+const RAYON_SOLEIL_APPARENT = 0.034;
+const RAYON_LUNE_APPARENTE = 0.0277;
+function faireDisque(couleur, opacite) {
+  const m = new THREE.Mesh(disqueGeo, new THREE.MeshBasicMaterial({
+    color: couleur, transparent: true, opacity: opacite,
+    // Test de profondeur **activé** : un matériau transparent est peint après tout le
+    // relief opaque, donc sans test il flotterait au-dessus des toits et de la roche
+    // (mesuré : un mur plein à six cubes laissait passer 38 % de pixels lunaires).
+    // Les astres sont placés juste sous le plan lointain dans `majCiel`, si bien que
+    // n'importe quel bloc est plus près qu'eux et les masque — « à l'infini », ici.
+    depthWrite: false, depthTest: true, fog: false, side: THREE.DoubleSide,
+  }));
+  m.renderOrder = -9;
+  PLANETE_CIEL.add(m);
+  return m;
+}
+const disqueSoleil = faireDisque(0xfff2cc, 1);
+const disqueLune = faireDisque(0xd8e2ff, 0.92);
+disqueSoleil.name = 'soleil';
+disqueLune.name = 'lune';
+
+// Étoiles : une calotte fixe, tirée au même hachage que le reste du monde pour qu'un
+// rechargement ne redessine pas un ciel différent.
+const etoiles = (() => {
+  const N = 700;
+  const pos = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    // Répartition quasi uniforme sur la sphère haute, par angles tirés au hasard déterministe.
+    const azimut = hashRoll(i, 1, 3, 71) * Math.PI * 2;
+    const hauteur = Math.acos(1 - hashRoll(i, 2, 5, 73) * 1.05);
+    const rayon = 1;
+    pos[i * 3] = Math.sin(hauteur) * Math.cos(azimut) * rayon;
+    pos[i * 3 + 1] = Math.cos(hauteur) * rayon;
+    pos[i * 3 + 2] = Math.sin(hauteur) * Math.sin(azimut) * rayon;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  const pts = new THREE.Points(geo, new THREE.PointsMaterial({
+    color: 0xffffff, size: 2.2, sizeAttenuation: false,
+    // Même règle que les disques : sans test de profondeur, les étoiles traversent la
+    // roche et les toits, le ciel nocturne se peignant par-dessus le monde.
+    transparent: true, opacity: 0, depthWrite: false, depthTest: true, fog: false,
+  }));
+  pts.renderOrder = -9;
+  pts.visible = false;
+  PLANETE_CIEL.add(pts);
+  return pts;
+})();
+
+// Nuages : une nappe continue, pas des cubes. Deux plans horizontaux tendus au-dessus
+// du monde et tendus d'un dessin de bouffissures douces, peint une fois pour toutes
+// dans un canevas. Un plan texturé plutôt qu'une couche de voxels, pour trois raisons :
+// la forme d'un nuage n'a aucune raison d'être cubique, deux triangles par couche coûtent
+// moins qu'un tronçon entier, et le ciel n'a rien à partager avec le monde — un nuage
+// que le joueur pourrait creuser n'a pas de sens.
+const NUAGE_TEXELLE = 256;   // résolution du dessin, en pixels
+
+/**
+ * Dessine une tuile de ciel déterministe : des amas de halos superposés, étirés à
+ * l'horizontale comme des cumulus. Chaque halo est peint sur les neuf positions
+ * possibles de la tuile, sans quoi la couture d'une répétition se verrait en grille.
+ */
+function dessinerTuileDeNuages(sel) {
+  const c = document.createElement('canvas');
+  c.width = NUAGE_TEXELLE; c.height = NUAGE_TEXELLE;
+  const g = c.getContext('2d');
+  g.clearRect(0, 0, NUAGE_TEXELLE, NUAGE_TEXELLE);
+  for (let i = 0; i < 17; i++) {
+    const ax = hashRoll(i, sel, 1, 4111) * NUAGE_TEXELLE;
+    const az = hashRoll(i, sel, 2, 4127) * NUAGE_TEXELLE;
+    const coeur = 0.32 + hashRoll(i, sel, 4, 4151) * 0.24;
+    const lobes = 4 + Math.floor(hashRoll(i, sel, 3, 4133) * 5);
+    for (let k = 0; k < lobes; k++) {
+      const ang = hashRoll(i, k, sel + 7, 4177) * Math.PI * 2;
+      const ecart = hashRoll(i, k, sel + 11, 4201) * 0.34;
+      const r = (0.05 + hashRoll(i, k, sel + 13, 4211) * 0.1) * NUAGE_TEXELLE;
+      const x = ax + Math.cos(ang) * ecart * NUAGE_TEXELLE;
+      const y = az + Math.sin(ang) * ecart * NUAGE_TEXELLE * 0.6;
+      for (let ox = -1; ox <= 1; ox++) for (let oz = -1; oz <= 1; oz++) {
+        const px = x + ox * NUAGE_TEXELLE;
+        const py = y + oz * NUAGE_TEXELLE;
+        if (px < -r || px > NUAGE_TEXELLE + r || py < -r || py > NUAGE_TEXELLE + r) continue;
+        const grad = g.createRadialGradient(px, py, 0, px, py, r);
+        grad.addColorStop(0, `rgba(255,255,255,${coeur.toFixed(3)})`);
+        grad.addColorStop(0.55, `rgba(255,255,255,${(coeur * 0.45).toFixed(3)})`);
+        grad.addColorStop(1, 'rgba(255,255,255,0)');
+        g.fillStyle = grad;
+        g.beginPath();
+        g.arc(px, py, r, 0, Math.PI * 2);
+        g.fill();
+      }
+    }
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = THREE.RepeatWrapping;
+  t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.magFilter = THREE.LinearFilter;
+  t.generateMipmaps = true;
+  t.anisotropy = 4;
+  t.needsUpdate = true;
+  return t;
+}
+const NUAGES_TEXTE = dessinerTuileDeNuages(1);
+
+// Le fondu se juge sur l'élévation du rayon visuel, jamais sur la brume de scène : la
+// nappe flotte quatre-vingts cubes au-dessus de la tête, donc tout ce qui frôle
+// l'horizon est déjà au-delà du plan lointain. S'en remettre à `fog` reviendrait à
+// peindre un voile blanc sur toute la bande d'horizon — exactement le lavage que
+// l'utilisateur reprochait au plein jour. L'autre moitié du fondu se cale sur le plan
+// lointain de la caméra (`uPortee`) : sans elle, le plan est simplement tronqué par le
+// volume de vue et la nappe présente une arête circulaire.
+const SHADER_NUAGE = /* glsl */`
+  uniform sampler2D uCarte;
+  uniform vec3 uCouleur;
+  uniform float uOpacite;
+  uniform vec3 uCam;
+  uniform float uPortee;
+  varying vec2 vUv;
+  varying vec3 vMonde;
+  void main() {
+    vec3 dir = vMonde - uCam;
+    float l = max(length(dir), 1e-4);
+    // Valeur absolue : vu d'en dessous comme d'en dessus, le nuage reste un voile.
+    float elevation = abs(dir.y) / l;
+    float voile = smoothstep(0.055, 0.34, elevation)
+                * (1.0 - smoothstep(uPortee * 0.72, uPortee, l));
+    float corps = texture2D(uCarte, vUv).a;
+    float a = corps * uOpacite * voile;
+    if (a < 0.004) discard;
+    // Le cœur dense prend tout son éclat, la bordure reste laiteuse : c'est ce dégradé
+    // qui fait un volume plutôt qu'une tache plate collée au ciel.
+    gl_FragColor = vec4(uCouleur * (0.82 + 0.18 * corps), a);
+  }`;
+
+function faireNape(nom, altitude, tuile, facteur, vitesse) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({
+    uniforms: {
+      uCarte: { value: NUAGES_TEXTE },
+      uCouleur: { value: new THREE.Color(0xffffff) },
+      uOpacite: { value: 0 },
+      uCam: { value: new THREE.Vector3() },
+      uPortee: { value: 400 },
+      // Le tuilage se fait ici et non sur la texture : un ShaderMaterial ne consulte
+      // jamais `texture.repeat` ni `texture.offset`, qui ne vivent que dans la matrice
+      // `map_transform` des matériaux built-in. Poser l'ancrage sur ces derniers laissait
+      // le ciel glisser avec le joueur tout en annonçant une dérive nulle au contrôle.
+      uTuile: { value: new THREE.Vector2(1, 1) },
+      uDecalage: { value: new THREE.Vector2(0, 0) },
+    },
+    vertexShader: /* glsl */`
+      uniform vec2 uTuile;
+      uniform vec2 uDecalage;
+      varying vec2 vUv;
+      varying vec3 vMonde;
+      void main() {
+        vUv = uv * uTuile + uDecalage;
+        vec4 monde = modelMatrix * vec4(position, 1.0);
+        vMonde = monde.xyz;
+        gl_Position = projectionMatrix * viewMatrix * monde;
+      }`,
+    fragmentShader: SHADER_NUAGE,
+    transparent: true,
+    depthWrite: false,
+    // Test de profondeur activé, comme les astres : depuis une grotte ou sous un toit,
+    // la roche est plus près qu'elle et doit la masquer.
+    depthTest: true,
+    side: THREE.DoubleSide,
+    fog: false,
+  }));
+  // Rotation qui pose le plan à l'horizontale : l'axe local +y part vers −z monde, d'où
+  // le signe inversé sur l'axe v dans `majCiel`.
+  m.rotation.x = -Math.PI / 2;
+  // Un rang sous les astres (-9) : le centre de la nappe est confondu avec la caméra,
+  // donc à tri égal Three la peindrait en dernier, par-dessus le soleil.
+  m.renderOrder = -10;
+  m.name = 'nuages';
+  m.userData = { nom, altitude, tuile, facteur, vitesse };
+  PLANETE_CIEL.add(m);
+  return m;
+}
+const nappes = [
+  // Les deux couches se posent **au-dessus du sol sous le joueur**, pas à une altitude
+  // absolue : à cent trente cubes de hauteur fixes, le plan lointain de la caméra (deux
+  // cents cubes à la portée par défaut) n'en laissait voir qu'une calotte de vingt
+  // degrés autour du zénith. En épousant le relief, la nappe basse reste à quatre-vingt
+  // quatre cubes au-dessus de la tête et couvre le ciel jusqu'à vingt-cinq degrés.
+  faireNape('basse', 84, 96, 1, 0.0032),
+  faireNape('haute', 130, 152, 0.62, 0.0019),
+];
+
+// Sous terre, les lanternes tiennent allumées en plein jour : c'est la roche au-dessus
+// de la tête qui décide, pas l'heure. Le relevé se paie une fois par quart de seconde,
+// pas par image — c'est une descente de colonne, pas un calcul gratuit.
+const HAUT = new THREE.Vector3(0, 1, 0);
+let lanterneVivet = etatCiel.lampes;
+let dernierReleveToit = -10;
+let toitVu = false;
+function sousTerre(maintenant) {
+  if (maintenant - dernierReleveToit > 0.25) {
+    dernierReleveToit = maintenant;
+    const hit = raycastVoxel(camera.position, HAUT, 48, true);
+    toitVu = !!hit && hit.t < 48;
+  }
+  return toitVu;
+}
+
+const heureEl = document.getElementById('clock');
+
+/** Applique l'état du ciel aux lumières, à la brume et aux objets du ciel. */
+function majCiel(delta, maintenant) {
+  const e = etatCiel;
+
+  ambientLight.color.setHex(e.ambiante.couleur);
+  ambientLight.intensity = e.ambiante.intensite;
+  sunLight.color.setHex(e.directe.couleur);
+  sunLight.intensity = e.directe.intensite;
+  sunLight.position.set(e.soleil[0] * 120, Math.abs(e.soleil[1]) * 120 + 8, e.soleil[2] * 120);
+
+  scene.background.setHex(e.ciel);
+  scene.fog.color.setHex(e.brume);
+
+  // Le dôme prend le dessus sur le fond uni dès qu'il est devant la caméra.
+  const distance = Math.max(120, Math.min(camera.far * 0.55, 900));
+  PLANETE_CIEL.position.copy(camera.position);
+  dome.scale.setScalar(distance);
+  domeUniformes.uZenith.value.setHex(e.ciel);
+  domeUniformes.uHorizon.value.setHex(e.horizon);
+  domeUniformes.uDirectionSoleil.value.set(e.soleil[0], e.soleil[1], e.soleil[2]);
+  domeUniformes.uHalo.value = Math.max(0, 1 - Math.abs(e.hauteur) * 2.4) * 0.7;
+
+  // Les astres se logent juste sous le plan lointain, et non à une distance « commode » :
+  // avec leur test de profondeur activé, tout bloc rendu est plus près qu'eux et les
+  // masque, alors qu'ils ne recouvrent jamais un cube. C'est ce que veut dire « affichés
+  // à l'infini » pour des objets collés à la caméra. Leur rayon apparent reste constant
+  // parce que l'échelle suit la distance ; les étoiles restent derrière les disques.
+  const astres = camera.far * 0.995;
+  disqueSoleil.position.set(e.soleil[0], e.soleil[1], e.soleil[2]).multiplyScalar(astres);
+  disqueSoleil.lookAt(camera.position);
+  disqueSoleil.scale.setScalar(astres * RAYON_SOLEIL_APPARENT);
+  disqueSoleil.visible = e.hauteur > -0.12;
+
+  disqueLune.position.set(e.lune[0], e.lune[1], e.lune[2]).multiplyScalar(astres);
+  disqueLune.lookAt(camera.position);
+  disqueLune.scale.setScalar(astres * RAYON_LUNE_APPARENTE);
+  disqueLune.visible = e.hauteur < 0.12;
+
+  etoiles.material.opacity = e.etoiles;
+  etoiles.visible = e.etoiles > 0.02;
+  etoiles.scale.setScalar(camera.far * 0.998);
+
+  // Les nappes suivent la caméra en x/z mais restent **ancrées au monde** : le plan se
+  // recentre sur le joueur à chaque image et ses UV compensent exactement ce parcours,
+  // sinon le ciel glisserait avec lui comme un plafond peint. L'axe v garde un signe
+  // inversé parce que la rotation envoie l'axe local +y vers −z monde.
+  const cote = Math.max(360, camera.far * 2.4);
+  const sol = getTerrainHeight(Math.floor(camera.position.x), Math.floor(camera.position.z));
+  for (const nappe of nappes) {
+    const u = nappe.userData;
+    const mat = nappe.material;
+    nappe.position.y = u.altitude + sol - camera.position.y;   // le groupe suit déjà la caméra
+    nappe.scale.set(cote, cote, 1);
+    const rpt = cote / u.tuile;
+    mat.uniforms.uTuile.value.set(rpt, rpt);
+    mat.uniforms.uDecalage.value.set(
+      camera.position.x / u.tuile + maintenant * u.vitesse,
+      -camera.position.z / u.tuile + maintenant * u.vitesse * 0.6,
+    );
+    mat.uniforms.uCouleur.value.setHex(e.nuages.couleur);
+    mat.uniforms.uOpacite.value = e.nuages.opacite * u.facteur;
+    mat.uniforms.uCam.value.copy(camera.position);
+    // Le fondu lointain meurt sur le plan lointain lui-même, pas sur le bord du plan
+    // géométrique : c'est le seul repère qui garantisse que rien n'est tronqué en vol.
+    mat.uniforms.uPortee.value = camera.far * 0.99;
+    nappe.visible = mat.uniforms.uOpacite.value > 0.02;
+  }
+
+  // Lanternes : franches la nuit et sous terre, éteintes en plein jour. La montée est
+  // amortie pour que le crépuscule allume la ville progressivement plutôt que d'un coup.
+  const cible = Math.max(e.lampes, sousTerre(maintenant) ? 1 : 0);
+  lanterneVivet += (cible - lanterneVivet) * Math.min(1, delta * 2.2);
+  if (Math.abs(lanterneVivet - cible) < 0.004) lanterneVivet = cible;
+  const w = world;
+  if (w) w.uniformeLampe.value.setRGB(1.0 * lanterneVivet, 0.69 * lanterneVivet, 0.4 * lanterneVivet);
+
+  if (heureEl) {
+    const texte = `${heureAffichee(e.heure)} · ${e.phase}`;
+    if (heureEl.textContent !== texte) heureEl.textContent = texte;
+  }
+}
 
 const world = new World(scene);
 world.updateChunks(SPAWN_XZ[0], SPAWN_XZ[1], WORLD_BOOT_BUDGET);
@@ -1756,6 +2513,17 @@ function lockPointer() {
 const inventory = new Inventory(hotbar, controls, blocker, keys, lockPointer);
 
 window.addEventListener('keydown', (e) => {
+  // L'écran de réglage du monde est un écran de saisie : le clavier lui appartient, à
+  // l'exception d'Échap qui le referme. Sans ce garde, un Z tapé dans le champ de la
+  // graine ferait marcher le joueur derrière le panneau.
+  if (reglageOuvert) {
+    if (e.code === 'Escape') {
+      e.preventDefault();
+      fermerReglageDuMonde();
+    }
+    return;
+  }
+
   // A focused slider owns its arrow keys; do not turn them into player movement.
   const target = e.target;
   if (target && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) return;
@@ -1824,9 +2592,12 @@ document.addEventListener('wheel', (e) => {
 });
 
 // Voxel DDA raycast: march through the voxel grid from a point along a direction.
-// Returns { x, y, z, nx, ny, nz, t } of the first solid block hit, or null; t is how
-// far along the (normalised) ray that block was entered.
-function raycastVoxel(origin, dir, maxDist) {
+// Returns { x, y, z, nx, ny, nz, t } of the first block the crosshair can reach, or null;
+// t is how far along the (normalised) ray that block was entered. Par défaut le rayon
+// s'arrête sur tout ce qui se laisse viser — le plein comme le mobilier mural non solide —
+// et `neViserQueLePlein` le rend aveugle à ce dernier (le sondeur de plafond, par exemple,
+// ne doit pas croire qu'une applique au-dessus de la tête est un toit).
+function raycastVoxel(origin, dir, maxDist, neViserQueLePlein = false) {
   const ox = origin.x, oy = origin.y, oz = origin.z;
   const dx = dir.x, dy = dir.y, dz = dir.z;
 
@@ -1850,11 +2621,18 @@ function raycastVoxel(origin, dir, maxDist) {
 
   let nx = 0, ny = 0, nz = 0;
   let t = 0;
+  let premier = true;
 
   while (t <= maxDist) {
-    if (world.isSolid(bx, by, bz)) {
+    // La toute première cellule est celle d'où part le rayon : on n'y vise rien. Sans cette
+    // réserve, un joueur qui traverse une applique — elle n'est pas solide, on marche
+    // dedans — casserait l'applique dès qu'il regarderait devant lui.
+    const cible = (!premier && !neViserQueLePlein)
+      ? world.isTargetable(bx, by, bz) : world.isSolid(bx, by, bz);
+    if (cible) {
       return { x: bx, y: by, z: bz, nx, ny, nz, t };
     }
+    premier = false;
 
     if (tMaxX < tMaxY && tMaxX < tMaxZ) {
       bx += stepX; t = tMaxX; tMaxX += tDeltaX;
@@ -2107,6 +2885,38 @@ distanceInput.max = String(MAX_RENDER_DISTANCE);
 syncDistanceControl(settings.renderDistance);
 distanceInput.addEventListener('input', () => setRenderDistance(distanceInput.value));
 
+// ---- durée de la journée ----
+const jourInput = document.getElementById('day-length');
+const jourValue = document.getElementById('day-length-value');
+
+function decrireDureeJour(secondes) {
+  const s = bornerDuree(secondes);
+  if (s < 120) return `${s} secondes`;
+  const m = s / 60;
+  return `${Number.isInteger(m) ? m : m.toFixed(1)} minute${m > 1 ? 's' : ''}`;
+}
+
+function syncDayControl() {
+  if (!jourInput) return;
+  jourInput.min = String(DUREE_JOUR_BORNES.min);
+  jourInput.max = String(DUREE_JOUR_BORNES.max);
+  jourInput.step = '30';
+  jourInput.value = String(settings.dureeJour);
+  jourValue.textContent = decrireDureeJour(settings.dureeJour);
+}
+
+function setDayLength(value) {
+  const next = bornerDuree(value);
+  settings.dureeJour = next;
+  horloge.reglerDuree(next);   // le monde en cours accélère ou ralentit sans changer d'heure
+  syncDayControl();
+  saveSettings();
+  return next;
+}
+
+syncDayControl();
+if (jourInput) jourInput.addEventListener('input', () => setDayLength(jourInput.value));
+
 startBtn.addEventListener('click', () => {
   if (!worldReady) return;   // stays disabled until the save has been read back
   inventory.hide();
@@ -2139,8 +2949,8 @@ controls.addEventListener('lock', () => {
 // The terrain regenerates from WORLD_SEEDS, so the disk carries only the player's
 // diff and their position. Writes are throttled to AUTOSAVE_INTERVAL_MS and only
 // happen when something actually changed, which keeps them off the frame budget.
-const SAVE_PARAMS = new URLSearchParams(window.location.search);
-const SAVE_SLOT = SAVE_PARAMS.get('world') || 'default';
+// `SAVE_SLOT` et `SAVE_PARAMS` viennent du haut du module : la fiche de génération du
+// monde doit être connue avant le premier tronçon.
 const saveStore = createSaveStore({ slot: SAVE_SLOT, tauriCore });
 
 // Deux identifiants par monde : le slot, qui est un nom de fichier sûr et sert à
@@ -2191,14 +3001,23 @@ function needsWorldSave() {
   return dx * dx + dy * dy + dz * dz > PLAYER_SAVE_MOVE_SQ;
 }
 
+// True between « Régénérer ce monde » et le rechargement : la page tient encore en
+// mémoire l'ancienne fiche, et une autosauvegarde qui partirait à ce moment-là la
+// réécrirait sur le disque — où elle reprendrait raison au démarrage suivant.
+let regenerEnCours = false;
+
 async function flushWorldSave({ force = false, beacon = false } = {}) {
+  if (regenerEnCours) return false;
   if (!worldReady) return false;
   // `force` lifts the throttle (unload, world switch), it never invents work: an
   // unchanged world is left alone on the disk.
   if (!needsWorldSave()) return false;
   const now = performance.now();
   if (!force && now - lastWriteAt < AUTOSAVE_INTERVAL_MS) return false;
-  const text = encodeSave({ seed: WORLD_SEEDS, name: worldName, player: player.saveState(), edits: world.modifiedBlocks });
+  const text = encodeSave({
+    seed: WORLD_SEEDS, name: worldName, player: player.saveState(),
+    edits: world.modifiedBlocks, monde: MONDE,
+  });
 
   // On the way out the response is worthless, so prefer the one transport the
   // browser promises to deliver after the page is gone.
@@ -2284,6 +3103,24 @@ async function bootWorld() {
   try {
     saved = await readStoredWorld();
     if (saved) {
+      // Le fichier porte peut-être une fiche de génération différente de celle du
+      // magasin local — mémoire locale effacée, monde copié d'une autre machine. C'est
+      // le fichier qui a raison : sans lui, les blocs posés par le joueur retomberaient
+      // sur un relief qu'il n'a jamais vu. On range la fiche et on repart une fois ; le
+      // garde de session ferme la porte à une boucle de rechargements.
+      if (saved.monde && !memesMondes(saved.monde, MONDE)) {
+        const cleGarde = `mincraft_fiche_vue:${saveStore.slot}`;
+        try {
+          localStorage.setItem(mondeStorageKey(saveStore.slot), JSON.stringify(clampMonde(saved.monde)));
+          if (!sessionStorage.getItem(cleGarde)) {
+            sessionStorage.setItem(cleGarde, '1');
+            window.location.reload();
+            return;
+          }
+        } catch (e) {
+          console.warn('Fiche du monde non mémorisée :', e);
+        }
+      }
       // Un nom passé par l'URL (création ou renommage à l'instant) prime : c'est
       // l'intention la plus récente, le fichier peut encore porter l'ancienne.
       if (!worldName) worldName = cleanWorldName(saved.name);
@@ -2619,12 +3456,23 @@ function updateWaterHud(force) {
   }
 }
 
+// L'écran de réglage du monde est plein écran et opaque : pendant qu'il est ouvert,
+// rien du monde n'est visible derrière lui. On suspend donc tout ce qui se paie par
+// image — physique, streaming de tronçons, rendu WebGL — sans arrêter l'horloge :
+// `lastTime` continue d'avancer, donc aucune avance de `deltaTime` n'attend le joueur
+// à la fermeture (le monde reprendrait sinon un bond d'une demi-seconde).
+let reglageOuvert = false;
+let framesRendues = 0;
+
 function animate() {
   requestAnimationFrame(animate);
 
   const now = performance.now();
   const deltaTime = Math.min((now - lastTime) / 1000, 0.1);
   lastTime = now;
+
+  if (reglageOuvert) return;
+  framesRendues++;
 
   // FPS counter
   frameCount++;
@@ -2646,6 +3494,12 @@ function animate() {
 
   flushWorldSave();   // throttled and change-gated inside
   updateSaveHud();
+
+  // L'heure du monde avance avec les images : la journée se tarit à l'horloge réelle,
+  // et le cycle s'arrête avec le reste quand l'écran de réglage est ouvert.
+  horloge.avancer(deltaTime);
+  etatCiel = etatDuCiel(horloge.heure());
+  majCiel(deltaTime, now / 1000);
 
   if (controls.isLocked) {
     player.update(deltaTime);
@@ -2678,6 +3532,270 @@ function animate() {
 }
 
 animate();
+
+// ==================== ÉCRAN DE GÉNÉRATION DU MONDE ====================
+// Écran plein écran ouvert depuis l'accueil : la carte à gauche, les curseurs à droite.
+// Les curseurs viennent de la fiche (`MONDE_FIELDS`), la carte et les chiffres viennent
+// de l'aperçu — même source, donc l'étiquette d'un curseur ne peut pas promettre ce que
+// la carte ne montre pas. Rien n'est appliqué à la volée : bouger un curseur redessine
+// l'aperçu, mais il faut un clic pour engager un monde, parce qu'une fiche différente
+// veut dire un autre relief sous des blocs déjà posés.
+const wgEcran = document.getElementById('worldgen-screen');
+const wgOuvrir = document.getElementById('worldgen-open');
+const wgFermer = document.getElementById('worldgen-close');
+const wgResume = document.getElementById('worldgen-resume');
+const wgNom = document.getElementById('worldgen-name');
+const wgCadre = wgEcran ? wgEcran.querySelector('.wg-cadre') : null;
+const wgCarte = document.getElementById('worldgen-map');
+const wgChamps = document.getElementById('worldgen-fields');
+const wgLecture = document.getElementById('worldgen-readout');
+const wgStatut = document.getElementById('worldgen-status');
+const wgDefaut = document.getElementById('worldgen-reset');
+const wgAppliquer = document.getElementById('worldgen-apply');
+const wgNouveau = document.getElementById('worldgen-new');
+
+const ficheEnReglage = Object.assign({}, MONDE);
+const champsParCle = new Map();
+let armeARegenerer = false;
+
+function memoriserFiche(slot, fiche) {
+  try {
+    localStorage.setItem(mondeStorageKey(slot), JSON.stringify(clampMonde(fiche)));
+    return true;
+  } catch (e) {
+    console.warn('Fiche du monde non mémorisée :', e);
+    return false;
+  }
+}
+
+function texteValeur(field, valeur) {
+  if (field.type === 'checkbox') return valeur ? 'oui' : 'non';
+  return `${valeur}${field.unit ? ` ${field.unit}` : ''}`;
+}
+
+function syncUnChamp(cle) {
+  const vue = champsParCle.get(cle);
+  if (!vue) return;
+  const { field, entree, valeurVue } = vue;
+  if (field.type === 'checkbox') entree.checked = !!ficheEnReglage[cle];
+  else entree.value = String(ficheEnReglage[cle]);
+  valeurVue.textContent = texteValeur(field, ficheEnReglage[cle]);
+}
+
+/** Un curseur sans objet (le rayon hors mode île) se grise plutôt que de disparaître. */
+function syncTousLesChamps() {
+  for (const [cle, vue] of champsParCle) {
+    syncUnChamp(cle);
+    const horsService = vue.field.dependsOn && !vue.field.dependsOn(ficheEnReglage);
+    vue.entree.disabled = horsService;
+    vue.ligne.classList.toggle('hors-service', horsService);
+  }
+}
+
+function construireChampsDuMonde() {
+  if (!wgChamps) return;
+  let groupeCourant = null;
+  for (const field of MONDE_FIELDS) {
+    if (field.group !== groupeCourant) {
+      groupeCourant = field.group;
+      const titre = document.createElement('div');
+      titre.className = 'worldgen-group';
+      titre.textContent = groupeCourant.toUpperCase();
+      wgChamps.appendChild(titre);
+    }
+    const ligne = document.createElement('div');
+    ligne.className = 'setting-row worldgen-row';
+    const label = document.createElement('label');
+    label.textContent = field.label;
+    label.htmlFor = `worldgen-${field.key}`;
+    const entree = document.createElement('input');
+    entree.id = `worldgen-${field.key}`;
+    entree.dataset.cle = field.key;
+    if (field.type === 'checkbox') {
+      entree.type = 'checkbox';
+    } else {
+      entree.type = field.type === 'number' ? 'number' : 'range';
+      entree.min = String(field.min);
+      entree.max = String(field.max);
+      entree.step = String(field.step);
+    }
+    const valeurVue = document.createElement('output');
+    valeurVue.htmlFor = entree.id;
+    ligne.append(label, entree, valeurVue);
+    if (field.hint) {
+      const note = document.createElement('span');
+      note.className = 'worldgen-hint';
+      note.textContent = field.hint;
+      ligne.appendChild(note);
+    }
+    wgChamps.appendChild(ligne);
+    champsParCle.set(field.key, { field, entree, valeurVue, ligne });
+    entree.addEventListener('input', () => {
+      ficheEnReglage[field.key] = field.type === 'checkbox' ? entree.checked : Number(entree.value);
+      syncTousLesChamps();
+      repeindreAPartirDeReglage();
+    });
+  }
+  syncTousLesChamps();
+}
+
+let minuteurDeCarte = null;
+function repeindreAPartirDeReglage(delai = 140) {
+  if (!wgCarte) return;
+  if (minuteurDeCarte) clearTimeout(minuteurDeCarte);
+  // L'échantillonnage coûte une passe de bruit sur toute la carte : on ne le paie
+  // qu'une fois le geste du curseur terminé, sinon la page d'accueil ramerait.
+  minuteurDeCarte = setTimeout(() => { minuteurDeCarte = null; repeindreCarte(); }, delai);
+}
+
+function repeindreCarte() {
+  if (!wgCarte) return null;
+  const fiche = clampMonde(ficheEnReglage);
+  const lu = apercuDuMonde.lire(fiche);
+  apercuDuMonde.peindre(wgCarte, fiche);
+  if (wgLecture) {
+    wgLecture.innerHTML = '';
+    for (const ligne of lu.lignes) {
+      const item = document.createElement('div');
+      item.className = 'worldgen-stat';
+      const nom = document.createElement('span');
+      nom.textContent = ligne.label;
+      const obtenu = document.createElement('b');
+      obtenu.textContent = ligne.valeur;
+      item.append(nom, obtenu);
+      if (ligne.vise) {
+        const vise = document.createElement('i');
+        vise.textContent = `visé ${ligne.vise}`;
+        item.appendChild(vise);
+      }
+      wgLecture.appendChild(item);
+    }
+  }
+  return lu;
+}
+
+function decrireFiche(f) {
+  return `${f.ile ? `île de ${f.rayonIle} cubes` : 'continent'} · forêt ${f.foret} %`
+    + ` · désert ${f.desert} % · mer ${f.mer} % · grève ${f.largeurPlage} cubes`
+    + ` · villes ${f.villesPetites}/${f.villesMoyennes}/${f.villesGrandes}`
+    + ` · graine ${f.graine}`;
+}
+
+/**
+ * La carte est un échantillon de 216 × 216 colonnes qu'on agrandit en cubes nets : ce
+ * qui coûte, c'est le nombre de colonnes jugées (une passe de bruit par pixel), pas sa
+ * taille à l'écran. On se contente donc de donner au canevas le plus grand carré tenant
+ * dans son cadre.
+ */
+function dimensionnerCarte() {
+  if (!wgCarte || !wgCadre) return;
+  const cote = Math.max(180, Math.floor(Math.min(wgCadre.clientWidth, wgCadre.clientHeight)));
+  wgCarte.style.width = `${cote}px`;
+  wgCarte.style.height = `${cote}px`;
+}
+
+/** L'accueil garde la trace de la fiche : celle du monde en jeu, et les réglages en attente. */
+function majResumeDuMonde() {
+  if (!wgResume) return;
+  const enJeu = `Génération du monde en jeu : ${decrireFiche(MONDE)}`;
+  wgResume.textContent = memesMondes(ficheEnReglage, MONDE)
+    ? enJeu
+    : `${enJeu} — réglages non appliqués : ${decrireFiche(ficheEnReglage)}`;
+}
+
+function ouvrirReglageDuMonde() {
+  if (!wgEcran || !wgEcran.hidden) return;
+  // Avant tout le reste : coupe le rendu dès l'image suivante.
+  reglageOuvert = true;
+  wgEcran.hidden = false;
+  // Une touche restée enfoncée avant l'ouverture ferait marcher le joueur à la fermeture.
+  for (const k in keys) keys[k] = false;
+  syncTousLesChamps();
+  dimensionnerCarte();
+  repeindreCarte();
+  if (wgStatut) wgStatut.textContent = `Réglages actuels : ${decrireFiche(ficheEnReglage)}`;
+  majResumeDuMonde();
+  if (wgFermer) wgFermer.focus();
+}
+
+function fermerReglageDuMonde() {
+  if (!wgEcran || wgEcran.hidden) return;
+  wgEcran.hidden = true;
+  reglageOuvert = false;
+  majResumeDuMonde();
+}
+
+if (wgEcran) {
+  construireChampsDuMonde();
+  majResumeDuMonde();
+  if (wgOuvrir) wgOuvrir.addEventListener('click', ouvrirReglageDuMonde);
+  if (wgFermer) wgFermer.addEventListener('click', fermerReglageDuMonde);
+  window.addEventListener('resize', () => { if (reglageOuvert) dimensionnerCarte(); });
+
+  if (wgDefaut) {
+    wgDefaut.addEventListener('click', () => {
+      Object.assign(ficheEnReglage, MONDE_DEFAULTS);
+      syncTousLesChamps();
+      repeindreAPartirDeReglage(0);
+      if (wgStatut) wgStatut.textContent = 'Valeurs par défaut rétablies — celles du monde d\'aujourd\'hui.';
+    });
+  }
+
+  // Régénérer efface les blocs posés par le joueur : c'est irréversible, donc le
+  // second clic doit porter l'intention, comme pour la suppression d'un monde.
+  if (wgAppliquer) {
+    wgAppliquer.addEventListener('click', async () => {
+      if (!armeARegenerer) {
+        armeARegenerer = true;
+        wgAppliquer.classList.add('confirm');
+        wgAppliquer.textContent = 'Confirmer ? le monde sera refait';
+        if (wgStatut) wgStatut.textContent = 'Ce bouton défait la sauvegarde de ce monde : recliquez pour régénérer.';
+        setTimeout(() => {
+          if (!armeARegenerer) return;
+          armeARegenerer = false;
+          wgAppliquer.classList.remove('confirm');
+          wgAppliquer.textContent = 'Régénérer ce monde';
+        }, 6000);
+        return;
+      }
+      armeARegenerer = false;
+      wgAppliquer.classList.remove('confirm');
+      wgAppliquer.textContent = 'Régénérer ce monde';
+      memoriserFiche(saveStore.slot, ficheEnReglage);
+      regenerEnCours = true;
+      await resetActiveWorld();
+      // Le fichier porte encore l'ancienne fiche — et c'est LUI qui a raison au démarrage
+      // suivant (garde de cohérence avec les blocs posés). Sans cette écriture, le
+      // rechargement qui suit annulerait le réglage et le monde reviendrait tel qu'avant.
+      try {
+        await saveStore.save(encodeSave({
+          seed: mondeSeeds(ficheEnReglage.graine), name: worldName,
+          player: player.saveState(), edits: new Map(), monde: ficheEnReglage,
+        }));
+      } catch (e) {
+        console.warn('Fiche non écrite dans la sauvegarde :', e);
+      }
+      window.location.reload();
+    });
+  }
+
+  if (wgNouveau) {
+    wgNouveau.addEventListener('click', async () => {
+      // Le nom se saisit ici : celui de l'accueil est derrière cet écran, donc hors de
+      // portée — on ne lui demande rien tant qu'on règle le monde. Vide, c'est la date.
+      const saisi = cleanWorldName((wgNom && wgNom.value) || (worldNameInput ? worldNameInput.value : ''));
+      const nom = saisi || `Monde du ${new Date().toLocaleDateString('fr-FR')}`;
+      await refreshWorldList();
+      const slot = nextSlotName(nom);
+      memoriserFiche(slot, ficheEnReglage);
+      await flushWorldSave({ force: true });
+      const url = new URL(window.location.href);
+      url.searchParams.set('world', slot);
+      url.searchParams.set('name', nom);
+      window.location.assign(url.toString());
+    });
+  }
+}
 
 // Headless test hook: drives physics/input without needing pointer lock.
 window.__mc = {
@@ -2729,11 +3847,14 @@ window.__mc = {
     world.updateChunks(camera.position.x, camera.position.z);
   },
   // Drains the streaming queue synchronously; lets a test assert on a settled world.
+  // The first pass must happen unconditionally: right after a teleport `pendingChunks`
+  // still carries the old position's count (often zero), and a `while` on it would
+  // return without generating anything at the new spot — a silently empty world.
   streamAll() {
     let guard = 0;
-    while (world.pendingChunks > 0 && guard++ < 500) {
+    do {
       world.updateChunks(camera.position.x, camera.position.z, 64);
-    }
+    } while (world.pendingChunks > 0 && guard++ < 500);
     return world.pendingChunks;
   },
   feetY() { return player.feetY; },
@@ -2760,6 +3881,35 @@ window.__mc = {
   saveStore,
   SAVE_SLOT,
   WORLD_SEEDS,
+  // ---- fiche de génération du monde ----
+  // La fiche en jeu, ses défauts, la table des curseurs et les seuils que l'étalonnage
+  // en a tirés : les suites vérifient l'écran sans dupliquer ces chiffres.
+  monde: MONDE,
+  MONDE_DEFAULTS,
+  MONDE_FIELDS,
+  MONDE_SEUILS,
+  mondeSeeds,
+  clampMonde,
+  memesMondes,
+  mondeStorageKey,
+  apercuDuMonde,
+  memoriserFiche,
+  ficheReglee: () => Object.assign({}, ficheEnReglage),
+  // Règle la fiche de l'écran et repeint la carte — sans recharger, pour qu'un test
+  // puisse lire l'aperçu avant d'engager le monde.
+  reglerFiche(partiel) {
+    Object.assign(ficheEnReglage, clampMonde(Object.assign({}, ficheEnReglage, partiel || {})));
+    syncTousLesChamps();
+    majResumeDuMonde();
+    return repeindreCarte();
+  },
+  carteDuMonde: () => wgCarte,
+  // L'écran lui-même : les suites l'ouvrent sans clic et jugent que le rendu 3D est
+  // bien à l'arrêt pendant qu'il occupe la fenêtre (`framesRendues` ne doit plus avancer).
+  ouvrirReglage: () => ouvrirReglageDuMonde(),
+  fermerReglage: () => fermerReglageDuMonde(),
+  reglageOuvert: () => reglageOuvert,
+  framesRendues: () => framesRendues,
   AUTOSAVE_INTERVAL_MS,
   worldReady: () => worldReady,
   flushSave: () => flushWorldSave({ force: true }),
@@ -2805,5 +3955,45 @@ window.__mc = {
   // vérifient le monument dans le monde chargé sans en dupliquer les constantes.
   templeAt: (i, j) => village.templeAt(i, j),
   templesSur: (x0, z0, x1, z1) => village.templesSur(x0, z0, x1, z1),
+  // --- cycle du jour et lanternes ---
+  // L'état du ciel tel qu'il est rendu. `reglerHeure` le fige : une suite qui veut
+  // juger la nuit ne peut pas attendre huit minutes, et un contrôle qui dépend de
+  // l'heure réelle serait vert un matin et rouge un soir.
+  ciel: () => ({ ...etatCiel, lanterneVivet }),
+  // La couche de nuages telle qu'elle est rendue. Une suite juge qu'ils ne sont pas des
+  // cubes (géométrie), qu'ils tiennent au monde quand le joueur marche (le décalage d'UV
+  // compense exactement sa course) et qu'ils s'éteignent avec le jour.
+  nuages: () => nappes.map((n) => ({
+    nom: n.userData.nom,
+    altitude: n.userData.altitude,
+    tuile: n.userData.tuile,
+    vitesse: n.userData.vitesse,
+    visible: n.visible,
+    geometrie: n.geometry.type,
+    opacite: +n.material.uniforms.uOpacite.value.toFixed(4),
+    couleur: '#' + n.material.uniforms.uCouleur.value.getHexString(),
+    repeat: +n.material.uniforms.uTuile.value.x.toFixed(4),
+    offsetU: n.material.uniforms.uDecalage.value.x,
+    offsetV: n.material.uniforms.uDecalage.value.y,
+    camX: camera.position.x,
+    camZ: camera.position.z,
+  })),
+  reglerHeure: (h) => {
+    horloge.regler(h);
+    etatCiel = etatDuCiel(horloge.heure());
+    majCiel(10, performance.now() / 1000);   // forcée : la valeur doit se lire tout de suite
+    return etatCiel;
+  },
+  horloge: () => horloge,
+  dureeJour: () => settings.dureeJour,
+  reglerDureeJour: (v) => setDayLength(v),
+  // Candélabres du village dans une région, et lanternes réellement retenues pour le
+  // halo d'un tronçon — la seconde réponse exclut donc celles que le joueur a arrachées.
+  lampadairesSur: (x0, z0, x1, z1) => village.lampadairesSur(x0, z0, x1, z1),
+  lampesInterieuresSur: (x0, z0, x1, z1) => village.lampesInterieuresSur(x0, z0, x1, z1),
+  appliquesMuralesSur: (x0, z0, x1, z1) => village.appliquesMuralesSur(x0, z0, x1, z1),
+  couloirsSur: (x0, z0, x1, z1) => village.couloirsSur(x0, z0, x1, z1),
+  lampesDuTroncon: (cx, cz) => world.lampesAutour(cx, cz),
+  bloc: (x, y, z) => world.getBlock(x, y, z),
   playerState: () => player.saveState(),
 };

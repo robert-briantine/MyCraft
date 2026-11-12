@@ -818,18 +818,26 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
 
       placer(bx + door.front.lx, plan.siteH + 1, bz + door.front.lz);
       const dehors = { feet: mc.feetY(), auSol: !!mc.player.onGround };
+      const apt = plan.appartements;
       const pas = {
         dehors,
+        distribue: !!apt,
         entree: avancerVers(bx + door.in.lx + 0.5, bz + door.in.lz + 0.5, plan.siteH + 1, 240),
       };
-      if (pas.entree.ok) {
+      // Un couloir n'est pas dans l'axe de la porte sur rue : sans ce point de passage,
+      // le joueur en ligne droite buterait dans le mur de dos et la volée passerait pour
+      // injouable alors que seul le détour manquait à la trajectoire.
+      if (pas.entree.ok && apt) {
+        pas.couloir = avancerVers(bx + apt.seuil.lx + 0.5, bz + apt.seuil.lz + 0.5, plan.siteH + 1, 240);
+      }
+      if (pas.entree.ok && (!apt || (pas.couloir && pas.couloir.ok))) {
         for (let i = 0; i < vollee.length; i++) {
           const c = vollee[i];
           const r = avancerVers(c.cx, c.cz, c.y + 1, 240);
           if (!r.ok) { pas.vollee = { index: i, cible: [c.cx, c.cz, c.y + 1], ...r }; break; }
         }
       } else {
-        pas.vollee = { index: -1, cible: [], ...pas.entree };
+        pas.vollee = { index: -1, cible: [], ...(pas.couloir || pas.entree) };
       }
       if (!pas.vollee) pas.toit = avancerVers(sortie.cx, sortie.cz, sortie.pieds, 240);
       grimpes.push(Object.assign(geo, pas));
@@ -874,6 +882,14 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
         (b) => `tronçon ${b.chunk}#${b.lot} pieds=${b.dehors.feet.toFixed(2)} attendu=${b.siteH + 1}`) || combien);
     check('le joueur entre par la porte en marchant', g.every((b) => b.entree.ok),
       fails((b) => !b.entree.ok, (b) => `tronçon ${b.chunk}#${b.lot} arrêté à ${b.entree.x.toFixed(2)},${b.entree.z.toFixed(2)} pieds=${b.entree.feet.toFixed(2)}`) || combien);
+    // Le couloir se juge en marchant, pas à sa géométrie : c'est le détour que le joueur
+    // fait réellement pour aller de la rue à l'escalier (« il y a pas de couloir qui mene
+    // vers des pieces avec des portes », 2026-11-11).
+    check('le joueur traverse le couloir jusqu’à l’escalier en marchant',
+      g.every((b) => !b.distribue || (b.couloir && b.couloir.ok)),
+      fails((b) => b.distribue && (!b.couloir || !b.couloir.ok),
+        (b) => `tronçon ${b.chunk}#${b.lot} bloqué au couloir à ${b.couloir ? `${b.couloir.x.toFixed(2)},${b.couloir.z.toFixed(2)} pieds=${b.couloir.feet.toFixed(2)}` : 'non tenté'}`)
+        || `${g.filter((b) => b.distribue).length} immeuble(s) distribué(s) traversé(s)`);
     check('le joueur monte tout l’escalier en marchant', g.every((b) => !b.vollee),
       fails((b) => b.vollee, (b) => `tronçon ${b.chunk}#${b.lot} bloqué à la marche ${b.vollee.index} `
         + `(cible ${b.vollee.cible.join(',')}) resté à ${b.vollee.x.toFixed(2)},${b.vollee.z.toFixed(2)} pieds=${b.vollee.feet.toFixed(2)}`)
@@ -882,6 +898,152 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
       g.every((b) => !!b.toit && b.toit.ok),
       fails((b) => !b.toit || !b.toit.ok, (b) => `tronçon ${b.chunk}#${b.lot} resté à `
         + (b.toit ? `${b.toit.x.toFixed(2)},${b.toit.z.toFixed(2)} pieds=${b.toit.feet.toFixed(2)}` : 'escalier non gravi')) || combien);
+  }
+  await vp.close();
+}
+
+// ============================================================ 8b bis. appliques du couloir
+// Demandé le 2026-11-11 : « dans les immeubles tu mis les lumières devant les portes, il
+// faudrait ajouter une lumière qui soit mise sur les murs pour éviter de bloquer le
+// passage ». Un candélabre occupe toute sa case à la marche — la collision se juge à la
+// cellule, jamais à la silhouette fine du poteau — donc celui du couloir condamne le seuil
+// des pièces. L'applique, elle, est scellée au mur et n'est pas solide. Deux jugements,
+// tous deux rendus par le joueur qui avance : le couloir se parcourt d'un bout à l'autre,
+// et l'on s'installe dans la case même de l'applique sans être éjecté. Le second jugement
+// porte son propre témoin négatif — rendre l'applique solide doit éjecter le joueur — sinon
+// il passerait vert sans rien mesurer, comme tant de contrôles dits « de collision ».
+{
+  const run = await openGame(URL);
+  const vp = run.page;
+  const probe = await vp.evaluate(() => {
+    const mc = window.__mc;
+    const EYE = 1.62;
+    const { AIR, LAMP_POST, LAMP_GLOW } = mc.BLOCK;
+    const APPLIQUES = [mc.BLOCK.LAMP_WALL_O, mc.BLOCK.LAMP_WALL_E,
+      mc.BLOCK.LAMP_WALL_N, mc.BLOCK.LAMP_WALL_S];
+    const cam0 = mc.camera.position;
+    const originX = Math.floor(cam0.x / 16);
+    const originZ = Math.floor(cam0.z / 16);
+
+    // Le couloir le mieux loti autour du point d'apparition.
+    let meilleur = null;
+    for (let cx = originX - 12; cx <= originX + 12; cx++) {
+      for (let cz = originZ - 12; cz <= originZ + 12; cz++) {
+        for (const co of mc.couloirsSur(cx * 16, cz * 16, cx * 16 + 15, cz * 16 + 15)) {
+          if (!meilleur || co.cellules.length > meilleur.co.cellules.length) meilleur = { cx, cz, co };
+        }
+      }
+    }
+    if (!meilleur) return { trouve: false, cam: [Math.round(cam0.x), Math.round(cam0.z)] };
+    const { co } = meilleur;
+    const cellules = co.cellules.slice().sort((a, b) => (a.wx - b.wx) || (a.wz - b.wz));
+    const tete = cellules[0];
+    const queue = cellules[cellules.length - 1];
+
+    const chargerAutour = (x, z) => {
+      mc.releaseAll();
+      mc.player.flyMode = true;
+      mc.camera.position.set(x + 0.5, co.y + 6, z + 0.5);
+      mc.player.velocity.set(0, 0, 0);
+      let attente = 0;
+      while (attente++ < 3000 && mc.bloc(tete.wx, co.y, tete.wz) === undefined) {
+        mc.streamAll();
+        mc.step(1 / 60);
+      }
+      mc.streamAll();
+      mc.step(1 / 60);
+    };
+    chargerAutour(tete.wx, tete.wz);
+    // `bloc` répond 0 pour un tronçon non chargé : juger la présence d'une applique avant
+    // le streaming renverrait « aucune » et le contrôle passerait à côté de son objet.
+    const longeuses = cellules.filter((c) => APPLIQUES.includes(mc.bloc(c.wx, co.y + 1, c.wz)));
+
+    const poserAuxPieds = (x, z, pieds) => {
+      mc.releaseAll();
+      mc.camera.position.set(x + 0.5, pieds + EYE, z + 0.5);
+      mc.camera.rotation.set(0, 0, 0, 'YXZ');
+      mc.player.velocity.set(0, 0, 0);
+      mc.player.flyMode = false;
+      for (let i = 0; i < 30; i++) mc.step(1 / 120);
+    };
+    const avancerVers = (tx, tz, piedsAttendus, budget) => {
+      for (let f = 0; f < budget; f++) {
+        const cam = mc.camera.position;
+        const dx = tx - cam.x, dz = tz - cam.z;
+        if (Math.hypot(dx, dz) < 0.34 && Math.abs(mc.feetY() - piedsAttendus) < 0.25) {
+          mc.releaseAll();
+          return { ok: true, frames: f, feet: mc.feetY(), x: cam.x, z: cam.z };
+        }
+        mc.camera.rotation.set(0, Math.atan2(-dx, -dz), 0, 'YXZ');
+        mc.controls.keys.KeyW = true;
+        mc.step(1 / 60);
+      }
+      mc.releaseAll();
+      return { ok: false, frames: budget, feet: mc.feetY(), x: mc.camera.position.x, z: mc.camera.position.z };
+    };
+
+    // 1) Le couloir se parcourt d'une extrémité à l'autre, appliques comprises.
+    poserAuxPieds(tete.wx, tete.wz, co.y);
+    const traite = avancerVers(queue.wx + 0.5, queue.wz + 0.5, co.y, 600);
+
+    // 2) Témoin du dispositif : un candélabre planté en travers du couloir doit l'arrêter.
+    //    Sans cette épreuve, « le couloir se traverse » serait vert même avec un poteau
+    //    dans le passage — exactement le défaut signalé par la demande.
+    const genant = cellules[Math.floor(cellules.length / 2)];
+    mc.setBlock(genant.wx, co.y, genant.wz, LAMP_POST);
+    mc.setBlock(genant.wx, co.y + 1, genant.wz, LAMP_GLOW);
+    mc.streamAll();
+    poserAuxPieds(tete.wx, tete.wz, co.y);
+    const barre = avancerVers(queue.wx + 0.5, queue.wz + 0.5, co.y, 600);
+    mc.setBlock(genant.wx, co.y, genant.wz, AIR);
+    mc.setBlock(genant.wx, co.y + 1, genant.wz, AIR);
+    mc.streamAll();
+
+    // 3) On tient dans la case de l'applique elle. C'est là que le candélabre échouait :
+    //    non solide, le luminaire mural doit laisser le joueur s'y tenir debout.
+    const echantillon = longeuses[0] || null;
+    let dansApplique = null;
+    if (echantillon) {
+      const id = mc.bloc(echantillon.wx, co.y + 1, echantillon.wz);
+      const info = mc.BLOCK_INFO[id];
+      poserAuxPieds(echantillon.wx, echantillon.wz, co.y);
+      dansApplique = {
+        deplace: +Math.hypot(mc.camera.position.x - (echantillon.wx + 0.5),
+          mc.camera.position.z - (echantillon.wz + 0.5)).toFixed(2),
+        auSol: !!mc.player.onGround,
+        pieds: +mc.feetY().toFixed(2),
+        bloque: mc.world.isSolid(echantillon.wx, co.y + 1, echantillon.wz),
+        solide: !!(info && info.solid),
+      };
+    }
+
+    return {
+      trouve: true,
+      couloir: `${tete.wx},${tete.wz} → ${queue.wx},${queue.wz} @${co.y}`,
+      colonnes: cellules.length, longeuses: longeuses.length,
+      traite, barre, dansApplique,
+    };
+  });
+
+  check('le monde chargé contient un couloir d\'immeuble', probe.trouve === true,
+    probe.trouve ? probe.couloir : `aucun couloir autour de ${probe.cam}`);
+  if (probe.trouve) {
+    check('un candélabre planté dans le couloir le condamne — le témoin voit les obstacles',
+      probe.barre.ok === false,
+      probe.barre.ok
+        ? 'le joueur passe malgré un poteau en travers : le contrôle ne verrait rien'
+        : `arrêté à ${probe.barre.x.toFixed(2)},${probe.barre.z.toFixed(2)}`);
+    check('le couloir d\'immeuble se parcourt d\'une porte à l\'autre en marchant',
+      probe.traite.ok && probe.longeuses >= 1,
+      probe.traite.ok
+        ? `${probe.colonnes} colonnes, ${probe.longeuses} applique(s) longée(s)`
+        : `bloqué à ${probe.traite.x.toFixed(2)},${probe.traite.z.toFixed(2)} pieds=${probe.traite.feet.toFixed(2)} · `
+          + `${probe.longeuses} applique(s) chargée(s) sur ${probe.colonnes} colonnes`);
+    check('on tient debout dans la case de l\'applique, elle ne barre pas le passage',
+      !!probe.dansApplique && probe.dansApplique.deplace < 0.35 && probe.dansApplique.auSol
+        && probe.dansApplique.bloque === false && probe.dansApplique.solide === false,
+      probe.dansApplique ? JSON.stringify(probe.dansApplique)
+        : 'aucune applique chargée le long du couloir jugé');
   }
   await vp.close();
 }
@@ -1086,9 +1248,15 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
     const passages = [];
     for (const a of arcs) {
       if (passages.length >= MAX || passages.length + nonCharges.arcs >= ESSAIS) break;
-      const niveau = (i) => (a.levels.has(i)
-        ? a.levels.get(i)
-        : (() => { const c = cellWorld(a.axis, a.k, i, 0); return mc.getTerrainHeight(c.wx, c.wz); })());
+      // Le socle se pose sur la chaussée, il ne la commande plus (voir `computeArch`) :
+      // juger les colonnes d'approche au relief naturel ferait échouer une marche
+      // pourtant réussie dès que l'avenue roule en remblai — mesuré colonne 51, pieds à
+      // 31 pour une altitude attendue de 33. Ce que foulent les pieds, c'est le pavé.
+      const niveau = (i) => {
+        const c = cellWorld(a.axis, a.k, i, 0);
+        const rue = mc.roadSurface(c.wx, c.wz, true);
+        return rue === null ? mc.getTerrainHeight(c.wx, c.wz) : rue;
+      };
       const c = cellWorld(a.axis, a.k, a.centre, 0);
       const r = marche('arc', a.axis, a.k, a.lo - 1, a.hi + 1, niveau, 420,
         () => solid(c.wx, a.g + a.clear + 1, c.wz));

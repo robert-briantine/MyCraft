@@ -17,7 +17,7 @@
 // Le module ne dépend de rien : on lui passe un bruit (voir `noise.js`) et la hauteur du
 // monde, donc les suites Node jugent exactement le relief que le navigateur dessine.
 
-export const RELIEF = {
+const RELIEF_DEFS = {
   baseHeight: 26,      // altitude moyenne des plateaux
   baseAmp: 10,         // ampleur du bruit large
   hillsAmp: 15,        // ampleur des collines basse fréquence
@@ -114,14 +114,39 @@ export const RELIEF = {
   // berge, le joueur restait `onGround` faux sans pouvoir gravir les cinq cubes d'un coup.
   riverBank: 8,
   riverFade: 10,              // pas refermant le lit à la source (le lit naît peu profond)
+
+  // Île. Demandé le 2026-11-10 : « je veux que le monde soit une île, quand on arrive
+  // sur le bord on de l'eau à perte de vue ». Le monde reste sans limite — c'est le
+  // moteur de tronçons qui ne sait pas borner — mais la colonne est **mélangée** à un
+  // fond marin constant à mesure qu'on s'écarte du centre : au-delà du rayon il ne
+  // reste que ce fond, donc une nappe parfaitement plane sous un plan d'eau plat, et
+  // l'horizon ne rencontre plus que de l'eau. Mélanger (et non retrancher quelques
+  // cubes) est ce qui garantit ce résultat quelle que soit la hauteur initiale : une
+  // soustraction laisserait un pic de soixante cubes traverser la mer à trois cents
+  // cubes du bord.
+  island: false,              // éteint par défaut : les suites Node jugent le monde d'avant
+  islandX: 0,
+  islandZ: 0,                 // l'île est centrée sur le point d'apparition historique
+  islandRadius: 1600,         // distance du centre au pied de la côte
+  islandShelf: 260,           // longueur du talus : la pente y reste sous un cube par colonne
+  islandDepth: 14,            // cubes d'eau au-dessus du fond du large
 };
+
+/** Les constantes du relief, telles que le projet les génère aujourd'hui. */
+export const RELIEF = RELIEF_DEFS;
 
 /**
  * @param {object} deps
  * @param {{noise2D:(x:number,y:number)=>number, octave:(x:number,y:number,oct?:number,persist?:number)=>number}} deps.noise
  * @param {number} [deps.chunkHeight] hauteur du monde, pour le plafond du relief
+ * @param {object} [deps.relief] correctifs de `RELIEF` (écran de génération du monde) ;
+ *        absent, le relief est exactement celui du projet — c'est ce que jugent les suites
  */
-export function createTerrain({ noise, chunkHeight = 64 }) {
+export function createTerrain({ noise, chunkHeight = 64, relief = null }) {
+  // Copie locale : tous les termes ci-dessous lisent `RELIEF`, donc un seul objet
+  // mélangé suffit à configurer le monde complet. Elle est déclarée avant toute
+  // lecture pour qu'aucun chemin du module n'évalue les constantes globales.
+  const RELIEF = relief ? Object.assign({}, RELIEF_DEFS, relief) : RELIEF_DEFS;
   const plafond = chunkHeight - RELIEF.ceilingMargin;
 
   /** Relèvement dû au massif, en cubes (0 sur la majeure partie de la carte). */
@@ -162,6 +187,30 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
   }
 
   /**
+   * Part de la colonne livrée au fond du large, de 0 (cœur de l'île) à 1 (pleine mer).
+   * Sigmoïde, comme le bassin et le massif : le pied du talus est franc et l'approche
+   * reste plate, d'où une plage qui se lit comme telle plutôt qu'une pente continue.
+   * Le talus ne peut pas mordre sur le cœur de l'île : au pire il s'arrête à soixante
+   * cubes du centre, sinon une île petite noierait le point d'apparition.
+   */
+  function islandMix(x, z) {
+    if (!RELIEF.island) return 0;
+    const rayon = Math.max(80, RELIEF.islandRadius);
+    const talus = Math.min(Math.max(20, RELIEF.islandShelf), Math.max(20, rayon - 60));
+    const depart = rayon - talus;
+    const r = Math.hypot(x - RELIEF.islandX, z - RELIEF.islandZ);
+    if (r <= depart) return 0;
+    const t = Math.min(1, (r - depart) / talus);
+    return t * t * (3 - 2 * t);
+  }
+
+  /** Altitude du fond du large : sous la ligne de flottaison d'autant de cubes qu'il faut
+   *  pour que la mer n'y montre plus son plancher. */
+  function seabed() {
+    return RELIEF.seaLevel - Math.max(1, RELIEF.islandDepth);
+  }
+
+  /**
    * Intensité du très haut massif, de 0 (le pays ordinaire) à 1 (le cœur). Le village
    * s'y cale pour n'y bâtir ni immeuble ni hameau dru : c'est la zone que le joueur
    * doit lire comme sauvage sur des centaines de cubes, pas comme un accident.
@@ -188,7 +237,13 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
     return Math.round(socle + RELIEF.alpsCrag * crag * t);
   }
 
-  function rawHeight(x, z) {
+  /**
+   * La colonne avant d'être posée. `opts.sansMer` et `opts.sansIle` retirent un terme :
+   * c'est la matière première de l'étalonnage de l'écran de génération, qui doit pouvoir
+   * demander « combien de colonnes noierais-je si le seuil marin valait t ? » sans
+   * repayer quatre octaves de bruit à chaque candidate.
+   */
+  function hauteurNue(x, z, opts) {
     const base = noise.octave(x * 0.01, z * 0.01, 5, 0.5);
     const hills = noise.octave(x * 0.003, z * 0.003, 3, 0.4) * RELIEF.hillsAmp;
     const ridge = Math.abs(noise.octave(x * RELIEF.valleyFreq, z * RELIEF.valleyFreq, 2, 0.5));
@@ -196,7 +251,8 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
     const valley = 1 - t * t * (3 - 2 * t);
     const lift = massifLift(x, z);
     const alps = alpsLift(x, z);
-    const sink = oceanBasin(x, z);
+    const sink = opts && opts.sansMer ? 0 : oceanBasin(x, z);
+    const mix = opts && opts.sansIle ? 0 : islandMix(x, z);
     const rise = lift + alps;
     // Le grain se retire à mesure qu'on monte : laissé entier, il suffisait à créer un
     // ressaut de deux cubes tous les dix pas sur un versant, et le marcheur — qui ne
@@ -217,7 +273,31 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
     // ne casse pas la franchissabilité — le minimum de deux fonctions à un cube par
     // colonne reste à un cube par colonne — mais il écrase l'arête, d'où la crête.
     if (alps > 0) h = Math.min(h, RELIEF.alpsTop);
-    return Math.max(RELIEF.minGround, Math.min(plafond, Math.floor(h)));
+    // La mer gagne par mélange, jamais par soustraction : à `mix` égal à un il ne reste
+    // que le fond du large, donc une plaine sous-marine exactement plane sous une eau
+    // exactement plane — l'horizon demandé. Le mélange n'ajoute de son côté que
+    // 1,5 × (sommet − fond) / talus de dérive par colonne, soit moins d'un cube pour les
+    // réglages courants : il incline le pays sans y dresser de falaise, et la rugosité
+    // qui reste est celle du relief d'avant, pas une muraille nouvelle.
+    if (mix > 0) h = h * (1 - mix) + seabed() * mix;
+    // Le plancher habituel (`minGround`) n'a pas à borner la pleine mer : sous l'eau,
+    // un fond plus bas ne fait pas un trou, il fait de la profondeur. Sans cette
+    // exception, régler une mer intérieure basse ET un large profond écrasait le fond
+    // du large sur `minGround` et l'océan devenait une flaque de trois cubes où le
+    // sable se voyait à travers l'eau.
+    const fondMin = RELIEF.island && mix > 0
+      ? Math.min(RELIEF.minGround, seabed())
+      : RELIEF.minGround;
+    return Math.max(fondMin, Math.min(plafond, Math.floor(h)));
+  }
+
+  function rawHeight(x, z) {
+    return hauteurNue(x, z, null);
+  }
+
+  /** Relief ni marin ni insulaire : ce que la colonne serait sans aucun des deux termes. */
+  function reliefBrut(x, z) {
+    return hauteurNue(x, z, { sansMer: true, sansIle: true });
   }
 
   // ---- rivières ------------------------------------------------------------
@@ -424,6 +504,6 @@ export function createTerrain({ noise, chunkHeight = 64 }) {
     return riv ? Math.max(RELIEF.seaLevel, riv.surface) : RELIEF.seaLevel;
   }
 
-  return { heightAt: groundAt, rawHeight, riverAt, waterTopAt, massifLift, oceanBasin,
-    alpsLift, alpsIntensity, RELIEF };
+  return { heightAt: groundAt, rawHeight, reliefBrut, riverAt, waterTopAt, massifLift, oceanBasin,
+    oceanField, islandMix, seabed, alpsLift, alpsIntensity, RELIEF };
 }

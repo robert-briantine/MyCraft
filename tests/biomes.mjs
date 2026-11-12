@@ -491,11 +491,11 @@ check('les couronnes ne se coupent pas aux frontières de tronçon', manquants =
 // ---------------------------------------------------------------------------
 const { SimplexNoise } = await loadPublicModule('public/js/noise.js');
 const { createTerrain } = await loadPublicModule('public/js/terrain.js');
-// La hauteur du MONDE du jeu (`game.js`, CHUNK_HEIGHT = 80), non celle des tampons de
+// La hauteur du MONDE du jeu (`game.js`, CHUNK_HEIGHT = 128), non celle des tampons de
 // tronçon ci-dessus. Le plafond du relief se déduit de cette valeur : à 64, toute la
 // section ne voyait que des sommets à cinquante-six cubes et jugerait infranchissable un
 // pays alpin dont le joueur ne voit jamais les crêtes à soixante-six.
-const HAUTEUR_MONDE = 80;
+const HAUTEUR_MONDE = 128;
 const monde = createTerrain({ noise: new SimplexNoise(42), chunkHeight: HAUTEUR_MONDE });
 const memoMonde = new Map();
 const rel = (x, z) => {

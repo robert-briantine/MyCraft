@@ -383,6 +383,92 @@ function paintObsidian(t) {
   t.speckle(9, rgb(0x8a6fd0), 6, 1);
 }
 
+/**
+ * Poteau de fonte du lampadaire : une colonne de métal brossé, plus claire sur la
+ * arête de droite pour que le poteau lise comme un cylindre et non comme une plaque,
+ * et un collier de laiton à son sommet — c'est là que s'accroche la lanterne.
+ */
+function paintLampPost(t) {
+  t.tint(rgb(0x3a3f47), 0.22, 0.5, 3);
+  for (let y = 0; y < TILE; y++) {
+    const brillance = 1 + (y / TILE - 0.5) * 0.35;
+    for (let x = 5; x <= 10; x++) {
+      const k = brillance * (x === 9 || x === 10 ? 1.5 : 1);
+      t.px(x, y, shade(rgb(0x4a515c), k));
+    }
+  }
+  for (let x = 0; x < TILE; x++) {                    // socle et collier de laiton
+    t.px(x, 0, rgb(0xb8892f));
+    t.px(x, 1, shade(rgb(0xd9a63f), 0.85));
+    t.px(x, TILE - 1, rgb(0x24272c));
+    t.px(x, TILE - 2, shade(rgb(0x2f343b), 1.15));
+  }
+  t.speckle(7, rgb(0x6b7480), 11, 1);
+}
+
+/**
+ * Verre de la lanterne : un cœur brûlant cerclé de fer. Le bloc est rendu sans
+ * éclairage de scène (il porte sa propre lumière), donc ces couleurs sont celles que
+ * le joueur voit la nuit — elles doivent être franches, pas délavées par une ambiante.
+ */
+function paintLampGlow(t) {
+  t.fill(rgb(0xffb733));
+  for (let y = 0; y < TILE; y++) {
+    for (let x = 0; x < TILE; x++) {
+      const d = Math.hypot(x - 7.5, y - 7.5) / 8;
+      const chaud = d < 0.45 ? rgb(0xfff2b0) : d < 0.75 ? rgb(0xffc94a) : rgb(0xe0781e);
+      const n = (t.rnd(x, y, 2) - 0.5) * 26;
+      t.px(x, y, [chaud[0] + n, chaud[1] + n * 0.8, chaud[2] + n * 0.5]);
+    }
+  }
+  for (let i = 0; i < TILE; i++) {                    // châssis de fer
+    t.px(i, 0, rgb(0x2a2d33)); t.px(i, TILE - 1, rgb(0x2a2d33));
+    t.px(0, i, rgb(0x2a2d33)); t.px(TILE - 1, i, rgb(0x2a2d33));
+    t.px(i, 7, rgb(0x3a3e45)); t.px(7, i, rgb(0x3a3e45));
+  }
+}
+
+/**
+ * Applique murale d'immeuble : un globe scellé sur un bras de laiton vissé à une platine
+ * de fonte. Comme la lanterne, le bloc est rendu sans éclairage de scène — ces couleurs
+ * sont donc vues telles quelles la nuit — mais elle doit se distinguer du lampadaire de
+ * voirie d'un coup d'œil : ici le fer occupe le bas de la tuile, car c'est le mur qui
+ * porte l'objet, pas un poteau planté dans le sol.
+ */
+function paintLampWall(t) {
+  for (let y = 0; y < TILE; y++) {                          // platine de fonte
+    for (let x = 0; x < TILE; x++) {
+      const n = (t.rnd(x, y, 1) - 0.5) * 18;
+      t.px(x, y, [0x2b + n, 0x2f + n, 0x36 + n]);
+    }
+  }
+  for (let x = 2; x <= 13; x++) {                           // bord riveté
+    t.px(x, 15, rgb(0x14171b));
+    t.px(x, 1, shade(rgb(0x4a515c), 1.1));
+  }
+  for (let y = 2; y <= 14; y++) {
+    t.px(1, y, rgb(0x14171b)); t.px(14, y, rgb(0x14171b));
+  }
+  for (let x = 5; x <= 10; x++) {                           // bras de laiton
+    for (let y = 9; y <= 12; y++) {
+      t.px(x, y, shade(rgb(0xc79636), x === 10 ? 1.35 : x === 5 ? 0.75 : 1));
+    }
+  }
+  t.px(4, 12, rgb(0x8a6a24)); t.px(11, 12, rgb(0x8a6a24));  // pattes de fixation
+  const cx = 7.5, cy = 6;
+  for (let y = 0; y < 12; y++) {                            // globe
+    for (let x = 0; x < TILE; x++) {
+      const d = Math.hypot(x - cx, y - cy) / 5.4;
+      if (d > 1) continue;
+      const chaud = d < 0.42 ? rgb(0xfff6c8) : d < 0.72 ? rgb(0xffd35c) : rgb(0xe8811f);
+      const n = (t.rnd(x, y, 2) - 0.5) * 22;
+      t.px(x, y, [chaud[0] + n, chaud[1] + n * 0.85, chaud[2] + n * 0.5]);
+    }
+  }
+  for (let i = 3; i <= 12; i++) t.px(i, 11, rgb(0x2a2d33)); // cerclage bas du globe
+  t.blob(5.6, 4.2, 1.1, rgb(0xffffff), 7);                  // reflet du verre
+}
+
 const PAINTERS = {
   dirt: paintDirt,
   grass_top: paintGrassTop,
@@ -407,6 +493,9 @@ const PAINTERS = {
   water: paintWater,
   lava: paintLava,
   obsidian: paintObsidian,
+  lamp_post: paintLampPost,
+  lamp_glow: paintLampGlow,
+  lamp_wall: paintLampWall,
 };
 
 // ==================== atlas ====================

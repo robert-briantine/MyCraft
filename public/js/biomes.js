@@ -21,7 +21,7 @@
 // cellule est-elle prise par la voirie ou un bâtiment », ce qui permet de le tester
 // sous Node sans navigateur.
 
-export const BIOMES = {
+const BIOMES_DEFS = {
   // Climat : deux bruits basse fréquence, une maille de 150 cubes soit neuf tronçons.
   climateCell: 150,
   climateDetail: 3,      // un octave serré divise la maille : frontières découpées
@@ -92,6 +92,9 @@ export const BIOMES = {
   sandLine: 20,
 };
 
+/** Les constantes de la végétation, telles que le projet les génère aujourd'hui. */
+export const BIOMES = BIOMES_DEFS;
+
 /**
  * @param {object} deps
  * @param {object} deps.BLOCK            table des blocs du jeu
@@ -104,11 +107,18 @@ export const BIOMES = {
  *                                                        ou un bâtiment
  * @param {(x:number,z:number)=>({surface:number,fond:number,demiLargeur:number,berge:number,d:number}|null)}
  *      [deps.riverAt]                    lit de rivière au droit d'une colonne
+ * @param {object} [deps.reglages]        correctifs de `BIOMES` (écran de génération) ;
+ *      absent, la végétation est exactement celle du projet
  */
 export function createBiomeGen({
   BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, roll, saltBase = 0, isBlocked = () => false,
-  seaLevel = -1, riverAt = null,
+  seaLevel = -1, riverAt = null, reglages = null,
 }) {
+  // Copie locale : tout le module lit `BIOMES`, donc un seul objet mélangé configure
+  // les zones, les bouquets et les arbres. Les seuils ne sont jamais un tirage — ils ne
+  // déplacent pas les souches, ils décident seulement de la zone d'une colonne — donc
+  // les régler ne peut pas désaccorder un monde enregistré.
+  const BIOMES = reglages ? Object.assign({}, BIOMES_DEFS, reglages) : BIOMES_DEFS;
   const S = (n) => (saltBase + n) | 0;
   // Un cours d'eau ne porte ni arbre ni rocher : ses berges sont sableuses et son lit
   // noyé. `surCours` juge le lit **et** ses berges, pour qu'une couronne ne vienne pas
@@ -168,6 +178,20 @@ export function createBiomeGen({
    */
   function grandeForet(x, z) {
     return bruit(x, z, BIOMES.forestMacroCell, SALT_MACRO) >= BIOMES.forestMacroLimit;
+  }
+
+  /**
+   * La valeur brute du grand boisé, sans le seuil. L'écran de génération a besoin du
+   * champ et pas seulement du booléen : convertir une part demandée en pourcentage en
+   * un seuil de climat suppose de savoir sur quoi porte la statistique.
+   */
+  function macroValue(x, z) {
+    return bruit(x, z, BIOMES.forestMacroCell, SALT_MACRO);
+  }
+
+  /** La fraîcheur du climat (forêt si elle monte, désert si elle baisse), sans seuil. */
+  function climateValue(x, z) {
+    return climat(x, z, BIOMES.climateCell, SALT_WET) - climat(x, z, BIOMES.climateCell, SALT_HEAT);
   }
 
   /**
@@ -413,5 +437,6 @@ export function createBiomeGen({
     }
   }
 
-  return { BIOMES, biomeAt, peuplement, surfaceFor, treeAt, stampVegetation, grandeForet };
+  return { BIOMES, biomeAt, peuplement, surfaceFor, treeAt, stampVegetation, grandeForet,
+    climateValue, macroValue };
 }

@@ -44,6 +44,18 @@ const palette = await page.evaluate(() => {
     for (let i = 0; i < d.length; i += 4) { sum += d[i] + d[i + 1] + d[i + 2]; uniq.add(`${d[i]},${d[i + 1]},${d[i + 2]}`); }
     return { sum, uniq: uniq.size };
   };
+  // Un bloc hors catalogue n'est pas automatiquement un bloc mort : il a le droit de
+  // n'être que la variante orientée d'une icône déjà en palette (`appliqueOriente` choisit
+  // la face au mur). Mais cette parenté doit être déclarée et vérifiable, sinon
+  // `variant: true` deviendrait une façon commode de faire disparaître un bloc du jeu.
+  const orphelines = Object.keys(mc.BLOCK_INFO).map(Number)
+    .filter((id) => id >= 1 && !ids.includes(id))
+    .filter((id) => {
+      const i = mc.BLOCK_INFO[id];
+      return i.variant !== true
+        || !ids.some((p) => p !== id && mc.BLOCK_INFO[p].name === i.name
+          && String(mc.BLOCK_INFO[p].tiles) === String(i.tiles));
+    });
   return {
     total: mc.ALL_BLOCKS.length,
     ids,
@@ -54,6 +66,7 @@ const palette = await page.evaluate(() => {
     lava: iconSig(mc.BLOCK.LAVA),
     stone: iconSig(mc.BLOCK.STONE),
     blank: cells.filter((c) => iconSig(Number(c.dataset.block)).sum === 0).length,
+    orphelines,
   };
 });
 check('la palette expose tous les blocs, sans doublon',
@@ -62,6 +75,9 @@ check('la palette expose tous les blocs, sans doublon',
   palette.ids.every((id) => id >= 1) &&
   palette.sections === palette.expectedSections,
   `${palette.ids.length}/${palette.total} blocs, ${palette.sections} catégories`);
+check('un bloc hors palette n\'est jamais qu\'une variante déclarée d\'une icône présente',
+  palette.orphelines.length === 0,
+  palette.orphelines.join(', ') || 'aucun bloc orphelin');
 check('chaque icône de palette est dessinée depuis l’atlas',
   palette.blank === 0 && palette.water.uniq > 8 && palette.lava.uniq > 8 &&
   Math.abs(palette.water.sum - palette.lava.sum) > 4000,
