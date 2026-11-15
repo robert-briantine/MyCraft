@@ -3703,6 +3703,72 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
     return out;
   }
 
+  /**
+   * Le monument le plus proche d'un point, cherché en anneaux de mailles croissants et
+   * abandonné au-delà de `maxRayons` : téléporter le joueur à un kilomètre pour l'asseoir
+   * sous une colonnade ne vaut pas qu'il découvre son monde ailleurs qu'au départ. Une
+   * maille ne paie son plan complet que si le tirage la retient (`computeTemple` écarte
+   * les autres sur un seul hachage), et `cachedStruct` garde le résultat pour
+   * l'estampage des tronçons qui le redemanderont.
+   */
+  function templeLePlusProche(x, z, maxRayons = 6) {
+    const cell = VILLAGE.templeCell;
+    const i0 = Math.floor(x / cell);
+    const j0 = Math.floor(z / cell);
+    for (let r = 0; r <= maxRayons; r++) {
+      let trouve = null;
+      let meilleur = Infinity;
+      const juger = (i, j) => {
+        const t = templeAt(i, j);
+        if (!t) return;
+        const dx = t.ex - x;
+        const dz = t.ez - z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < meilleur) { meilleur = d2; trouve = t; }
+      };
+      if (r === 0) juger(i0, j0);
+      else {
+        for (let d = -r; d <= r; d++) {
+          juger(i0 + d, j0 - r);
+          juger(i0 + d, j0 + r);
+          // Les deux colonnes latérales, coins déduits : déjà comptés par les rangées.
+          if (d > -r && d < r) { juger(i0 - r, j0 + d); juger(i0 + r, j0 + d); }
+        }
+      }
+      // On s'arrête au premier anneau qui en porte un, sans pousser la recherche jusqu'à
+      // la preuve du plus proche : un plan peut loger n'importe où dans sa maille, donc
+      // garantir la distance minimale coûterait le calcul de toutes les mailles voisines,
+      // pour un écart que le joueur ne mesurera pas.
+      if (trouve) return trouve;
+    }
+    return null;
+  }
+
+  /**
+   * Où poser le visiteur qui découvre un monument : une case à l'intérieur de la porte,
+   * debout sur le dallage du naos, le regard tourné vers l'autel. Pas le centre — l'autel
+   * y tient la place — ni le parvis, où il resterait dehors sans lire le sanctuaire.
+   * `y` est le niveau des pieds, comme partout ailleurs dans le jeu ; `yaw` se repose
+   * tel quel en rotation YXZ de la caméra.
+   */
+  function pointDansTemple(t) {
+    const dir = TEMPLE_DIRS[t.door];
+    const axial = VILLAGE.templeCellaHalf - 1;   // juste derrière l'enceinte du naos
+    return {
+      x: t.ex + dir.dx * axial + 0.5,
+      y: t.socle + 1,
+      z: t.ez + dir.dz * axial + 0.5,
+      yaw: Math.atan2(dir.dx, dir.dz),
+      ex: t.ex, ez: t.ez, socle: t.socle, door: t.door,
+    };
+  }
+
+  /** Le perchoir d'apparition d'un monde neuf, ou null si aucun monument n'est à portée. */
+  function apparitionDansTemple(x, z, maxRayons = 6) {
+    const t = templeLePlusProche(x, z, maxRayons);
+    return t ? pointDansTemple(t) : null;
+  }
+
   /** Ouvrages touchant un tronçon — sert à l'estampage comme aux tests. */
   function structuresAt(cx, cz) {
     const key = `${cx},${cz}`;
@@ -4742,6 +4808,7 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
     stampLamps, lampadairesSur, lampesInterieuresSur, appliquesMuralesSur, couloirsSur,
     piecesDImmeubleSur,
     bridgeAt, archAt, templeAt, templesSur, bridgeUnderside, isOccupied, blocksVegetation,
+    templeLePlusProche, pointDansTemple, apparitionDansTemple,
     templeStone, statueStone, statueAt, statuesSur, statueGenantSur, cityInfluence, cityTypeAt, VILLAGE, alpage,
     roadSurface, streetLevel, surfaceAt,
   };

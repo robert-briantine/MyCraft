@@ -73,6 +73,11 @@ export async function waitForBoot(page, timeout = 30000) {
     null,
     { timeout },
   );
+  // L'écran d'accueil endort le bucle d'images — c'est voulu : sous un voile opaque,
+  // rien ne se dessine ni n'avance. Les suites jugent le monde sans souris capturée,
+  // donc sans jamais fermer cet écran : elles le réveillent ici. Celles qui veulent juger
+  // la veille l'éteignent elles-mêmes avec __mc.image(false).
+  await page.evaluate(() => { if (window.__mc.image) window.__mc.image(true); });
 }
 
 // Loads the game and waits until the debug hook is live.

@@ -11,11 +11,13 @@ import {
   reliefOverrides, biomesOverrides, villageOverrides,
 } from './world-config.js';
 import { createMondePreview } from './world-preview.js';
-import { creerEclairage, LAMPE_PORTEE, PLANCHER_NUIT } from './eclairage.js';
+import { creerEclairage, LAMPE_PORTEE, PLANCHER_NUIT, PLANCHER_PIECE, COUVERTE_MINCE, SEUIL_MUR, PORTEE_CIEL } from './eclairage.js';
+import { creerEau, EAU } from './eau.js';
 import {
   etatDuCiel, creerHorloge, heureAffichee, bornerDuree,
   DUREE_JOUR_DEFAUT, DUREE_JOUR_BORNES, HEURE_DEPART,
 } from './ciel.js';
+import { creerMeteo, cielSousPluie, METEO_MODES } from './meteo.js';
 
 // ===================== CONSTANTS =====================
 const CHUNK_SIZE = 16;
@@ -29,8 +31,28 @@ const CHUNK_HEIGHT = 128;
 const GRAVITY = 30;
 const JUMP_SPEED = 10;
 const MOVE_SPEED = 8;
+// Le vol libre n'est plus une touche : il s'est décomposé en deux gestes distincts
+// (voir l'en-tête du contrôleur aérien). `FLY_SPEED` et `FLY` ne survivent que pour le
+// survol de debug que les suites posent sur `player.flyMode`.
 const FLY_SPEED = 20;
 const FLY = false;
+
+// ---- contrôleur aérien ------------------------------------------------------
+// Trois gestes, trois effets, aucune ambiguïté avec la nage (dans l'eau, Espace reste
+// le coup de palme et rien de tout ceci ne s'allume) :
+//  - une pression au sol **saute** ;
+//  - un **maintien** en l'air allume les réacteurs — on monte tant que la touche tient,
+//    on retombe dès qu'on la lâche ;
+//  - une **seconde pression** en l'air ouvre le plané : la trajectoire suit le regard,
+//    Z (ou W) pousse le gaz, S le réduit — le nez décide de l'altitude, l'allure de la
+//    portance. Une nouvelle pression rompt le plané et on redescend.
+const JET_SPEED = 9;            // montée des réacteurs (cubes/s), sans jauge
+const PLANE_MIN = 4;            // allure minimale du planeur
+const PLANE_DEFAUT = 14;        // allure à l'ouverture du plané
+const PLANE_MAX = 34;           // allure maximale au gaz
+const PLANE_THRUST = 16;        // cubes/s gagnés ou perdus par seconde de touche tenue
+const PLANE_LIFT_SPEED = 16;    // au-delà de cette allure, le planeur ne perd plus de hauteur
+const PLANE_SINK_MAX = 7;       // perte d'altitude à l'arrêt complet (cubes/s)
 
 // Player collider: axis aligned box, camera sits at eye level.
 const PLAYER_HALF_WIDTH = 0.3;
@@ -91,6 +113,23 @@ const CHUNK_STREAM_BUDGET = 16;   // cells generated synchronously when the slid
 const WORLD_BOOT_BUDGET = 169;    // 13×13 cells built synchronously under the player
 const CHUNK_FRAME_MS = 10;        // wall-clock ceiling for world building per frame
 const CHUNK_MESH_WATERMARK = 64;  // stop generating when this many chunks await meshing
+// Part du tri offerte à la direction du regard : un tronçon droit devant est compté
+// comme s'il était un peu plus proche. Sans ce biais, le joueur qui vole au planeur
+// creuse son propre trou : mesuré le 2026-11-15 sur trois vols appariés de dix-huit
+// secondes à 34 cubes/s et rayon 8, il manquait un tronçon dans l'axe du regard sur
+// 58 à 100 % des images ; avec 0,3, sur 12 à 37 %, pour 1,7 image/s perdue. Le réglage
+// a été poussé jusqu'à 0,5 — le trou tombe alors sous 8 % des images, mais au prix de
+// 5,5 i/s : trois fois plus cher pour un gain marginal. Ce qui ne se reverra jamais
+// (derrière le joueur) ne mange donc plus le créneau d'image.
+const BIAIS_DEVANT = 0.3;
+// Parois de référence pour juger une première publication (voir `majMurs`) : quatre
+// tampons partagés par tout le monde plutôt qu'un jeu alloué à chaque tronçon maillé.
+const PLAN_VIDE = {
+  w: new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT),
+  e: new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT),
+  n: new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT),
+  s: new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT),
+};
 
 // ---- fiche du monde (écran de génération) ----
 // Le slot se lit dans l'URL : c'est lui qui porte l'identité du monde, donc c'est lui
@@ -145,6 +184,9 @@ function loadSettings() {
     // La durée de la journée se règle comme la profondeur de champ ; à son défaut le
     // monde tourne à la cadence du projet, et un réglage absent du disque n'y change rien.
     dureeJour: bornerDuree(stored.dureeJour ?? DUREE_JOUR_DEFAUT),
+    // La météo se règle comme la durée du jour : « auto » laisse le monde tirer ses
+    // averses, les deux autres positions rendent le joueur maître du ciel.
+    meteo: METEO_MODES.includes(stored.meteo) ? stored.meteo : 'auto',
   };
 }
 
@@ -153,6 +195,7 @@ function saveSettings() {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
       renderDistance: settings.renderDistance,
       dureeJour: settings.dureeJour,
+      meteo: settings.meteo,
     }));
   } catch (e) {
     /* private mode: the setting simply does not survive */
@@ -450,6 +493,32 @@ const village = createVillageGen({
   reglages: villageOverrides(MONDE),
 });
 
+// ---- où naît un monde neuf ----
+// Un monde qui sort du néant s'ouvre sous la colonnade d'un temple : le joueur découvre
+// d'emblée ce que le village sait faire de mieux, et repart de là avec des repères. Un
+// monde repris sur disque garde sa position enregistrée, et son point de re-naissance
+// reste le repli au sec historique — changer cela téléporterait le joueur loin de chez
+// lui à la première chute.
+const APPARITION_TEMPLE_RAYONS = 6;   // ± six mailles de temple autour du repli au sec
+let mondeVierge = false;               // aucun fichier sur le disque pour ce slot
+let apparitionDuMonde = null;          // { x, y(pieds), z, yaw } | null
+let apparitionResolue = false;
+
+/** Le monument d'apparition, cherché une seule fois par session (le plan est coûteux). */
+function resoudreApparition() {
+  if (apparitionResolue) return apparitionDuMonde;
+  apparitionResolue = true;
+  try {
+    apparitionDuMonde = village.apparitionDansTemple(
+      SPAWN_XZ[0], SPAWN_XZ[1], APPARITION_TEMPLE_RAYONS);
+  } catch (e) {
+    // Un monde sans temple reste jouable : le repli au sec fait l'affaire.
+    console.warn('Temple d’apparition introuvable :', e);
+    apparitionDuMonde = null;
+  }
+  return apparitionDuMonde;
+}
+
 // Forêts, plaines et déserts vivent dans leur propre module, pour la même raison que
 // le village : pensés et testés à part du moteur. Le prédicat `isBlocked` reprend la
 // voirie et les emprises bâties — rien ne pousse sur une avenue ni dans un mur, et la
@@ -514,6 +583,15 @@ function tileNameFor(info, kind) {
  * la forme change d'une version de Three à l'autre. Si l'include venait à disparaître,
  * le remplacement ne ferait simplement rien : les lampes cesseraient d'éclairer, ce que
  * le contrôle de pixels de la suite `ciel` voit immédiatement.
+ *
+ * Le halo est **multiplié par le grain de l'atlas** (`mcGrainLampe`) : sans ça, une cave
+ * éclairée perd sa texture. La raison est dans l'ordre des opérations — l'ambiante et le
+ * soleil multiplient `diffuseColor` (donc la carte), alors que le canal, lui, s'ajoute
+ * après tout. Sous un halo assez fort, le pixel devient ce terme additif, plat, et le
+ * dessin de la pierre n'y est plus pour rien. Mesuré dans une galerie scellée à minuit,
+ * mur à deux cubes d'une lanterne : retirer `map` du matériau divisait le grain par dix
+ * sous ambiante seule (1,56 → 0,16) mais seulement par deux sous le halo (0,84 → 0,33) —
+ * preuve que l'image était déjà celle du halo, pas de la roche.
  */
 function brancherCanalLampe(material, uniforme) {
   material.onBeforeCompile = (shader) => {
@@ -523,12 +601,46 @@ function brancherCanalLampe(material, uniforme) {
       .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLampe = aLampe;');
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', '#include <common>\nvarying float vLampe;\nuniform vec3 uLampe;')
+      // Saisi juste après `<map_fragment>`, donc avant `<color_fragment>` : là, `diffuseColor`
+      // ne porte encore que la carte d'atlas, pas la couleur de sommet qui écrase tout sous
+      // terre. Un matériau sans carte y lit simplement son blanc, le halo reste franc.
+      .replace('#include <map_fragment>', '#include <map_fragment>\nvec3 mcGrainLampe = diffuseColor.rgb;')
       .replace('#include <dithering_fragment>',
-        '#include <dithering_fragment>\ngl_FragColor.rgb += uLampe * vLampe;');
+        '#include <dithering_fragment>\ngl_FragColor.rgb += uLampe * vLampe * '
+        + `mix(vec3(1.0), mcGrainLampe / ${CLARTE_ATLAS}, ${GRAIN_LAMPE});`);
   };
   // Deux matériaux qui ne diffèrent que par ce patch doivent quand même deux programmes.
   material.customProgramCacheKey = () => 'lampe';
 }
+
+/**
+ * Teinte du halo jeté par les lanternes et les appliques — blanche, comme un lampadaire
+ * municipal : l'ambre d'une lampe à huile peint la pierre des murs en jaune, ce que le
+ * joueur voit aussitôt à minuit. Le globe reste ambré (c'est l'objet qui brille, pas la
+ * lumière qu'il projette).
+ *
+ * Le gain de 0,74 compense la perte de luminance : le canal est additif donc perçu, et
+ * (0,2126·1 + 0,7152·0,69 + 0,0722·0,4) = 0,735 était la luminance de l'ancien ambre.
+ * Un blanc franc à (1,1,1) éclaircirait le cadre de 14 % — chiffre mesuré sur image,
+ * rendu comparé teinte par teinte autour d'une lanterne isolée à minuit.
+ */
+const TEINTE_LAMPE = 0.74;
+
+/**
+ * Part du détail de l'atlas que le halo transporte, dans `brancherCanalLampe`. À zéro, le
+ * halo est plat — c'est le défaut signalé (« les textures ont disparu dans les caves quand
+ * il y a de la lumière ») : mesuré dans une galerie scellée à minuit, retirer la carte du
+ * matériau ne coûtait qu'un grain de 0,84 → 0,33 sous le halo, contre 1,56 → 0,16 sous une
+ * lumière qui multiplie l'albédo. Le pixel n'était plus à la roche, il était au halo.
+ *
+ * La modulation est **divisée par `CLARTE_ATLAS`**, la luminance moyenne de l'atlas (0,372,
+ * comptée en parcourant son canevas). Sans cette division, multiplier par une carte qui
+ * moyenne à 0,37 éteindrait les lampes des deux tiers — mesuré 50,7 → 29,1 de luminance
+ * dans la même galerie. Normalisée, elle rend le grain (0,84 → 2,00, la référence de jour
+ * étant 1,56) pour 9 % de lumière seulement (50,7 → 46,2), et 0 % de pixel écrêté.
+ */
+const GRAIN_LAMPE = 0.7;
+const CLARTE_ATLAS = 0.372;
 
 class World {
   constructor(scene) {
@@ -540,8 +652,28 @@ class World {
     this._lampIndex = null;          // lanternes posées par le joueur, voir lampesAutour
     this.pendingChunks = 0;          // in-range cells still waiting to be generated
     this.dirtyKeys = new Set();      // chunks awaiting a (re)mesh
-    this._offsetRadius = null;       // cached nearest-first offset table, keyed by radius
+    this._offsetCle = null;          // cached nearest-first offset table, keyed by radius+heading
     this._offsets = [];
+    this._centre = null;             // chunk du joueur, pour trier à partir de lui
+    this._dir = { x: 0, z: 0 };      // direction du regard, pour servir l'avant en premier
+
+    // ---- eau courante -------------------------------------------------------
+    // Le monde ne stocke que le diff du joueur ; l'eau de passage y a donc sa propre
+    // table de distances. Une cellule d'eau absente de cette table est une **source**
+    // (mer, rivière, seau posé) : pérenne, cube plein, distance 0. Toute cellule d'eau,
+    // source ou de passage, occupe le cube entier.
+    this.eauNiveaux = new Map();     // key: "x,y,z" -> distance à la source (1..EAU.PORTEE)
+    this._enEau = false;             // garde : l'automate ne doit pas se réveiller lui-même
+    this.eau = creerEau({
+      height: CHUNK_HEIGHT,
+      ID_AIR: BLOCK.AIR,
+      ID_EAU: BLOCK.WATER,
+      bloc: (x, y, z) => this.getBlock(x, y, z),
+      niveau: (x, y, z) => this.eauNiveaux.get(`${x},${y},${z}`) ?? null,
+      solide: (x, y, z) => this.isSolid(x, y, z),
+      charge: (x, z) => this.chunks.has(this.getChunkKey(Math.floor(x / CHUNK_SIZE), Math.floor(z / CHUNK_SIZE))),
+      ecrire: (cells) => this._ecrireEau(cells),
+    });
 
     this.matOpaque = new THREE.MeshLambertMaterial({
       map: atlas.texture,
@@ -570,7 +702,7 @@ class World {
     // multipliée par cet albédo n'éclairerait jamais une galerie noire. Un attribut
     // propre au maillage (`aLampe`) et un uniforme partagé entre les deux matériaux
     // éclairés font le travail — éteindre les lampes de ville ne coûte qu'une valeur.
-    this.uniformeLampe = { value: new THREE.Color(0xffb066) };
+    this.uniformeLampe = { value: new THREE.Color().setRGB(TEINTE_LAMPE, TEINTE_LAMPE, TEINTE_LAMPE) };
     brancherCanalLampe(this.matOpaque, this.uniformeLampe);
     brancherCanalLampe(this.matTrans, this.uniformeLampe);
   }
@@ -607,15 +739,31 @@ class World {
 
   // One remesh per touched chunk instead of one per block: a cuboid fill writes
   // thousands of cells and must not pay for thousands of chunk rebuilds.
-  setBlocksBulk(cells) {
+  //
+  // `options.differe` hands the remesh to the streaming queue instead of paying for it on
+  // this frame — what the fluid uses, so a flood creeping over nine chunks cannot stutter.
+  // `options.fluide` set to false skips the wake-up call (the fluid's own writes must not
+  // re-arm themselves).
+  setBlocksBulk(cells, options = {}) {
+    const differe = !!options.differe;
+    const duJoueur = options.fluide !== false;
     const touched = new Set();
     for (const [x, y, z, blockId] of cells) {
-      const etaitLampe = estLanterne(this.getBlock(x, y, z));
+      const avant = this.getBlock(x, y, z);
+      const etaitLampe = estLanterne(avant);
       // Une applique posée par le joueur s'oriente toute seule : on choisit la face dont
       // le mur est plein derrière elle, faute de quoi elle flotterait adossée au vide.
       const id = APPLIQUES.includes(blockId) ? this.appliqueOriente(x, y, z, blockId) : blockId;
       this.modifiedBlocks.set(`${x},${y},${z}`, id);
+      // Une édition du joueur efface la distance enregistrée : l'eau qu'elle pose est une
+      // source, pas un filet en sursis, et rien ne doit rester d'un filet là où le joueur
+      // vient de couler du béton. L'automate, lui, écrit ses propres distances (garde
+      // `_enEau`) et n'est donc pas concerné par cette tonte.
+      if (duJoueur) this.eauNiveaux.delete(`${x},${y},${z}`);
       this._touchedChunks(x, y, z, touched);
+      const pleinAvant = avant !== BLOCK.AIR && !!BLOCK_INFO[avant]?.opaque;
+      const pleinApres = id !== BLOCK.AIR && !!BLOCK_INFO[id]?.opaque;
+      if (pleinAvant !== pleinApres) this._touchLumiere(x, z, touched);
       // Poser ou arracher une lanterne change l'éclairage des tronçons d'à côté, pas
       // seulement de celui qui la porte : son halo porte à neuf cubes, et un tronçon
       // voisin maillé avant resterait clair là où le nouveau-né éteint tout — ou
@@ -630,12 +778,42 @@ class World {
     this._overrideIndex = null;
     this._lampIndex = null;          // voir lampesAutour : même cycle de vie que l'index
 
+    // Toute édition réveille le fluide autour d'elle : percer le sable d'une plage est
+    // exactement la cellule qu'il faut noyer, et boucher une source est ce qui doit tarir
+    // la nappe en aval. L'eau générée avec le relief, elle, ne passe jamais par ici —
+    // c'est voulu, elle est déjà à l'équilibre.
+    if (options.fluide !== false && !this._enEau) {
+      for (const [x, y, z] of cells) this.eau.reveiller(x, y, z);
+    }
+
     for (const key of touched) {
       const comma = key.indexOf(',');
-      this.rebuildChunk(+key.slice(0, comma), +key.slice(comma + 1));
+      const cx = +key.slice(0, comma);
+      const cz = +key.slice(comma + 1);
+      if (differe) this.markChunkDirty(cx, cz);
+      else this.rebuildChunk(cx, cz);
     }
     if (touched.size > 0 && this.onEdit) this.onEdit();
     return touched.size;
+  }
+
+  /**
+   * Écriture groupée d'une vague d'eau. Les distances sont posées **avant** les blocs : le
+   * mailleur lit la table des niveaux pour choisir l'épaisseur de chaque filet, et mailler
+   * un cube plein que la distance vient rattraper une image plus tard se verrait à l'écran.
+   */
+  _ecrireEau(cells) {
+    for (const [x, y, z, id, niv] of cells) {
+      const k = `${x},${y},${z}`;
+      if (id === BLOCK.WATER && niv != null) this.eauNiveaux.set(k, niv);
+      else this.eauNiveaux.delete(k);
+    }
+    this._enEau = true;
+    try {
+      this.setBlocksBulk(cells, { differe: true, fluide: false });
+    } finally {
+      this._enEau = false;
+    }
   }
 
   // The chunk owning the column, plus any neighbour whose mesher reads across the
@@ -651,16 +829,132 @@ class World {
     if (lx === CHUNK_SIZE - 1) into.add(this.getChunkKey(cx + 1, cz));
     if (lz === 0) into.add(this.getChunkKey(cx, cz - 1));
     if (lz === CHUNK_SIZE - 1) into.add(this.getChunkKey(cx, cz + 1));
+    // Le coin partagé par quatre tronçons : la face verticale du voisin diagonal lit
+    // les deux voisins orthogonaux pour son occlusion ambiante.
+    if (lx === 0 && lz === 0) into.add(this.getChunkKey(cx - 1, cz - 1));
+    if (lx === 0 && lz === CHUNK_SIZE - 1) into.add(this.getChunkKey(cx - 1, cz + 1));
+    if (lx === CHUNK_SIZE - 1 && lz === 0) into.add(this.getChunkKey(cx + 1, cz - 1));
+    if (lx === CHUNK_SIZE - 1 && lz === CHUNK_SIZE - 1) into.add(this.getChunkKey(cx + 1, cz + 1));
+  }
+
+  // Un cube cassé ou posé change l'éclairage bien au-delà de sa colonne : le BFS du
+  // ciel ne meurt qu'après `PORTEE_CIEL` cubes à plat. Tout tronçon touchant cette
+  // portée a donc quelque chose à relire chez nous — on le met en file plutôt qu'on ne
+  // le maille ici, pour qu'un pavé de mille cubes ne paie pas mille remaillages.
+  _touchLumiere(x, z, horsFile) {
+    const cx = Math.floor(x / CHUNK_SIZE);
+    const cz = Math.floor(z / CHUNK_SIZE);
+    const lx = x - cx * CHUNK_SIZE;
+    const lz = z - cz * CHUNK_SIZE;
+    const files = [];
+    if (lx < PORTEE_CIEL) files.push([cx - 1, cz]);
+    if (lx >= CHUNK_SIZE - PORTEE_CIEL) files.push([cx + 1, cz]);
+    if (lz < PORTEE_CIEL) files.push([cx, cz - 1]);
+    if (lz >= CHUNK_SIZE - PORTEE_CIEL) files.push([cx, cz + 1]);
+    for (const [fx, fz] of files) {
+      const cle = this.getChunkKey(fx, fz);
+      if (horsFile?.has(cle)) continue;      // déjà reconstruit synchronement
+      this.markChunkDirty(fx, fz);
+    }
+  }
+
+  /**
+   * Luminance déjà calculée des quatre tronçons attenants, lue sur la paroi partagée et
+   * rendue dans le repère du tronçon qu'on va mailler. Un tronçon hors du flot répond
+   * null : la frontière reste close, comme avant ce correctif.
+   */
+  mursSemences(cx, cz) {
+    const plan = (dx, dz, cote) => this.chunks.get(this.getChunkKey(cx + dx, cz + dz))?.murs?.[cote] ?? null;
+    const ouest = plan(-1, 0, 'e'), est = plan(1, 0, 'w');
+    const nord = plan(0, -1, 's'), sud = plan(0, 1, 'n');
+    if (!ouest && !est && !nord && !sud) return null;
+    return { ouest, est, nord, sud };
+  }
+
+  /**
+   * Garde les quatre parois du champ de lumière d'un tronçon et prévient les voisins
+   * dont la paroi vient de bouger : sans cet aller-retour, celui qui a maillé en premier
+   * gardait la luminance que son voisin avait avant l'édit, et le jour ne traversait
+   * jamais la frontière. La garde `SEUIL_MUR` borne la conversation — une paroi ne se
+   * rejuge que si elle a réellement changé.
+   */
+  majMurs(cx, cz, niveau) {
+    const chunk = this.chunks.get(this.getChunkKey(cx, cz));
+    if (!chunk) return;
+    const cells = CHUNK_SIZE * CHUNK_SIZE;
+    const mur = (indexeur) => {
+      const p = new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT);
+      // `u + y * CHUNK_SIZE` et non `y + u * CHUNK_SIZE` : `y` court jusqu'à
+      // CHUNK_HEIGHT pour un pas de CHUNK_SIZE, donc l'autre ordre fait déborder chaque
+      // colonne sur la suivante et une paroi ne garde que ses dernières hauteurs.
+      for (let u = 0; u < CHUNK_SIZE; u++) {
+        for (let y = 0; y < CHUNK_HEIGHT; y++) p[u + y * CHUNK_SIZE] = niveau[indexeur(u, y)];
+      }
+      return p;
+    };
+    const avant = chunk.murs;
+    // À la première publication, personne n'a encore rien lu de nous : on juge donc
+    // contre le néant. Rendre la main sans prévenir laissait le premier maillage —
+    // calculé sans les voisins — être lu par eux jusqu'à la fin de la session : mesuré
+    // le 2026-11-14, les neuf tronçons d'un quartier n'étaient maillés qu'une fois et
+    // une poche scellée gardait 26,6 de bande haute au lieu de 3,6.
+    const reference = avant || PLAN_VIDE;
+    const murs = {
+      w: mur((u, y) => u * CHUNK_SIZE + y * cells),                    // lx = 0
+      e: mur((u, y) => (CHUNK_SIZE - 1) + u * CHUNK_SIZE + y * cells), // lx = dernier
+      n: mur((u, y) => u + y * cells),                                  // lz = 0
+      s: mur((u, y) => u + (CHUNK_SIZE - 1) * CHUNK_SIZE + y * cells), // lz = dernier
+    };
+    chunk.murs = murs;
+    const ecart = (a, b) => {
+      let m = 0;
+      for (let i = 0; i < a.length; i++) {
+        const d = a[i] > b[i] ? a[i] - b[i] : b[i] - a[i];
+        if (d > m) m = d;
+      }
+      return m;
+    };
+    // Un voisin qui n'a jamais été maillé recalculera de toute façon : pas la peine de
+    // le remettre en file, ce qui doublerait le travail du premier passage du flot.
+    const dejaMaille = (fx, fz) => {
+      const c = this.chunks.get(this.getChunkKey(fx, fz));
+      return !!c && c.meshes.length > 0;
+    };
+    const prevenir = (deltaX, deltaZ, cote) => {
+      if (ecart(murs[cote], reference[cote]) <= SEUIL_MUR) return;
+      if (!avant && !dejaMaille(cx + deltaX, cz + deltaZ)) return;
+      this.markChunkDirty(cx + deltaX, cz + deltaZ);
+    };
+    prevenir(-1, 0, 'w');
+    prevenir(1, 0, 'e');
+    prevenir(0, -1, 'n');
+    prevenir(0, 1, 's');
   }
 
   // Replays a save read from disk. It deliberately does not fire onEdit — putting
   // the stored diff back is not a player edit — and queues the remesh instead of
   // rebuilding in place, so a save holding tens of thousands of cubes still costs
   // nothing on the loading frame.
-  applyEdits(edits) {
+  //
+  // `flux` remet les distances de l'eau de passage. Le monde recharge **à l'arrêt** : une
+  // inondation interrompue par la fermeture de l'onglet ne reprend pas toute seule, elle
+  // attend la prochaine édition du joueur, comme la mer générée attend qu'on la perce.
+  applyEdits(edits, flux = null) {
     this.modifiedBlocks = new Map(edits);
+    // Une distance ne survit qu'aussi longtemps que la cellule d'eau qui la porte : un
+    // fichier bricolé (ou repris après une édition manuelle) ne doit pas laisser traîner
+    // de niveau sur un bloc qui n'est plus de l'eau.
+    const niveaux = new Map();
+    if (flux) {
+      const eau = BLOCK.WATER;
+      for (const [cle, niv] of flux) {
+        if (this.modifiedBlocks.get(cle) === eau) niveaux.set(cle, niv);
+      }
+    }
+    this.eauNiveaux = niveaux;
     this._overrideIndex = null;
     this._lampIndex = null;          // voir lampesAutour : même cycle de vie que l'index
+    this.eau.reinitialiser();
     const touched = new Set();
     for (const key of this.modifiedBlocks.keys()) {
       const first = key.indexOf(',');
@@ -681,8 +975,10 @@ class World {
   // "Nouveau monde": drops every player edit and re-queues the visible meshes.
   clearEdits() {
     this.modifiedBlocks = new Map();
+    this.eauNiveaux = new Map();     // l'eau de passage fait partie du diff du joueur
     this._overrideIndex = null;
     this._lampIndex = null;          // voir lampesAutour : même cycle de vie que l'index
+    this.eau.reinitialiser();
     for (const key of this.chunks.keys()) this.dirtyKeys.add(key);
   }
 
@@ -713,6 +1009,16 @@ class World {
     }
     this._overrideIndex = index;
     return index;
+  }
+
+  /**
+   * Le corps flotte-t-il dans cette cellule ? Toute cellule d'eau compte : l'automate ne
+   * rend plus que des cubes pleins, il n'existe pas de pellicule qui mouillerait le sol
+   * sans porter un joueur.
+   */
+  estNageable(x, y, z) {
+    if (y < 0 || y >= CHUNK_HEIGHT) return false;
+    return this.getBlock(x, y, z) === BLOCK.WATER;
   }
 
   isSolid(x, y, z) {
@@ -841,7 +1147,9 @@ class World {
     // colonne. Avant elle, ils se feraient raser par le garde-tête d'une avenue.
     village.stampLamps(data, cx, cz);
 
-    this.chunks.set(key, { data, meshes: [], cx, cz });
+    // `murs` garde la luminance calculée sur les quatre parois du tronçon : c'est ce que
+    // les voisins viennent lire quand ils se maillent (voir `mursSemences`).
+    this.chunks.set(key, { data, meshes: [], cx, cz, murs: null });
     return this.chunks.get(key);
   }
 
@@ -964,6 +1272,19 @@ class World {
       const b = blockAt(wx, wy, wz);
       return b !== BLOCK.AIR && !!BLOCK_INFO[b].opaque;
     };
+    // Un tronçon pas encore généré n'est pas du vide : vu d'ici, il est plein. Le champ
+    // de lumière doit donc lire « opaque » là où il n'a rien à lire — sinon un tronçon
+    // maillé avant ses voisins reçoit le plein jour par des murs qui n'existent pas
+    // encore. Mesuré le 2026-11-14, la luminance cuite à six cubes sous la surface
+    // valait 0,495 contre 0,037 une fois le voisinage généré : le joueur voyait la
+    // couleur des blocs se corriger toute seule en s'approchant. La géométrie, elle,
+    // garde `opaqueAt` — dessiner une face vers un voisin absent ne gêne personne.
+    const opaquePourLeCiel = (wx, wy, wz) => {
+      if (opaqueAt(wx, wy, wz)) return true;
+      const lx = wx - baseX, lz = wz - baseZ;
+      if (lx >= 0 && lx < CHUNK_SIZE && lz >= 0 && lz < CHUNK_SIZE) return false;
+      return !this.chunks.has(this.getChunkKey(Math.floor(wx / CHUNK_SIZE), Math.floor(wz / CHUNK_SIZE)));
+    };
 
     const buckets = {
       opaque: { positions: [], normals: [], uvs: [], colors: [], lumieres: [], indices: [], count: 0 },
@@ -1002,7 +1323,7 @@ class World {
     }
     const ecl = creerEclairage({
       CHUNK_SIZE, CHUNK_HEIGHT,
-      opaqueAt,
+      opaqueAt: opaquePourLeCiel,
       rocheAt: (wx, wy, wz) => ROCHE_NATURELLE.has(blockAt(wx, wy, wz)),
       estLampe: estLanterne,
       estBati: (wx, wy, wz) => {
@@ -1011,13 +1332,26 @@ class World {
         return tenuBati[lx + lz * CHUNK_SIZE + wy * CHUNK_SIZE * CHUNK_SIZE] === 1;
       },
     });
-    const cielDuTroncon = ecl.champCiel(baseX, baseZ);
-    const halo = ecl.champLampes(this.lampesAutour(cx, cz), baseX, baseZ);
+    // Le champ de lumière vient aussi des tronçons attenants : sans ces graines, une
+    // pièce assise de part et d'autre d'une frontière restait noire du côté où le jour
+    // entrait pourtant chez le voisin (mesuré 0,35 à gauche, 0,035 à droite).
+    const graines = this.mursSemences(cx, cz);
+    const cielDuTroncon = ecl.champCiel(baseX, baseZ, graines);
+    this.majMurs(cx, cz, cielDuTroncon.niveau);
+    const lampes = this.lampesAutour(cx, cz);
+    const halo = ecl.champLampes(lampes, baseX, baseZ);
     const haloEn = (wx, wy, wz) => {
-      const lx = wx - baseX, lz = wz - baseZ;
-      if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) return 0;
       if (wy < 0 || wy >= CHUNK_HEIGHT) return 0;
-      return halo[lx + lz * CHUNK_SIZE + wy * CHUNK_SIZE * CHUNK_SIZE];
+      const lx = wx - baseX, lz = wz - baseZ;
+      if (lx >= 0 && lx < CHUNK_SIZE && lz >= 0 && lz < CHUNK_SIZE) {
+        return halo[lx + lz * CHUNK_SIZE + wy * CHUNK_SIZE * CHUNK_SIZE];
+      }
+      // La face est donnée au tronçon voisin : sa cellule adjacente vit chez lui et n'est
+      // pas dans ce champ. Y lire zéro barrait la cave d'une bande noire tous les
+      // CHUNK_SIZE cubes — mesuré le 2026-11-15, les deux faces d'un même pilier sous une
+      // applique valaient 0,24 et 0. Jugé sur place plutôt que lu chez le voisin : aucun
+      // ordre de maillage ne peut donc laisser la bande en place.
+      return ecl.puissanceLampe(lampes, wx, wy, wz);
     };
 
     // Classic voxel AO: the two side neighbours and the diagonal one sitting on
@@ -1128,53 +1462,110 @@ class World {
     }
   }
 
-  // Nearest-first cell order for a radius, rebuilt only when the radius changes:
-  // at 32 chunks that is 4356 entries, far too many to sort every frame.
-  offsetsFor(radius) {
-    if (this._offsetRadius !== radius) {
+  /**
+   * Ordre de visite des cellules d'un rayon, reconstruit seulement quand le rayon ou
+   * la direction du regard change : à 32 chunks cela fait 4356 entrées, bien trop pour
+   * un tri par image. La direction est quantifiée en 32 caps pour la même raison — sans
+   * quoi la moindre rotation de souris jetterait la table.
+   *
+   * Le rang n'est pas la distance seule : un tronçon droit devant est compté comme
+   * deux fois plus proche (`BIAIS_DEVANT`). Ce que le joueur ne verra plus jamais passe
+   * en dernier, ce qui rend le créneau d'image disponible pour ce qu'il regarde.
+   */
+  offsetsFor(radius, dirX = 0, dirZ = 0) {
+    const norm = Math.hypot(dirX, dirZ);
+    const ax = norm > 1e-4 ? dirX / norm : 0;
+    const az = norm > 1e-4 ? dirZ / norm : 0;
+    const cap = norm > 1e-4 ? Math.round((Math.atan2(az, ax) + Math.PI) * 32 / Math.PI) : -1;
+    const cle = `${radius}|${cap}`;
+    if (this._offsetCle !== cle) {
       const offsets = [];
       for (let dx = -radius; dx <= radius; dx++) {
         for (let dz = -radius; dz <= radius; dz++) {
-          offsets.push([dx, dz, dx * dx + dz * dz]);
+          const d = Math.sqrt(dx * dx + dz * dz);
+          const cos = d > 0 ? (dx * ax + dz * az) / d : 1;
+          offsets.push([dx, dz, d * (1 - BIAIS_DEVANT * cos)]);
         }
       }
       offsets.sort((a, b) => a[2] - b[2]);
       this._offsets = offsets;
-      this._offsetRadius = radius;
+      this._offsetCle = cle;
     }
     return this._offsets;
   }
 
-  // Generates at most `maxCells` missing cells, and gives up after `maxMs` of wall
-  // clock, so a large view depth streams in over frames instead of freezing the tab.
-  // A chunk is meshed only once its four neighbours exist: building it earlier would
-  // re-mesh it every time a new neighbour shows up, which doubles the total cost.
-  updateChunks(playerX, playerZ, maxCells = Infinity, maxMs = Infinity) {
+  /**
+   * Maille la file prête en commençant par ce que le joueur regarde, et rend le temps
+   * qu'il y a passé — sans ce relevé, les deux passes du flot cumuleraient leurs
+   * tranches et le budget d'image serait dépassé de 45 % (mesuré 14,5 ms pour 10
+   * demandés, 56,7 i/s tombées à 43,3).
+   *
+   * Le contrôle d'horloge se fait **avant** l'appel coûteux : à ~4,5 ms le maillage,
+   * contrôler après coup laissait chaque image déborder d'un tronçon entier.
+   */
+  drainerMailles(dureeAccordee) {
+    const entree = performance.now();
+    if (this.dirtyKeys.size === 0 || dureeAccordee <= 0) return 0;
+    const echeance = entree + dureeAccordee;
+    const c = this._centre;
+    const files = [];
+    for (const key of this.dirtyKeys) {
+      if (!this.chunks.has(key)) { this.dirtyKeys.delete(key); continue; }
+      const virgule = key.indexOf(',');
+      const cx = +key.slice(0, virgule);
+      const cz = +key.slice(virgule + 1);
+      let rang = 0;
+      if (c && (this._dir.x !== 0 || this._dir.z !== 0)) {
+        const dx = cx - c.pcx, dz = cz - c.pcz;
+        const d = Math.hypot(dx, dz);
+        const cos = d > 0 ? (dx * this._dir.x + dz * this._dir.z) / d : 1;
+        rang = d * (1 - BIAIS_DEVANT * cos);
+      } else if (c) {
+        rang = Math.hypot(cx - c.pcx, cz - c.pcz);
+      }
+      files.push([rang, cx, cz]);
+    }
+    files.sort((a, b) => a[0] - b[0]);
+    for (const [, cx, cz] of files) {
+      if (performance.now() > echeance) return performance.now() - entree;
+      if (!this.chunks.has(this.getChunkKey(cx, cz))) continue;
+      this.rebuildChunk(cx, cz);
+    }
+    return performance.now() - entree;
+  }
+
+  // Génère au plus `maxCells` cellules manquantes et s'arrête après `maxMs` d'horloge
+  // murale : une grande profondeur de champ se décharge ainsi sur plusieurs images
+  // plutôt que de geler l'onglet. `dirX`/`dirZ` portent le regard du joueur — voir
+  // `offsetsFor`, qui donne l'ordre de visite.
+  updateChunks(playerX, playerZ, maxCells = Infinity, maxMs = Infinity, dirX = 0, dirZ = 0) {
     const started = performance.now();
     const pcx = Math.floor(playerX / CHUNK_SIZE);
     const pcz = Math.floor(playerZ / CHUNK_SIZE);
     const radius = settings.renderDistance;
-    const offsets = this.offsetsFor(radius);
+    this._centre = { pcx, pcz, radius };
+    const norm = Math.hypot(dirX, dirZ);
+    this._dir.x = norm > 1e-4 ? dirX / norm : 0;
+    this._dir.z = norm > 1e-4 ? dirZ / norm : 0;
+    const offsets = this.offsetsFor(radius, dirX, dirZ);
 
-    // Meshing costs about twice what generating costs (each new chunk dirties its
-    // neighbours too), so the two phases get separate slices of the frame budget and
-    // the mesher goes first. The watermark is what keeps the two in step: generation
-    // pauses while a backlog exists instead of outrunning the mesher forever.
-    const meshDeadline = started + maxMs * 0.5;
-    const genDeadline = started + maxMs;
+    // Le maillage coûte environ trois fois ce que coûte la génération : il lui revient
+    // donc une tranche du budget d'image, et cette tranche est **partagée** entre les
+    // deux passes — sinon chacune consomme sa moitié et l'image déborde. Chaque passe
+    // doit aussi rester sous la fin du budget global : sans cela, une première passe
+    // économe autorisait la seconde à dépasser l'enveloppe (mesuré 11,1 ms pour 10).
+    const finBudget = started + maxMs;
+    const partMaille = maxMs * 0.6;
+    let tempsMaille = 0;
+    const tranche = () => Math.min(partMaille - tempsMaille, finBudget - performance.now());
 
-    for (const key of this.dirtyKeys) {
-      if (!this.chunks.has(key)) { this.dirtyKeys.delete(key); continue; }
-      const [cx, cz] = key.split(',').map(Number);
-      this.rebuildChunk(cx, cz);
-      if (performance.now() > meshDeadline) break;
-    }
+    tempsMaille += this.drainerMailles(tranche());
 
     let made = 0;
     let pending = 0;
-    // The scan always covers every cell in range so pendingChunks means "work left",
-    // not "work left that we happened to look at"; only the generation itself is
-    // limited by the watermark and the clock.
+    // Le balayage couvre toujours TOUTES les cellules du rayon, sinon `pendingChunks`
+    // voudrait dire « ce que nous avons eu le temps de regarder » et non « ce qui reste
+    // à faire » ; seule la génération elle-même est bornée par les seuils et l'horloge.
     for (const [dx, dz] of offsets) {
       const cx = pcx + dx;
       const cz = pcz + dz;
@@ -1183,9 +1574,14 @@ class World {
       pending++;
       if (made >= maxCells) continue;
       if (this.dirtyKeys.size > CHUNK_MESH_WATERMARK) continue;
-      if ((made & 3) === 3 && performance.now() > genDeadline) continue;
+      if (performance.now() > finBudget) continue;
       made++; // failures consume budget too, so a bad cell cannot spin forever
       if (this.generateChunkData(cx, cz)) {
+        // Le tronçon né et ses quatre voisins : chacun doit redessiner la frontière que
+        // cette naissance vient de changer. Différer le maillage « jusqu'aux voisins » a
+        // été mesuré le 2026-11-15 : cela doublait les repeintures (618 → 1278 sur un
+        // vol de dix-huit secondes) sans jamais en supprimer une seule — deux tronçons
+        // adjacents ne peuvent pas se mailler après l'autre.
         this.markChunkDirty(cx, cz);
         this.markChunkDirty(cx - 1, cz);
         this.markChunkDirty(cx + 1, cz);
@@ -1193,6 +1589,8 @@ class World {
         this.markChunkDirty(cx, cz + 1);
       }
     }
+
+    tempsMaille += this.drainerMailles(tranche());
 
     // Remove far chunks
     for (const [key, chunk] of this.chunks) {
@@ -1255,6 +1653,12 @@ class Player {
     // par le joueur plutôt que par une constante : on garde son assiette tant qu'on nage.
     this.assiette = FLOAT_SUBMERGED;
     this.flyMode = FLY;
+    // ---- contrôleur aérien (voir les constantes en tête de module) ----
+    this.planant = false;       // le second appui d'Espace a ouvert le plané
+    this.reacteurs = false;     // Espace tenu en l'air : les réacteurs tiennent la montée
+    this.vitesseVol = PLANE_DEFAUT;   // allure du planeur, dosée par Z et S
+    this.espaceTenu = false;    // état de la touche à l'image précédente (détection d'appui)
+    this.attendRelache = false; // l'appui qui a ouvert/rompu le plané ne doit pas allumer les réacteurs
     this.spawnPoint = new THREE.Vector3(8, 0, 8);
     // Placement only: the saved position now arrives asynchronously from disk and
     // bootWorld() owns the chunk building, so the constructor must not stream.
@@ -1305,6 +1709,12 @@ class Player {
   // Push the collider out of terrain it spawned inside of.
   settle() {
     const p = this.camera.position;
+    // Un corps qu'on ressort d'un bloc ne doit pas en repartir en plané. La mémoire de
+    // l'appui d'Espace, elle, se garde : `settle` tourne dès que le collider frotte une
+    // paroi — un nageur qui remonte une berge y passe une dizaine de fois par seconde, et
+    // effacer cette mémoire lui rendait les réacteurs en pleine longueur de nage.
+    this.planant = false;
+    this.reacteurs = false;
     let feet = this.feetY;
     if (!this.collides(p.x, feet, p.z)) {
       this.velocity.y = 0;
@@ -1327,18 +1737,51 @@ class Player {
     return [SPAWN_XZ[0], SPAWN_XZ[1]];
   }
 
+  /**
+   * Le point où le joueur est posé quand on le remet à l'apparition. Sur un monde neuf,
+   * c'est l'intérieur du temple le plus proche ; `getTerrainHeight` n'a rien à dire de
+   * cet endroit — le sol y est une dalle estampée, plusieurs cubes au-dessus du relief.
+   * Renvoie le niveau des pieds, comme le reste du module.
+   */
+  _spawnPoint() {
+    if (mondeVierge) {
+      const t = resoudreApparition();
+      if (t) return t;
+    }
+    const [sx, sz] = this._spawnXZ();
+    return { x: sx, y: getTerrainHeight(sx, sz) + 1, z: sz };
+  }
+
   // Drops the player on the surface at the spawn point without touching the world.
   placeAtSpawn() {
-    const [sx, sz] = this._spawnXZ();
-    this.setEye(sx, getTerrainHeight(sx, sz) + 1, sz);
+    const p = this._spawnPoint();
+    this.setEye(p.x, p.y, p.z);
+    if (Number.isFinite(p.yaw)) {
+      // Le visiteur se réveille face à l'autel, pas dos à lui.
+      this.camera.rotation.order = 'YXZ';
+      this.camera.rotation.set(0, p.yaw, 0, 'YXZ');
+    }
     this.velocity.set(0, 0, 0);
     this.onGround = false;
+    this.coupeLeVol();
+  }
+
+  /** Un déplacement brutal rend réacteurs et plané sans objet : on oublie tout. */
+  coupeLeVol() {
+    this.planant = false;
+    this.reacteurs = false;
+    this.attendRelache = false;
+    this.vitesseVol = PLANE_DEFAUT;
+    // Une touche encore tenue ne doit pas compter comme un appui neuf à la reprise.
+    // (Le dictionnaire de touches est branché sur les contrôles après le joueur : d'où
+    // la lecture prudente, sinon la page meurt au démarrage.)
+    this.espaceTenu = !!this.controls?.keys?.Space;
   }
 
   _teleportToSpawn() {
-    const [sx, sz] = this._spawnXZ();
+    const p = this._spawnPoint();
     // chunks around the spawn may have been unloaded while the player was away
-    this.world.updateChunks(sx, sz, WORLD_BOOT_BUDGET);
+    this.world.updateChunks(p.x, p.z, WORLD_BOOT_BUDGET);
     this.placeAtSpawn();
   }
 
@@ -1376,14 +1819,16 @@ class Player {
    * `surface` est la première colonne non liquide au-dessus du joueur, autrement dit
    * le plan d'eau vers lequel la flottaison le ramène. Seule l'eau compte : la lave
    * aussi est `liquid`, mais y flotter tiendrait le joueur suspendu au-dessus d'un
-   * bain de lave au lieu de le laisser s'y enfoncer lentement.
+   * bain de lave au lieu de le laisser s'y enfoncer lentement. Toute cellule d'eau porte
+   * un corps (`estNageable`) : l'automate ne rend que des cubes pleins, on nage donc
+   * aussi bien dans une flaque de sept cubes de long que dans l'océan.
    */
   waterState() {
     const p = this.camera.position;
     const feet = this.feetY;
     const bx = Math.floor(p.x);
     const bz = Math.floor(p.z);
-    const eau = (y) => this.world.getBlock(bx, y, bz) === BLOCK.WATER;
+    const eau = (y) => this.world.estNageable(bx, y, bz);
     const pieds = eau(Math.floor(feet + 0.2));
     const poitrine = eau(Math.floor(feet + 0.9));
     const tete = eau(Math.floor(feet + PLAYER_HEIGHT - 0.2));
@@ -1450,6 +1895,9 @@ class Player {
     // Movement input relative to where the camera looks (flattened on XZ).
     const direction = new THREE.Vector3();
     this.controls.getDirection(direction);
+    // L'aplatissement ne vaut que pour la marche : le planeur, lui, suit le regard à
+    // trois dimensions, donc l'inclinaison de la caméra est ce qui monte et descend.
+    const regard = direction.clone();
     direction.y = 0;
     if (direction.lengthSq() > 0) direction.normalize();
 
@@ -1467,31 +1915,81 @@ class Player {
     this.nage = eau.nage;
     this.sousLEau = eau.tete;
 
-    const speed = this.flyMode ? FLY_SPEED : (eau.nage ? SWIM_SPEED : MOVE_SPEED);
-    this.velocity.x = moveInput.x * speed;
-    this.velocity.z = moveInput.z * speed;
-
-    if (!this.flyMode) {
+    // ---- les trois gestes d'Espace ----------------------------------------
+    // Un appui se reconnaît au passage faux→vrai entre deux images : sans cette
+    // distinction, maintenir la touche ouvrirait le plané sitôt les réacteurs éteints.
+    const tenu = !!this.controls.keys['Space'] && !this.flyMode;
+    const appuie = tenu && !this.espaceTenu;
+    this.espaceTenu = tenu;
+    if (!tenu) this.attendRelache = false;
+    if (eau.nage) this.planant = false;   // sous l'eau, Espace reste le coup de palme
+    let venaitDeSauter = false;
+    if (appuie && !this.flyMode) {
       if (eau.nage) {
-        this.applyWater(deltaTime, eau);
+        // L'appui appartient au coup de palme. Sans ce garde, le corps qui franchit la
+        // ligne d'eau touche tenue s'allumait en réacteurs : la sortie de rivière
+        // devenait un décollage et plus personne ne se hissait sur la berge.
+        this.attendRelache = true;
+      } else if (this.onGround) {
+        this.velocity.y = JUMP_SPEED;     // une pression saute
+        this.onGround = false;
+        venaitDeSauter = true;            // cette image garde l'élan du saut
+      } else if (this.planant) {
+        this.planant = false;             // en vol, la même pression rompt le plané
+        this.attendRelache = true;        // et ne doit pas rallumer les réacteurs
       } else {
-        this.velocity.y -= GRAVITY * deltaTime;
-        this.velocity.y = Math.max(this.velocity.y, -TERMINAL_VELOCITY);
-        // Dans la lave on s'enfonce, on ne tombe pas : le plafond supprime la vitesse
-        // terminale dès que le corps touche le bain.
-        if (this.dansLaLave()) this.velocity.y = Math.max(this.velocity.y, LAVE_CHUTE);
-        if (this.controls.keys['Space'] && this.onGround) {
-          this.velocity.y = JUMP_SPEED;
-          this.onGround = false;
-        }
+        this.planant = true;              // seconde pression en l'air : on ouvre le plané
+        this.attendRelache = true;
       }
+    }
+    // Les réacteurs tiennent la montée tant que la touche est tenue ; ils ne s'allument
+    // ni au sol (c'est le saut), ni en plané, ni dans l'eau, ni l'image du saut — sinon
+    // l'élan de JUMP_SPEED serait écrasé par celui des réacteurs dès le décollage.
+    this.reacteurs = tenu && !this.attendRelache && !this.planant && !venaitDeSauter
+      && !this.onGround && !eau.nage && !this.flyMode;
+
+    if (this.planant && !eau.nage && !this.flyMode) {
+      // Le planeur : Z (ou W) pousse le gaz, S le réduit, et le **regard tient la
+      // trajectoire** — nez vers le haut on prend de l'altitude, nez vers le bas on en
+      // perd, tout l'air venant de l'allure dosée au gaz. La portance reste liée à
+      // l'avancement : nez à l'horizontale et sous l'allure de sustentation, on coule
+      // doucement au lieu de tomber, ce qui interdit le vol stationnaire gratuit.
+      if (this.controls.keys['KeyZ'] || this.controls.keys['KeyW']) this.vitesseVol += PLANE_THRUST * deltaTime;
+      if (this.controls.keys['KeyS']) this.vitesseVol -= PLANE_THRUST * deltaTime;
+      this.vitesseVol = Math.min(PLANE_MAX, Math.max(PLANE_MIN, this.vitesseVol));
+      const portance = Math.min(1, this.vitesseVol / PLANE_LIFT_SPEED);
+      this.velocity.set(
+        regard.x * this.vitesseVol,
+        regard.y * this.vitesseVol - PLANE_SINK_MAX * (1 - portance),
+        regard.z * this.vitesseVol,
+      );
     } else {
-      if (this.controls.keys['Space']) this.velocity.y = FLY_SPEED;
-      else if (this.controls.keys['ShiftLeft']) this.velocity.y = -FLY_SPEED;
-      else this.velocity.y = 0;
+      const speed = this.flyMode ? FLY_SPEED : (eau.nage ? SWIM_SPEED : MOVE_SPEED);
+      this.velocity.x = moveInput.x * speed;
+      this.velocity.z = moveInput.z * speed;
+
+      if (!this.flyMode) {
+        if (eau.nage) {
+          this.applyWater(deltaTime, eau);
+        } else {
+          this.velocity.y -= GRAVITY * deltaTime;
+          this.velocity.y = Math.max(this.velocity.y, -TERMINAL_VELOCITY);
+          // Dans la lave on s'enfonce, on ne tombe pas : le plafond supprime la vitesse
+          // terminale dès que le corps touche le bain.
+          if (this.dansLaLave()) this.velocity.y = Math.max(this.velocity.y, LAVE_CHUTE);
+          if (this.reacteurs) this.velocity.y = JET_SPEED;
+        }
+      } else {
+        if (this.controls.keys['Space']) this.velocity.y = FLY_SPEED;
+        else if (this.controls.keys['ShiftLeft']) this.velocity.y = -FLY_SPEED;
+        else this.velocity.y = 0;
+      }
     }
 
     this.moveWithCollision(this.velocity.clone().multiplyScalar(deltaTime));
+
+    // Posé, le planeur n'a plus de raison d'être : on marche, et un nouvel Espace saute.
+    if (this.onGround) { this.planant = false; this.reacteurs = false; }
 
     if (this.feetY < KILL_Y) this.respawn();
     // Position persistence is driven by the autosave tick in animate(), which
@@ -1824,9 +2322,15 @@ const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerH
 // toute le relief au-delà de la moitié du champ rendu rendait la seule couleur de brume
 // — l'utilisateur voyait « des cubes tous blancs à l'horizon ». Le brouillard ne garde
 // que sa vraie tâche, dissoudre la lisière ; le milieu du champ garde ses matières.
+// Le référentiel « temps sec » est gardé à part : l'averse resserre la brume autour de
+// ces deux valeurs (`majCiel`) et doit les retrouver exactement quand elle se retire,
+// sans quoi un réglage de profondeur de champ fait après une pluie hériterait du ciel bas.
+const brumeSere = { near: 30, far: 60 };
 function applyFogForDistance(radius) {
-  scene.fog.near = Math.max(6, radius * CHUNK_SIZE * 0.62);
-  scene.fog.far = radius * CHUNK_SIZE * 0.98;
+  brumeSere.near = Math.max(6, radius * CHUNK_SIZE * 0.62);
+  brumeSere.far = radius * CHUNK_SIZE * 0.98;
+  scene.fog.near = brumeSere.near;
+  scene.fog.far = brumeSere.far;
   camera.far = Math.max(200, radius * CHUNK_SIZE * 2);
   camera.updateProjectionMatrix();
 }
@@ -1862,6 +2366,21 @@ PLANETE_CIEL.renderOrder = -10;
 scene.add(PLANETE_CIEL);
 
 const domeGeo = new THREE.SphereGeometry(1, 32, 16);
+// Les shaders maison écrivent `gl_FragColor` à la main : Three n'y insère jamais
+// l'encodage de sortie que reçoivent les matériaux built-in. Les couleurs passées en
+// uniforme sont pourtant déjà converties en linéaire par ColorManagement — écrites
+// telles quelles dans un framebuffer sRGB, elles rendent deux fois trop sombre
+// (mesuré : #808080 → 55,55,55 et #9dc3e4 → 86,139,198 au lieu de 128,128,128 et
+// 157,195,228). La brume des tronçons, elle, suit le bon pipeline et garde sa valeur.
+// C'est tout l'écart du « tout est blanc à l'horizon » : le relief lointain se peignait
+// à luminance ~148 contre ~112 pour le ciel qui le surmonte, la bande d'horizon
+// devenant l'élément le plus clair de l'image. Ces deux shaders doivent donc encoder
+// comme le reste de la scène.
+const GLSL_VERS_SRGB = /* glsl */`
+  vec3 versSRGB(vec3 c) {
+    vec3 v = clamp(c, 0.0, 1.0);
+    return mix(v * 12.92, pow(v, vec3(1.0 / 2.4)) * 1.055 - 0.055, step(vec3(0.0031308), v));
+  }`;
 const domeUniformes = {
   uZenith: { value: new THREE.Color(0x87ceeb) },
   uHorizon: { value: new THREE.Color(0xcfe6f5) },
@@ -1886,6 +2405,7 @@ const dome = new THREE.Mesh(domeGeo, new THREE.ShaderMaterial({
     uniform vec3 uDirectionSoleil;
     uniform float uHalo;
     varying vec3 vDir;
+    ${GLSL_VERS_SRGB}
     void main() {
       float t = clamp(vDir.y * 1.35 + 0.08, 0.0, 1.0);
       vec3 col = mix(uHorizon, uZenith, pow(t, 0.65));
@@ -1895,7 +2415,7 @@ const dome = new THREE.Mesh(domeGeo, new THREE.ShaderMaterial({
       // au blanc, ce que l'utilisateur décrivait comme « à l'horizon tout est blanc ».
       float face = max(dot(normalize(vDir), normalize(uDirectionSoleil)), 0.0);
       col += uHalo * pow(face, 18.0) * vec3(0.55, 0.30, 0.13);
-      gl_FragColor = vec4(col, 1.0);
+      gl_FragColor = vec4(versSRGB(col), 1.0);
     }`,
 }));
 dome.renderOrder = -10;
@@ -2025,6 +2545,7 @@ const SHADER_NUAGE = /* glsl */`
   uniform float uPortee;
   varying vec2 vUv;
   varying vec3 vMonde;
+  ${GLSL_VERS_SRGB}
   void main() {
     vec3 dir = vMonde - uCam;
     float l = max(length(dir), 1e-4);
@@ -2037,7 +2558,7 @@ const SHADER_NUAGE = /* glsl */`
     if (a < 0.004) discard;
     // Le cœur dense prend tout son éclat, la bordure reste laiteuse : c'est ce dégradé
     // qui fait un volume plutôt qu'une tache plate collée au ciel.
-    gl_FragColor = vec4(uCouleur * (0.82 + 0.18 * corps), a);
+    gl_FragColor = vec4(versSRGB(uCouleur * (0.82 + 0.18 * corps)), a);
   }`;
 
 function faireNape(nom, altitude, tuile, facteur, vitesse) {
@@ -2096,6 +2617,119 @@ const nappes = [
   faireNape('haute', 130, 152, 0.62, 0.0019),
 ];
 
+// ==================== PLUIE ====================
+// Le modèle de l'averse est pur (`meteo.js`), comme celui du ciel : il ne rend rien, il
+// décide d'une intensité. Tout ici la consomme — lumières, brume, nuages, et le rideau
+// de gouttes ci-dessous.
+const METEO_SEL = (WORLD_SEEDS.trees * 6151) | 0;   // deux mondes différents, deux météos
+const meteo = creerMeteo({ sel: METEO_SEL, mode: settings.meteo });
+// Une suite fige l'averse pour la juger sans attendre vingt minutes d'horloge ; `null`
+// rend la main au monde.
+let pluieForcee = null;
+const intensitePluie = () => (pluieForcee == null ? meteo.etat().intensite : pluieForcee);
+
+// ---- le rideau de gouttes ---------------------------------------------------
+// Des points, pas des voxels : une goutte n'a rien à partager avec le monde, et quelques
+// milliers de sprites coûtent moins cher qu'un tronçon. Tout le mouvement vit dans le vertex
+// shader — la chute s'enroule sur `uTemps`, le vent dérive chaque goutte selon sa graine
+// — donc aucun tableau n'est renvoyé au GPU image après image. La densité se règle par
+// seuil sur cette même graine : épaissir l'averse ne reconstruit rien.
+const PLUIE_POINTS = 4500;
+const PLUIE_BOITE = new THREE.Vector3(52, 34, 52);   // le volume de gouttes autour de la tête
+const COULEUR_PLUIE_NUIT = new THREE.Color(0x6f7f92);
+const COULEUR_PLUIE_JOUR = new THREE.Color(0xdfeaf7);
+
+const SHADER_PLUIE = /* glsl */`
+  uniform vec3 uBoite;
+  uniform float uTemps;
+  uniform float uDerive;
+  uniform float uTaille;
+  uniform float uPortee;
+  uniform float uDensite;
+  attribute float aVitesse;
+  attribute float aGraine;
+  varying float vVoile;
+  void main() {
+    vec3 p = position;
+    p.y = mod(p.y - uTemps * aVitesse + uBoite.y * 0.5, uBoite.y) - uBoite.y * 0.5;
+    p.x = mod(p.x + uTemps * uDerive * (0.6 + 0.8 * aGraine) + uBoite.x * 0.5, uBoite.x) - uBoite.x * 0.5;
+    vec4 oeil = viewMatrix * modelMatrix * vec4(p, 1.0);
+    gl_Position = projectionMatrix * oeil;
+    float d = max(-oeil.z, 1.0);
+    // Taille bornée : un point collé à la caméra couvrirait l'écran au lieu de tremper.
+    gl_PointSize = clamp(uTaille * (34.0 / d), 1.0, 22.0);
+    vVoile = (1.0 - smoothstep(uPortee * 0.55, uPortee, d)) * step(aGraine, uDensite);
+  }`;
+
+const SHADER_PLUIE_FRAGMENT = /* glsl */`
+  uniform vec3 uCouleur;
+  uniform float uOpacite;
+  uniform float uPente;
+  varying float vVoile;
+  ${GLSL_VERS_SRGB}
+  void main() {
+    vec2 q = gl_PointCoord - 0.5;
+    q.x -= q.y * uPente;                       // la traînée est inclinée, pas verticale
+    // Les deux lisseurs définissent la goutte : une baguette haute et étroite. Étroits,
+    // ils ne laissaient peindre que six centièmes de pour cent de l'image à midi — une
+    // averse qu'on ne voit pas. Mesurés après reprise : quelques pour cents, ce que l'œil
+    // lit comme de la pluie.
+    float trait = (1.0 - smoothstep(0.06, 0.30, abs(q.x)))
+                * (1.0 - smoothstep(0.04, 0.52, abs(q.y)));
+    float a = trait * uOpacite * vVoile;
+    if (a < 0.01) discard;
+    gl_FragColor = vec4(versSRGB(uCouleur), a);
+  }`;
+
+function faireRideauDePluie() {
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(PLUIE_POINTS * 3);
+  const vitesses = new Float32Array(PLUIE_POINTS);
+  const graines = new Float32Array(PLUIE_POINTS);
+  for (let i = 0; i < PLUIE_POINTS; i++) {
+    pos[i * 3] = (hashRoll(i, 1, 7, 9101) - 0.5) * PLUIE_BOITE.x;
+    pos[i * 3 + 1] = (hashRoll(i, 2, 7, 9103) - 0.5) * PLUIE_BOITE.y;
+    pos[i * 3 + 2] = (hashRoll(i, 3, 7, 9107) - 0.5) * PLUIE_BOITE.z;
+    vitesses[i] = 16 + hashRoll(i, 4, 7, 9109) * 12;   // cubes par seconde
+    graines[i] = hashRoll(i, 5, 7, 9127);               // densité et dérive individuelles
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aVitesse', new THREE.BufferAttribute(vitesses, 1));
+  geo.setAttribute('aGraine', new THREE.BufferAttribute(graines, 1));
+  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), PLUIE_BOITE.length() * 0.6);
+  const m = new THREE.Points(geo, new THREE.ShaderMaterial({
+    uniforms: {
+      uBoite: { value: PLUIE_BOITE.clone() },
+      uTemps: { value: 0 },
+      uDerive: { value: 3.4 },
+      uTaille: { value: 6.5 },
+      uPortee: { value: 90 },
+      uCouleur: { value: new THREE.Color(0xdfeaf7) },
+      uOpacite: { value: 0 },
+      uPente: { value: 0.34 },
+      uDensite: { value: 0 },
+    },
+    vertexShader: SHADER_PLUIE,
+    fragmentShader: SHADER_PLUIE_FRAGMENT,
+    transparent: true,
+    depthWrite: false,
+    // Test de profondeur actif : la roche devant la caméra doit cacher les gouttes, sinon
+    // une grotte se remplissait de pluie. Le reste du travail se fait dans `majCiel`, qui
+    // éteint le rideau sous un toit.
+    depthTest: true,
+    fog: false,
+  }));
+  m.name = 'pluie';
+  // Le volume suit la caméra : le culler sur une boîte locale reviendrait à faire
+  // disparaître la pluie dès qu'elle regarde ailleurs.
+  m.frustumCulled = false;
+  m.renderOrder = 6;          // après le relief et les blocs translucides
+  m.visible = false;
+  scene.add(m);
+  return m;
+}
+const rideauPluie = faireRideauDePluie();
+
 // Sous terre, les lanternes tiennent allumées en plein jour : c'est la roche au-dessus
 // de la tête qui décide, pas l'heure. Le relevé se paie une fois par quart de seconde,
 // pas par image — c'est une descente de colonne, pas un calcul gratuit.
@@ -2110,6 +2744,45 @@ function sousTerre(maintenant) {
     toitVu = !!hit && hit.t < 48;
   }
   return toitVu;
+}
+
+// L'altitude d'ancrage des nappes s'appuie sur une **moyenne régionale** du relief,
+// lissée dans le temps — jamais sur la colonne sous les pieds. Jugée cube par cube, la
+// nappe suivait le gradin du terrain : mesuré sur une ligne droite de vingt-quatre
+// cubes, la hauteur de la couche basse passait de 100 à 114 puis retombait à 100, et
+// un même nuage se déplaçait de trente-sept pixels à l'écran, pour un joueur qui avance
+// à plat (« les nuages ne sont pas stables, ils bougent quand je marche »). Une sonde
+// prise tous les trente-deux cubes sur cent quatre-vingt-douze cubes de large ne bouge
+// quasiment plus d'un pas à l'autre ; l'amortissement efface ce qui reste.
+const NAPPE_PAS_SONDE = 32;
+const NAPPE_RAYON_SONDE = 96;
+const NAPPE_INTERVALE_SONDE = 0.5;   // secondes entre deux relevés du relief
+const NAPPE_TAU = 0.8;               // rapidité de rattrapage de l'ancrage
+let solNappe = null;
+let cibleSolNappe = 0;
+let derniereSondeNappe = -10;
+
+function sonderRelief(x, z) {
+  let somme = 0, n = 0;
+  for (let dx = -NAPPE_RAYON_SONDE; dx <= NAPPE_RAYON_SONDE; dx += NAPPE_PAS_SONDE) {
+    for (let dz = -NAPPE_RAYON_SONDE; dz <= NAPPE_RAYON_SONDE; dz += NAPPE_PAS_SONDE) {
+      somme += getTerrainHeight(Math.floor(x + dx), Math.floor(z + dz));
+      n++;
+    }
+  }
+  return n ? somme / n : getTerrainHeight(Math.floor(x), Math.floor(z));
+}
+
+function majAncrageNappe(delta, maintenant, x, z) {
+  if (solNappe === null || maintenant - derniereSondeNappe > NAPPE_INTERVALE_SONDE) {
+    derniereSondeNappe = maintenant;
+    cibleSolNappe = sonderRelief(x, z);
+    // Un saut brutal n'est pas une pente : après une téléportation ou un respawn, la
+    // nappe prend la nouvelle valeur sans glisser sur une demi-seconde.
+    if (solNappe === null || Math.abs(cibleSolNappe - solNappe) > 32) solNappe = cibleSolNappe;
+  }
+  solNappe += (cibleSolNappe - solNappe) * Math.min(1, delta * NAPPE_TAU);
+  return solNappe;
 }
 
 const heureEl = document.getElementById('clock');
@@ -2161,7 +2834,7 @@ function majCiel(delta, maintenant) {
   // sinon le ciel glisserait avec lui comme un plafond peint. L'axe v garde un signe
   // inversé parce que la rotation envoie l'axe local +y vers −z monde.
   const cote = Math.max(360, camera.far * 2.4);
-  const sol = getTerrainHeight(Math.floor(camera.position.x), Math.floor(camera.position.z));
+  const sol = majAncrageNappe(delta, maintenant, camera.position.x, camera.position.z);
   for (const nappe of nappes) {
     const u = nappe.userData;
     const mat = nappe.material;
@@ -2182,18 +2855,47 @@ function majCiel(delta, maintenant) {
     nappe.visible = mat.uniforms.uOpacite.value > 0.02;
   }
 
+  // ---- l'averse ----
+  // Trois choses seulement : la brume se resserre (c'est le ciel bas), les gouttes
+  // tombent, et elles s'arrêtent sous un toit. Les lumières et les teintes viennent
+  // déjà grevées du modèle (`cielSousPluie`), rien n'est recompté ici.
+  const averse = e.pluie || 0;
+  const serre = 1 - 0.42 * averse;
+  scene.fog.near = Math.max(3, brumeSere.near * serre);
+  scene.fog.far = brumeSere.far * serre;
+  rideauPluie.position.copy(camera.position);
+  rideauPluie.visible = averse > 0.02 && !sousTerre(maintenant);
+  if (rideauPluie.visible) {
+    const u = rideauPluie.material.uniforms;
+    u.uTemps.value = maintenant;
+    u.uDensite.value = averse;
+    u.uOpacite.value = 0.40 + 0.28 * averse;
+    u.uPortee.value = Math.min(90, camera.far * 0.5);
+    u.uCouleur.value.copy(COULEUR_PLUIE_NUIT).lerp(COULEUR_PLUIE_JOUR, e.jour);
+  }
+
   // Lanternes : franches la nuit et sous terre, éteintes en plein jour. La montée est
   // amortie pour que le crépuscule allume la ville progressivement plutôt que d'un coup.
   const cible = Math.max(e.lampes, sousTerre(maintenant) ? 1 : 0);
   lanterneVivet += (cible - lanterneVivet) * Math.min(1, delta * 2.2);
   if (Math.abs(lanterneVivet - cible) < 0.004) lanterneVivet = cible;
   const w = world;
-  if (w) w.uniformeLampe.value.setRGB(1.0 * lanterneVivet, 0.69 * lanterneVivet, 0.4 * lanterneVivet);
+  if (w) w.uniformeLampe.value.setScalar(TEINTE_LAMPE * lanterneVivet);
 
   if (heureEl) {
     const texte = `${heureAffichee(e.heure)} · ${e.phase}`;
     if (heureEl.textContent !== texte) heureEl.textContent = texte;
   }
+}
+
+// Remet le ciel à jour sur-le-champ. Le bucle d'images le fait déjà image après image,
+// mais une suite (comme le joueur qui change de réglage derrière le panneau) veut lire
+// la valeur dans la foulée : `delta` petit garde l'allumage des lanternes amorti, seul
+// canal qui le soit.
+function rafraichirCiel(delta = 1 / 60, maintenant = performance.now() / 1000) {
+  etatCiel = cielSousPluie(etatDuCiel(horloge.heure()), intensitePluie());
+  majCiel(delta, maintenant);
+  return etatCiel;
 }
 
 const world = new World(scene);
@@ -2218,12 +2920,45 @@ const player = new Player(camera, world, controls, hotbar);
 
 // Block highlight wireframe
 // Slightly larger than the cube so it reads as a marker instead of the block's own
-// silhouette, and drawn without a depth test: depth-tested, this wireframe loses to
-// the very block it wraps and nothing gets painted at all.
+// silhouette. It is drawn *with* a depth test on purpose: without one the square stayed
+// painted through hills and the player dug at cubes they could not see. Depth-tested
+// lines lose against the very block they wrap and paint nothing at all, so the vertices
+// are pulled a few centimetres toward the eye (see biaisVersLOeil).
+const BIAIS_MARKERS = 0.06;   // cubes vers l'œil, en espace caméra
+/**
+ * Rend un filaire lisible sans le trahir : test de profondeur actif, plus un léger
+ * rappel des sommets vers la caméra. Ce qui n'est que confondu avec la surface du cube
+ * visé se détache ; ce qui a vraiment un relief devant soi reste caché, pixel par pixel.
+ * Le décalage se compte en espace caméra — un biais en coordonnées clip serait une
+ * distance différente à chaque profondeur et traverserait la colline qu'il doit cacher.
+ */
+function biaisVersLOeil(materiau) {
+  materiau.depthTest = true;
+  materiau.depthWrite = false;
+  materiau.onBeforeCompile = (shader) => {
+    // L'inclusion d'origine reste en place (instancing, batching) ; on ne fait que
+    // rejeter la projection avec la position caméra rappelée vers l'œil.
+    shader.vertexShader = shader.vertexShader.replace('#include <project_vertex>', `
+      #include <project_vertex>
+      mvPosition.z += ${BIAIS_MARKERS.toFixed(3)};
+      gl_Position = projectionMatrix * mvPosition;
+    `);
+    if (!shader.vertexShader.includes('mvPosition.z +=')) {
+      // Une mise à jour de three qui changerait l'inclusion rendrait les marqueurs
+      // invisibles en silence — le défaut d'avant, exactement. Mieux vaut le dire.
+      console.warn('biais des marqueurs non appliqué : <project_vertex> introuvable dans le vertex shader');
+    }
+  };
+  // Deux matériaux partagent le même programme : sans clé propre, three les confondrait
+  // avec le filaire ordinaire et l'un des deux resterait aveugle à la profondeur.
+  materiau.customProgramCacheKey = () => 'mycraft-biais-markers';
+  return materiau;
+}
+
 const highlightGeo = new THREE.BoxGeometry(1.04, 1.04, 1.04);
-const highlightMat = new THREE.LineBasicMaterial({
-  color: 0x000000, linewidth: 2, depthTest: false, depthWrite: false,
-});
+const highlightMat = biaisVersLOeil(new THREE.LineBasicMaterial({
+  color: 0x000000, linewidth: 2,
+}));
 const highlight = new THREE.LineSegments(new THREE.EdgesGeometry(highlightGeo), highlightMat);
 highlight.visible = false;
 highlight.renderOrder = 13;
@@ -2234,7 +2969,7 @@ scene.add(highlight);
 // into the face so it reads against the texture instead of merging with the block edge.
 const faceMarker = new THREE.LineSegments(
   new THREE.EdgesGeometry(new THREE.PlaneGeometry(0.9, 0.9)),
-  new THREE.LineBasicMaterial({ color: 0x000000, depthTest: false, depthWrite: false }),
+  biaisVersLOeil(new THREE.LineBasicMaterial({ color: 0x000000 })),
 );
 faceMarker.visible = false;
 faceMarker.renderOrder = 13;
@@ -2281,8 +3016,9 @@ const selectionFill = new THREE.Mesh(
 );
 const selectionOutline = new THREE.LineSegments(
   new THREE.EdgesGeometry(selectionFill.geometry),
-  // Same reason as the highlight: depth-tested lines never paint over solid terrain.
-  new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false }),
+  // Same bias as the highlight: the frame must not be painted through the hills it
+  // crosses, or the player reads a cuboid that half of them hides.
+  biaisVersLOeil(new THREE.LineBasicMaterial({ color: 0xffffff })),
 );
 const selectionPreview = new THREE.Group();
 selectionPreview.add(selectionFill, selectionOutline);
@@ -2552,12 +3288,6 @@ window.addEventListener('keydown', (e) => {
   if (e.code >= 'Digit1' && e.code <= 'Digit9') {
     hotbar.select(parseInt(e.code.replace('Digit', ''), 10) - 1);
   }
-  // F key for fly mode
-  if (e.code === 'KeyF') {
-    player.flyMode = !player.flyMode;
-    player.velocity.y = 0;
-    updateInfo();
-  }
   // T for texture panel
   if (e.code === 'KeyT') {
     toggleTexturePanel();
@@ -2665,15 +3395,37 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 // ==================== UI ====================
 const info = document.getElementById('info');
+let lastInfoText = null;
+
+/** Ce qui occupe le joueur cette image : ses jambes, ses réacteurs, ses ailes. */
+function modeJoueur() {
+  if (player.flyMode) return 'Survol (debug)';
+  if (player.planant) {
+    // Le planeur obéit au regard : dire l'allure sans dire si elle monte laisserait
+    // le pilote juger son altitude à l'œil nu. Bandes larges — un texte qui changerait
+    // chaque image annulerait la garde de `updateInfo`.
+    const vy = player.velocity.y;
+    const cap = vy > 0.5 ? 'en montée' : vy < -0.5 ? 'en descente' : 'à plat';
+    return `Plané ${Math.round(player.vitesseVol)} c/s · ${cap}`;
+  }
+  if (player.reacteurs) return 'Réacteurs';
+  return 'Marche';
+}
+
 function updateInfo() {
   const pos = camera.position;
   const blockName = BLOCK_INFO[player.selectedBlock]?.name || 'Unknown';
-  info.textContent = `
+  // Le mode change à chaque geste sur Espace : affiché seulement à la seconde, il
+  // resterait une image derrière la réalité. D'où la garde sur le texte complet.
+  const texte = `
     XYZ: ${Math.floor(pos.x)}, ${Math.floor(pos.y)}, ${Math.floor(pos.z)}
     Bloc: ${blockName}
-    Mode: ${player.flyMode ? 'Vol (F)' : 'Marche'}
+    Mode: ${modeJoueur()}
     FPS: ${fps}
   `;
+  if (texte === lastInfoText) return;
+  lastInfoText = texte;
+  info.textContent = texte;
 }
 
 // ==================== TEXTURE PANEL ====================
@@ -2917,6 +3669,34 @@ function setDayLength(value) {
 syncDayControl();
 if (jourInput) jourInput.addEventListener('input', () => setDayLength(jourInput.value));
 
+// ---- météo ----
+// Le réglage ne fait que choisir le régime ; c'est `meteo.js` qui décide de l'averse.
+// « Averse continue » sert aussi bien au joueur qui veut la pluie qu'aux suites, qui ne
+// peuvent pas attendre qu'un épisode se présente.
+const meteoSelect = document.getElementById('meteo-mode');
+const meteoValue = document.getElementById('meteo-mode-value');
+const METEO_LIBELLES = { auto: 'automatique', jamais: 'ciel clair', toujours: 'averse' };
+
+function syncMeteoControl() {
+  if (!meteoSelect) return;
+  meteoSelect.value = settings.meteo;
+  if (meteoValue) meteoValue.textContent = METEO_LIBELLES[settings.meteo];
+}
+
+function setMeteoMode(value) {
+  const next = METEO_MODES.includes(value) ? value : 'auto';
+  settings.meteo = next;
+  meteo.reglerMode(next);
+  pluieForcee = null;   // une reprise en main de test ne survit pas à un changement de réglage
+  rafraichirCiel();     // l'aperçu derrière le panneau doit changer tout de suite
+  syncMeteoControl();
+  saveSettings();
+  return next;
+}
+
+syncMeteoControl();
+if (meteoSelect) meteoSelect.addEventListener('input', () => setMeteoMode(meteoSelect.value));
+
 startBtn.addEventListener('click', () => {
   if (!worldReady) return;   // stays disabled until the save has been read back
   inventory.hide();
@@ -2936,6 +3716,12 @@ startBtn.addEventListener('click', () => {
 controls.addEventListener('unlock', () => {
   if (inventory.isOpen()) return;
   blocker.style.display = 'flex';
+  // Échap ouvre cet écran : le bouton d'enregistrement s'y présente dans l'état réel du
+  // disque, et sa note explique une bonne fois ce que l'autosauvegarde fait déjà seule.
+  majBoutonEnregistrer();
+  if (saveNote && !saveNote.textContent) {
+    saveNote.textContent = `Le monde s’économise seul toutes les ${Math.round(AUTOSAVE_INTERVAL_MS / 1000)} s ; ce bouton écrit tout de suite.`;
+  }
 });
 
 controls.addEventListener('lock', () => {
@@ -2976,6 +3762,7 @@ const saveStatusEl = document.getElementById('save-status');
 let worldReady = false;
 let saveDirty = false;      // an edit happened since the last write
 let writingSave = false;    // one request in flight, avoids piling up writes
+let finECriture = Promise.resolve();   // sa promesse : qui demande une écriture l'attend
 let lastWriteAt = -Infinity;
 let writtenEdits = -1;      // diff size as of the last successful write
 const writtenPos = new THREE.Vector3(NaN, NaN, NaN);
@@ -3009,6 +3796,10 @@ let regenerEnCours = false;
 async function flushWorldSave({ force = false, beacon = false } = {}) {
   if (regenerEnCours) return false;
   if (!worldReady) return false;
+  // Une écriture est déjà partie (l'économise périodique, un clic précédent) : on l'attend
+  // au lieu de repartir les mains vides. Faire semblant d'enregistrer ferait croire au
+  // demandeur que le disque n'est pas à jour alors qu'il vient de le devenir.
+  if (writingSave) await finECriture;
   // `force` lifts the throttle (unload, world switch), it never invents work: an
   // unchanged world is left alone on the disk.
   if (!needsWorldSave()) return false;
@@ -3016,7 +3807,7 @@ async function flushWorldSave({ force = false, beacon = false } = {}) {
   if (!force && now - lastWriteAt < AUTOSAVE_INTERVAL_MS) return false;
   const text = encodeSave({
     seed: WORLD_SEEDS, name: worldName, player: player.saveState(),
-    edits: world.modifiedBlocks, monde: MONDE,
+    edits: world.modifiedBlocks, monde: MONDE, flux: world.eauNiveaux,
   });
 
   // On the way out the response is worthless, so prefer the one transport the
@@ -3030,18 +3821,27 @@ async function flushWorldSave({ force = false, beacon = false } = {}) {
 
   writingSave = true;
   lastWriteAt = now;
-  try {
-    await saveStore.save(text);
-    markWorldWritten();
-    return true;
-  } catch (e) {
-    console.warn('Sauvegarde impossible :', e);
-    saveDirty = true; // retried on the next tick instead of being lost
-    return false;
-  } finally {
-    writingSave = false;
-  }
+  finECriture = (async () => {
+    try {
+      await saveStore.save(text);
+      markWorldWritten();
+      return true;
+    } catch (e) {
+      console.warn('Sauvegarde impossible :', e);
+      saveDirty = true; // le prochain réveil de l'économise reprendra le diff
+      return false;
+    } finally {
+      writingSave = false;
+    }
+  })();
+  return finECriture;
 }
+
+// L'économise automatique ne se paie plus par image : l'écran d'accueil peut dormir le
+// bucle pendant des minutes, et une écriture du disque n'a rien à attendre de la
+// prochaine image. Le garde-fis est le même (throttlée, et muette tant que rien n'a
+// changé), seul son réveil change de nature.
+setInterval(() => { if (worldReady) flushWorldSave(); }, AUTOSAVE_INTERVAL_MS);
 
 function describeAge(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return 'à l’instant';
@@ -3071,6 +3871,55 @@ let savedAtLocal = Date.now();
 function setWorldStatus(text) {
   if (worldStatusEl) worldStatusEl.textContent = text;
 }
+
+// ---- bouton « Enregistrer » de l'écran d'arrêt ----
+// Échap rend la souris et rouvre cet écran : c'est le moment où le joueur veut être sûr
+// que ce qu'il vient de bâtir est sur le disque. L'autosauvegarde reprend déjà le
+// travail en arrière-plan ; ce bouton, lui, doit dire ce qu'il a fait — une écriture
+// muette ressemble à une écriture qui n'a pas eu lieu.
+const saveBtn = document.getElementById('save-btn');
+const saveNote = document.getElementById('save-note');
+let saveBtnBusy = false;
+
+function majBoutonEnregistrer() {
+  if (!saveBtn) return;
+  // Le bouton reste cliquable pendant une écriture automatique : la demande du joueur
+  // attend celle qui est en vol au lieu d'être refusée. Lui seul se met en congé.
+  saveBtn.disabled = !worldReady || saveBtnBusy;
+  saveBtn.textContent = !worldReady ? '💾 monde en chargement…'
+    : (writingSave || saveBtnBusy) ? '💾 écriture…'
+    : '💾 Enregistrer le monde';
+}
+
+/** Écrit tout de suite et rend le verdict dans la note sous le bouton. */
+async function enregistrerMaintenant() {
+  // Une écriture en vol n'est pas un motif de refus : `flushWorldSave` l'attend et reprend
+  // le diff. Refuser laissait le joueur avec un bouton qui n'avait rien écrit.
+  if (!worldReady || saveBtnBusy) return false;
+  const regenerait = regenerEnCours;
+  saveBtnBusy = true;
+  majBoutonEnregistrer();
+  let ecrit = false;
+  try {
+    ecrit = await flushWorldSave({ force: true });
+  } finally {
+    saveBtnBusy = false;
+    majBoutonEnregistrer();
+    updateSaveHud();
+  }
+  if (saveNote) {
+    // Verdict lu sur l'état final du disque, pas sur le seul voyage de ce clic : si
+    // l'économise périodique vient d'écrire ces mêmes cubes, le joueur a eu ce qu'il veut.
+    saveNote.textContent = ecrit
+      ? `Monde « ${worldLabel()} » écrit · ${world.modifiedBlocks.size} cube${world.modifiedBlocks.size > 1 ? 's' : ''} modifié${world.modifiedBlocks.size > 1 ? 's' : ''}`
+      : regenerait ? 'Régénération du monde en cours : rien à écrire pour l’instant'
+      : !needsWorldSave() ? 'Rien de nouveau depuis la dernière écriture : le disque est à jour'
+      : 'Échec de l’écriture — voir la console';
+  }
+  return ecrit;
+}
+
+if (saveBtn) saveBtn.addEventListener('click', () => { enregistrerMaintenant(); });
 
 async function readStoredWorld() {
   let timer = null;
@@ -3124,10 +3973,16 @@ async function bootWorld() {
       // Un nom passé par l'URL (création ou renommage à l'instant) prime : c'est
       // l'intention la plus récente, le fichier peut encore porter l'ancienne.
       if (!worldName) worldName = cleanWorldName(saved.name);
-      world.applyEdits(saved.edits);
+      world.applyEdits(saved.edits, saved.flux);
       player.restoreFromSave(saved.player);
       savedAtLocal = saved.savedAt || Date.now();
     } else {
+      mondeVierge = true;
+      // Le sol du monument est estampé, pas généré avec le relief : les tronçons qui le
+      // portent doivent exister avant qu'on y pose le joueur, sinon il traverse la dalle
+      // libre d'air et tombe jusqu'au fond du monde.
+      const reveil = resoudreApparition();
+      if (reveil) world.updateChunks(reveil.x, reveil.z, WORLD_BOOT_BUDGET);
       player.placeAtSpawn();
       world.updateChunks(camera.position.x, camera.position.z, WORLD_BOOT_BUDGET);
       savedAtLocal = Date.now();
@@ -3141,11 +3996,17 @@ async function bootWorld() {
   } finally {
     worldReady = true;
     startBtn.disabled = false;
+    majBoutonEnregistrer();
   }
   if (worldNameInput && !worldNameInput.value) worldNameInput.value = worldName || '';
+  // Dire où le joueur se réveille : sans cette ligne, un monde neuf qui s'ouvre sous une
+  // colonnade ressemble à un téléportation hasardeuse plutôt qu'à un choix du monde.
+  const reveil = !saved && mondeVierge && apparitionDuMonde
+    ? ` · réveil dans le temple de (${apparitionDuMonde.ex}, ${apparitionDuMonde.ez})`
+    : (!saved && mondeVierge ? ' · aucun temple à portée, apparition en pleine nature' : '');
   setWorldStatus(saved
     ? `Monde « ${worldLabel()} » retrouvé · ${saved.edits.size} bloc${saved.edits.size > 1 ? 's' : ''} modifié${saved.edits.size > 1 ? 's' : ''} · ${describeAge(Date.now() - savedAtLocal)}`
-    : `Nouveau monde « ${worldLabel()} » · rien sur le disque pour l’instant`);
+    : `Nouveau monde « ${worldLabel()} » · rien sur le disque pour l’instant${reveil}`);
   refreshWorldList();
 }
 
@@ -3264,6 +4125,10 @@ async function resetActiveWorld() {
     console.warn('Effacement impossible :', e);
   }
   world.clearEdits();
+  // Le monde redevient vierge : le joueur y est remis comme à sa première venue, sous la
+  // colonnade du temple — sinon « Réinitialiser » le rendrait au plein champ alors que la
+  // même page, chargée sans fichier, l'y aurait mené.
+  mondeVierge = true;
   player.respawn();
   saveDirty = false;
   writtenEdits = 0;
@@ -3463,6 +4328,35 @@ function updateWaterHud(force) {
 // à la fermeture (le monde reprendrait sinon un bond d'une demi-seconde).
 let reglageOuvert = false;
 let framesRendues = 0;
+// Les suites jugent le monde sans jamais cliquer « jouer » : elles n'ont pas de souris
+// capturée, donc pas d'écran fermé, et devraient voir une page figée. Ce drapeau leur
+// rend les images que la pause refuse, sans simuler pour autant la partie réelle.
+let imageForcee = false;
+let veilleAppliquee = null;
+
+/** Vrai tant que l'écran d'accueil — ou la pause qu'Échap rouvre — couvre la page. */
+const ecranPose = () => blocker.style.display !== 'none';
+
+/**
+ * L'horloge du fluide. Une vague toutes les `EAU.PAS_MS` millisecondes, jamais plus : le
+ * budget de cellules jugées par vague est borné côté automate, et le remaillage des
+ * tronçons touchés part dans la file de streaming (`differe`) au lieu d'être payé ici.
+ * Deux vagues à la suite sur la même image ne gagneraient rien — la seconde ne juge que
+ * des cellules découvertes par la première — et coûtent deux remaillages.
+ */
+let horlogeEau = 0;
+function majEau(deltaTime) {
+  if (world.eau.enAttente() === 0) { horlogeEau = 0; return; }
+  horlogeEau += deltaTime * 1000;
+  if (horlogeEau < EAU.PAS_MS) return;
+  horlogeEau = 0;
+  world.eau.vague();
+}
+
+// Le regard du joueur, lu une fois par image. Il décide de l'ordre dans lequel le monde
+// se décharge (`offsetsFor`) et sert aussi au viseur : un seul vecteur partagé plutôt
+// qu'une allocation par image.
+const directionRegard = new THREE.Vector3(0, 0, -1);
 
 function animate() {
   requestAnimationFrame(animate);
@@ -3472,6 +4366,15 @@ function animate() {
   lastTime = now;
 
   if (reglageOuvert) return;
+  // L'écran d'accueil est opaque : rien du monde n'est visible derrière lui, donc rien
+  // ne se dessine, ne se maille, ni n'avance pendant qu'il est posé. Le canevas est masqué
+  // en plus — une pleine fenêtre à composer coûte même quand personne ne dessine dedans.
+  const enVeille = !imageForcee && ecranPose();
+  if (enVeille !== veilleAppliquee) {
+    veilleAppliquee = enVeille;
+    renderer.domElement.classList.toggle('hors-jeu', enVeille);
+  }
+  if (enVeille) return;
   framesRendues++;
 
   // FPS counter
@@ -3492,25 +4395,31 @@ function animate() {
     return;
   }
 
-  flushWorldSave();   // throttled and change-gated inside
-  updateSaveHud();
+  updateSaveHud();   // l'écriture périodique, elle, tourne sur son propre réveil
 
   // L'heure du monde avance avec les images : la journée se tarit à l'horloge réelle,
-  // et le cycle s'arrête avec le reste quand l'écran de réglage est ouvert.
+  // et le cycle s'arrête avec le reste quand l'écran de réglage est ouvert. La météo
+  // compte ses journées sur la même pendule, donc accélérer la journée rapproche aussi
+  // les averses — c'est le seul rythme que le joueur règle.
   horloge.avancer(deltaTime);
-  etatCiel = etatDuCiel(horloge.heure());
+  meteo.avancer(deltaTime, horloge.duree());
+  etatCiel = cielSousPluie(etatDuCiel(horloge.heure()), intensitePluie());
   majCiel(deltaTime, now / 1000);
 
   if (controls.isLocked) {
     player.update(deltaTime);
-    world.updateChunks(camera.position.x, camera.position.z, Infinity, CHUNK_FRAME_MS);
+    updateInfo();   // le mode (marche / réacteurs / plané) suit le geste, pas la seconde
+    // Ce que le joueur regarde se décharge en premier : au planeur à 34 cubes/s, il
+    // traverse son propre champ rendu en moins de quatre secondes.
+    directionRegard.set(0, 0, -1).applyQuaternion(camera.quaternion);
+    world.updateChunks(camera.position.x, camera.position.z, Infinity, CHUNK_FRAME_MS,
+      directionRegard.x, directionRegard.z);
+    majEau(deltaTime);
 
     // The pending cuboid owns the cursor while it lasts; otherwise square off the face
     // under the crosshair — which cube and which of its sides a click would start from.
     if (!updateSelectionVisuals()) {
-      const dir = new THREE.Vector3(0, 0, -1);
-      camera.getWorldDirection(dir);
-      const hit = raycastVoxel(camera.position, dir, 8);
+      const hit = raycastVoxel(camera.position, directionRegard, 8);
       highlight.visible = false;
       if (hit) showFaceMarker(hit);
       else faceMarker.visible = false;
@@ -3521,8 +4430,12 @@ function animate() {
     updateSelectionVisuals();
     // Keep filling the world in behind the start screen: a large view depth has to
     // stream in over frames, and the preview is what makes the slider worth having.
+    // Même ordre prioritaire qu'en jeu : l'aperçu se remplit dans le sens où regarde la
+    // caméra, sinon la vue du réglage se construit à l'opposé de ce qu'elle montre.
     if (world.pendingChunks > 0) {
-      world.updateChunks(camera.position.x, camera.position.z, Infinity, CHUNK_FRAME_MS);
+      directionRegard.set(0, 0, -1).applyQuaternion(camera.quaternion);
+      world.updateChunks(camera.position.x, camera.position.z, Infinity, CHUNK_FRAME_MS,
+        directionRegard.x, directionRegard.z);
     }
   }
 
@@ -3771,6 +4684,7 @@ if (wgEcran) {
         await saveStore.save(encodeSave({
           seed: mondeSeeds(ficheEnReglage.graine), name: worldName,
           player: player.saveState(), edits: new Map(), monde: ficheEnReglage,
+          flux: new Map(),
         }));
       } catch (e) {
         console.warn('Fiche non écrite dans la sauvegarde :', e);
@@ -3805,6 +4719,15 @@ window.__mc = {
   renderer,
   world,
   player,
+  // Le contrôleur aérien se juge sur ses nombres à lui : une suite qui recopie ces
+  // chiffres dérive dès qu'on les règle.
+  GRAVITY, JUMP_SPEED, MOVE_SPEED, JET_SPEED,
+  PLANE_MIN, PLANE_DEFAUT, PLANE_MAX, PLANE_THRUST, PLANE_LIFT_SPEED, PLANE_SINK_MAX,
+  // Les nombres du champ de lumière : une suite qui recopie ces seuils dérive au
+  // premier réglage, et ils décident de ce qu'on appelle encore « noir ».
+  PLANCHER_NUIT, PLANCHER_PIECE, COUVERTE_MINCE, LAMPE_PORTEE, PORTEE_CIEL,
+  // La ligne du HUD qui dit ce que fait le joueur, lisible sans attendre l'horloge FPS.
+  modeDuJoueur: () => modeJoueur(),
   hotbar,
   inventory,
   controls,
@@ -3857,6 +4780,19 @@ window.__mc = {
     } while (world.pendingChunks > 0 && guard++ < 500);
     return world.pendingChunks;
   },
+  // Génère les données des tronçons d'une fenêtre sans déplacer le centre du flot. Une
+  // suite qui juge des colonnes fixes loin du joueur en a besoin : `streamAll` ne charge
+  // que autour de la caméra — et le monde s'ouvre aujourd'hui dans un temple, parfois à
+  // deux cents cubes de l'apparition historique.
+  chargerRegion(x0, z0, x1, z1) {
+    let faits = 0;
+    for (let cx = Math.floor(x0 / CHUNK_SIZE); cx <= Math.floor(x1 / CHUNK_SIZE); cx++) {
+      for (let cz = Math.floor(z0 / CHUNK_SIZE); cz <= Math.floor(z1 / CHUNK_SIZE); cz++) {
+        if (world.generateChunkData(cx, cz)) faits++;
+      }
+    }
+    return faits;
+  },
   feetY() { return player.feetY; },
   respawn: () => player.respawn(),
   settle: () => player.settle(),
@@ -3877,10 +4813,42 @@ window.__mc = {
   MAX_SELECTION_DEPTH,
   MAX_SELECTION_CELLS,
   setBlock: (x, y, z, id) => world.setBlock(x, y, z, id),
+  // ---- eau qui coule ----
+  // Les suites jugent la propagation sans dépendre du temps réel : `eauVagues` fait avancer
+  // l'automate d'un coup, et `eauNiveau` répond la distance enregistrée (null = source).
+  eauParams: EAU,
+  eauNiveau: (x, y, z) => world.eauNiveaux.get(`${x},${y},${z}`) ?? null,
+  eauNageable: (x, y, z) => world.estNageable(x, y, z),
+  eauEnAttente: () => world.eau.enAttente(),
+  eauReveiller: (x, y, z) => world.eau.reveiller(x, y, z),
+  eauVagues: (n = 1) => {
+    let evaluees = 0;
+    let modifiees = 0;
+    for (let i = 0; i < n; i++) {
+      const r = world.eau.vague();
+      evaluees += r.evaluees;
+      modifiees += r.modifiees;
+      if (r.enAttente === 0) break;
+    }
+    return { evaluees, modifiees, enAttente: world.eau.enAttente() };
+  },
+  /** Toutes les cellules d'eau de passage du monde : `[x, y, z, distance]`. */
+  eauCellules: () => {
+    const out = [];
+    for (const [cle, niv] of world.eauNiveaux) {
+      const [x, y, z] = cle.split(',').map(Number);
+      out.push([x, y, z, niv]);
+    }
+    return out;
+  },
   // ---- persistence hooks ----
   saveStore,
   SAVE_SLOT,
   WORLD_SEEDS,
+  // Où un monde neuf fait apparaître son joueur (null : repli au sec). Les suites jugent
+  // le réveil dans le temple sans recalculer la recherche des mailles.
+  pointApparition: () => resoudreApparition(),
+  mondeVierge: () => mondeVierge,
   // ---- fiche de génération du monde ----
   // La fiche en jeu, ses défauts, la table des curseurs et les seuils que l'étalonnage
   // en a tirés : les suites vérifient l'écran sans dupliquer ces chiffres.
@@ -3910,6 +4878,12 @@ window.__mc = {
   fermerReglage: () => fermerReglageDuMonde(),
   reglageOuvert: () => reglageOuvert,
   framesRendues: () => framesRendues,
+  // L'écran d'accueil (et la pause d'Échap) endort le bucle : rien ne se dessine ni
+  // n'avance tant qu'il est posé. Une suite qui juge le monde sans jamais cliquer
+  // « jouer » réveille le bucle avec `image(true)` et le rendort pour vérifier la veille.
+  image: (vrai = true) => { imageForcee = !!vrai; return imageForcee; },
+  ecranPose: () => ecranPose(),
+  horsJeu: () => renderer.domElement.classList.contains('hors-jeu'),
   AUTOSAVE_INTERVAL_MS,
   worldReady: () => worldReady,
   flushSave: () => flushWorldSave({ force: true }),
@@ -3975,15 +4949,57 @@ window.__mc = {
     repeat: +n.material.uniforms.uTuile.value.x.toFixed(4),
     offsetU: n.material.uniforms.uDecalage.value.x,
     offsetV: n.material.uniforms.uDecalage.value.y,
+    // L'ancrage régional tel qu'il est appliqué (identique pour les deux couches) : une
+    // suite juge qu'il ne tressaute pas quand le joueur marche sur un gradin.
+    solAncre: +(solNappe ?? 0).toFixed(3),
     camX: camera.position.x,
     camZ: camera.position.z,
   })),
-  reglerHeure: (h) => {
+  // `delta` et `maintenant` se figent pour qu'une suite puisse dérouler la marche du
+  // joueur image par image plutôt que de voir l'amortissement sauter comme à la
+  // télécommande (sans quoi le contrôle jugerait un ciel instantané, pas celui du jeu).
+  reglerHeure: (h, delta = 10, maintenant = performance.now() / 1000) => {
     horloge.regler(h);
-    etatCiel = etatDuCiel(horloge.heure());
-    majCiel(10, performance.now() / 1000);   // forcée : la valeur doit se lire tout de suite
-    return etatCiel;
+    return rafraichirCiel(delta, maintenant);   // forcée : la valeur doit se lire tout de suite
   },
+  // --- pluie ---
+  // L'état de la météo et ce que le rideau rend réellement. Une suite ne peut pas
+  // attendre vingt minutes d'horloge pour juger une averse : `reglerPluie` la fige et
+  // force `majCiel`, exactement comme `reglerHeure` le fait pour l'heure.
+  pluie: () => {
+    const e = meteo.etat();
+    return {
+      ...e,
+      // `intensite` est celle que la scène rend — avec une reprise en main de test, ce
+      // n'est pas celle de l'automate ; elle reste lisible sous `automate`.
+      intensite: intensitePluie(),
+      automate: e.intensite,
+      force: pluieForcee,
+      rendu: {
+        visible: rideauPluie.visible,
+        points: rideauPluie.geometry.attributes.position.count,
+        peints: renderer.info.render.points || 0,
+        densite: +rideauPluie.material.uniforms.uDensite.value.toFixed(3),
+        opacite: +rideauPluie.material.uniforms.uOpacite.value.toFixed(3),
+        couleur: '#' + rideauPluie.material.uniforms.uCouleur.value.getHexString(),
+        brume: [+scene.fog.near.toFixed(1), +scene.fog.far.toFixed(1)],
+        // Même arrondi que `brume` : la suite compare les deux et jugerait une différence
+        // de lecture là où il n'y a qu'une différence de virgule flottante.
+        brumeSere: [+brumeSere.near.toFixed(1), +brumeSere.far.toFixed(1)],
+      },
+    };
+  },
+  reglerPluie: (v, delta = 10, maintenant = performance.now() / 1000) => {
+    pluieForcee = v == null ? null : Math.min(1, Math.max(0, Number(v) || 0));
+    return rafraichirCiel(delta, maintenant).pluie || 0;
+  },
+  /** Fait défiler la pendule météo de `journees` journées (suites). */
+  avancerMeteo: (journees, delta = 1 / 60, maintenant = performance.now() / 1000) => {
+    meteo.reglerTemps(meteo.etat().journee + (Number(journees) || 0));
+    rafraichirCiel(delta, maintenant);
+    return meteo.etat();
+  },
+  reglerMeteo: (m) => setMeteoMode(m),
   horloge: () => horloge,
   dureeJour: () => settings.dureeJour,
   reglerDureeJour: (v) => setDayLength(v),

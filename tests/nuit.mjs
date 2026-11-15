@@ -310,7 +310,54 @@ const horizon = await page.evaluate(() => {
       teinte: [Math.round(rs / n), Math.round(gs / n), Math.round(bs / n)] };
   };
   const heures = [0, 0.27, 0.5, 0.73].map(sonder);
-  return { colline, heures, pres: mc.scene.fog.near, loin: mc.scene.fog.far };
+
+  // Le blanc absolu ne suffisait pas à juger cette bande : tant que le dôme rendait sous
+  // sa valeur, aucun pixel n'approchait des seuils et la porte restait verte pendant que
+  // le joueur voyait « tout blanc devant ». Ce qui fait un horizon lavé, c'est un rapport
+  // de luminance : le relief dissous dans la brume ne doit jamais être plus clair que le
+  // ciel posé juste au-dessus de lui, rangée par rangée.
+  const hierarchie = (() => {
+    mc.camera.position.set(colline.x + 0.5, colline.h + 1.62, colline.z + 0.5);
+    mc.player.velocity.set(0, 0, 0);
+    for (let i = 0; i < 4; i++) mc.step(1 / 120);
+    mc.look(0, 0);
+    mc.reglerHeure(0.5);
+    const img = rendu();
+    const { w, h } = img;
+    const L = (i) => 0.2126 * img.px[i] + 0.7152 * img.px[i + 1] + 0.0722 * img.px[i + 2];
+    const near = mc.scene.fog.near, loin = mc.scene.fog.far;
+    const tanH = Math.tan(mc.THREE.MathUtils.degToRad(mc.camera.fov) / 2), aspect = w / h;
+    const fwd = new mc.THREE.Vector3(), right = new mc.THREE.Vector3(), up = new mc.THREE.Vector3();
+    mc.camera.getWorldDirection(fwd);
+    right.crossVectors(fwd, new mc.THREE.Vector3(0, 1, 0)).normalize();
+    up.crossVectors(right, fwd).normalize();
+    const dir = new mc.THREE.Vector3();
+    const BANDES = 16;
+    const rangees = Array.from({ length: BANDES }, () => ({ cielN: 0, cielL: 0, relN: 0, relL: 0 }));
+    for (let y = 0; y < h; y += 2) {
+      const b = Math.min(BANDES - 1, Math.floor((y / h) * BANDES));
+      const ndcY = 2 * (y + 0.5) / h - 1;                 // readPixels : ligne 0 en bas
+      for (let x = 0; x < w; x += 2) {
+        const ndcX = 2 * (x + 0.5) / w - 1;
+        dir.copy(fwd).addScaledVector(right, ndcX * tanH * aspect).addScaledVector(up, ndcY * tanH).normalize();
+        const touche = mc.raycastVoxel(mc.camera.position, dir, mc.camera.far);
+        const lum = L((y * w + x) * 4);
+        if (!touche) { rangees[b].cielN++; rangees[b].cielL += lum; continue; }
+        if ((touche.t - near) / (loin - near) > 0.6) { rangees[b].relN++; rangees[b].relL += lum; }
+      }
+    }
+    let pire = null, comparees = 0;
+    for (const r of rangees) {
+      if (r.cielN < 40 || r.relN < 40) continue;
+      comparees++;
+      const e = r.relL / r.relN - r.cielL / r.cielN;
+      if (!pire || e > pire.ecart) {
+        pire = { ecart: +e.toFixed(1), ciel: +(r.cielL / r.cielN).toFixed(1), relief: +(r.relL / r.relN).toFixed(1) };
+      }
+    }
+    return { pire, comparees };
+  })();
+  return { colline, heures, pres: mc.scene.fog.near, loin: mc.scene.fog.far, hierarchie };
 });
 check('la brume reste dans la famille du ciel à toute heure',
   horizon.heures.every((h) => h.lumBrume < 200),
@@ -323,6 +370,9 @@ check('le plein jour garde une bande d’horizon bleutée, pas laiteuse',
     const midi = horizon.heures.find((h) => h.phase === 'jour');
     return !!midi && midi.teinte[2] > midi.teinte[0] + 20;
   })(), JSON.stringify(horizon.heures.find((h) => h.phase === 'jour')));
+check('le relief noyé de brume ne domine jamais le ciel de la même rangée',
+  horizon.hierarchie.comparees >= 2 && !!horizon.hierarchie.pire && horizon.hierarchie.pire.ecart <= 12,
+  `${horizon.hierarchie.comparees} rangées comparées · pire ${JSON.stringify(horizon.hierarchie.pire)}`);
 
 // ------------------------------------------------- 2 ter bis. les nuages ne sont pas des cubes
 // L'utilisateur demandait « des nuages, mais pas en cube ». La suite juge donc la forme
@@ -388,7 +438,15 @@ const nuages = await page.evaluate(() => {
   mc.reglerHeure(0);
   mc.look(0, 85);
   const etatNuit = mc.nuages();
-  const cielNuit = moyBande(tirer(), ...haut);
+  // La référence de nuit se prend elle aussi voile retiré : juger la bande haute sur une
+  // valeur absolue reviendrait à juger le dôme. Depuis que les shaders du ciel encodent
+  // leur sortie comme les matériaux built-in, `#070b1c` rend vraiment 11 de luminance au
+  // lieu de ployer sous les 2 — seul l'apport propre de la nappe répond de « éteinte ».
+  const nuitAvec = tirer();
+  const cielNuit = moyBande(nuitAvec, ...haut);
+  for (const n of nappes) n.visible = false;
+  const cielNuitNu = moyBande(tirer(), ...haut);
+  for (const nap of nappes) nap.visible = true;
 
   // Ancrage : parcourir le monde ne doit pas faire glisser la tuile sous le joueur.
   mc.reglerHeure(0.5);
@@ -456,7 +514,7 @@ const nuages = await page.evaluate(() => {
   return {
     formes: nappes.map((o) => ({ geometrie: o.geometry.type, horizontal: Math.abs(o.rotation.x + Math.PI / 2) < 1e-6,
       testProfondeur: o.material.depthTest, ecritProfondeur: o.material.depthWrite })),
-    etatJour, etatNuit, cielJour, cielNu, cielNuit,
+    etatJour, etatNuit, cielJour, cielNu, cielNuit, cielNuitNu,
     apport: { couverts: +(100 * gagnes / n).toFixed(1), moyenne: +moyenne.toFixed(1), max: +max.toFixed(1),
       ecartType: +ecartType.toFixed(1) },
     derive, calage, creux, cielSousRoche,
@@ -472,13 +530,105 @@ check('en pleine journée ils repeignent le ciel au-dessus de la tête',
 check('et ils dessinent des amas, pas un lavis uniforme',
   nuages.apport.ecartType > 4,
   `écart type des apports ${nuages.apport.ecartType} sur ${nuages.apport.couverts}% de pixels touchés`);
+const apportNuit = +(nuages.cielNuit - nuages.cielNuitNu).toFixed(1);
 check('la nuit venue, la nappe s’éteint',
   nuages.etatNuit.every((n, i) => n.opacite < nuages.etatJour[i].opacite * 0.6)
-    && nuages.cielNuit < 12,
-  `opacité ${nuages.etatJour[0].opacite} → ${nuages.etatNuit[0].opacite} · bande haute ${nuages.cielNuit}`);
+    && apportNuit <= 5 && nuages.cielNuit < 30,
+  `opacité ${nuages.etatJour[0].opacite} → ${nuages.etatNuit[0].opacite} · la nappe ajoute ${apportNuit} de luminance à une bande déjà à ${nuages.cielNuitNu} (plein jour, elle ajoute +${nuages.apport.moyenne})`);
 check('le ciel des nuages tient au monde quand le joueur marche',
   Math.abs(nuages.derive.u) < 0.02 && Math.abs(nuages.derive.v) < 0.02,
   `après 64 cubes vers l’est et 40 vers le nord, dérive ${(nuages.derive.u)},${(nuages.derive.v)} de tuile`);
+
+// L'autre moitié de l'ancrage est verticale. La nappe se pose au-dessus du relief : jugée
+// sur la colonne sous les pieds, elle suivait le gradin cube par cube et le ciel
+// tressautait à chaque pas (« quand je marche, les nuages ne sont pas stables, ils
+// bougent »). Le contrôle compare donc l'ancrage réellement appliqué à la règle qu'on a
+// remplacée, sur le même trajet — celui qui faisait le plus sauter la nappe.
+const tremble = await page.evaluate(() => {
+  const mc = window.__mc;
+  const B = mc.biomeParams;
+  let couloir = null;
+  for (let x = -240; x <= 240; x += 12) {
+    for (let z = -240; z <= 240; z += 12) {
+      const h = mc.getTerrainHeight(x, z);
+      if (h < B.sandLine + 4 || h > B.treeLine - 2) continue;
+      if (mc.cellOccupied(x, z) || mc.cellGenante(x, z)) continue;
+      for (const yaw of [0, 45, 90, 135, 180, 225, 270, 315]) {
+        const rad = yaw * Math.PI / 180, dx = -Math.sin(rad), dz = -Math.cos(rad);
+        const cols = [];
+        let bloque = false;
+        for (let t = 0; t <= 26; t += 2) {
+          const hh = mc.getTerrainHeight(Math.floor(x + dx * t), Math.floor(z + dz * t));
+          cols.push(hh);
+          if (hh > h + 1) bloque = true;                  // un mur à hauteur d'yeux : on n'y passe pas
+        }
+        const denivelle = Math.max(...cols) - Math.min(...cols);
+        if (bloque || denivelle < 4) continue;
+        if (!couloir || denivelle > couloir.denivelle) couloir = { x, z, h, yaw, denivelle };
+      }
+    }
+  }
+  if (!couloir) return { erreur: 'aucun couloir de marche accidenté trouvé' };
+
+  // La suite poursuit avec ses propres prises de vue juste après : on rend l'appareil
+  // photo tel qu'on l'a trouvé, sinon c'est le contrôle d'à côté qui juge un autre cadre.
+  const etatCamera = {
+    pos: mc.camera.position.clone(), rot: mc.camera.rotation.clone(),
+    ordre: mc.camera.rotation.order, fly: mc.player.flyMode,
+  };
+  mc.player.flyMode = true;                               // vol à plat : seule la nappe doit bouger
+  mc.releaseAll();
+  mc.player.setEye(couloir.x + 0.5, couloir.h + 1, couloir.z + 0.5);
+  mc.player.velocity.set(0, 0, 0);
+  mc.world.updateChunks(couloir.x, couloir.z);
+  for (let i = 0; i < 900 && mc.world.pendingChunks > 0; i++) mc.streamAll();
+  mc.look(couloir.yaw, 0);
+  let basse = null;
+  mc.scene.traverse((o) => { if (o.name === 'nuages' && o.userData.nom === 'basse') basse = o; });
+  const ALT = basse.userData.altitude;
+  const rad = couloir.yaw * Math.PI / 180;
+  const repere = new mc.THREE.Vector3(couloir.x, 0, couloir.z).addScaledVector(
+    new mc.THREE.Vector3(-Math.sin(rad), 0, -Math.cos(rad)), 90);
+  const pxH = mc.renderer.domElement.clientHeight;
+  const proj = (y) => repere.clone().setY(y).project(mc.camera).y * 0.5 * pxH;
+
+  mc.press('KeyW');
+  const t0 = performance.now() / 1000;
+  const ech = [];
+  for (let i = 0; i < 300; i++) {                         // cinq secondes de marche
+    mc.step(1 / 60);
+    mc.reglerHeure(0.5, 1 / 60, t0 + i / 60);             // delta réel : c'est l'amorti du jeu qu'on juge
+    const yAncre = basse.getWorldPosition(new mc.THREE.Vector3()).y;
+    ech.push({
+      x: +mc.camera.position.x.toFixed(2), z: +mc.camera.position.z.toFixed(2),
+      col: mc.getTerrainHeight(Math.floor(mc.camera.position.x), Math.floor(mc.camera.position.z)),
+      ancre: +yAncre.toFixed(3), gradin: +(ALT + mc.getTerrainHeight(Math.floor(mc.camera.position.x), Math.floor(mc.camera.position.z))).toFixed(3),
+      ecranAncre: +proj(yAncre).toFixed(2),
+      ecranGradin: +proj(ALT + mc.getTerrainHeight(Math.floor(mc.camera.position.x), Math.floor(mc.camera.position.z))).toFixed(2),
+    });
+  }
+  mc.releaseAll();
+  mc.player.flyMode = etatCamera.fly;
+  mc.player.velocity.set(0, 0, 0);
+  mc.player.setEye(etatCamera.pos.x, etatCamera.pos.y - 1.62, etatCamera.pos.z);
+  mc.camera.position.copy(etatCamera.pos);
+  mc.camera.rotation.order = etatCamera.ordre;
+  mc.camera.rotation.copy(etatCamera.rot);
+  const TV = (k) => ech.reduce((s, r, i) => i ? s + Math.abs(r[k] - ech[i - 1][k]) : s, 0);
+  const SAUT = (k) => Math.max(...ech.slice(1).map((r, i) => Math.abs(r[k] - ech[i][k])));
+  const RUG = (k) => { let s = 0; for (let i = 1; i < ech.length - 1; i++) s += Math.abs(ech[i + 1][k] - 2 * ech[i][k] + ech[i - 1][k]); return +s.toFixed(1); };
+  return {
+    couloir, parcouru: +Math.hypot(ech.at(-1).x - ech[0].x, ech.at(-1).z - ech[0].z).toFixed(1),
+    paliersColonnes: new Set(ech.map((r) => r.col)).size,
+    avant: { rugositePx: RUG('ecranGradin'), tvCube: +TV('gradin').toFixed(1), sautMaxCube: SAUT('gradin') },
+    apres: { rugositePx: RUG('ecranAncre'), tvCube: +TV('ancre').toFixed(1), sautMaxCube: +SAUT('ancre').toFixed(3) },
+  };
+});
+check('marcher sur un gradin ne fait plus tressauter la nappe',
+  !tremble.erreur && tremble.parcouru > 12 && tremble.paliersColonnes >= 3
+    && tremble.apres.rugositePx <= 0.05 * Math.max(1, tremble.avant.rugositePx)
+    && tremble.apres.sautMaxCube <= 0.2,
+  tremble.erreur || `${tremble.parcouru} cubes sur relief à ${tremble.paliersColonnes} niveaux · rugosité ${tremble.apres.rugositePx} px contre ${tremble.avant.rugositePx} px, plus grand saut ${tremble.apres.sautMaxCube} cube`);
 check('une tuile de décalage rend le ciel identique, une moitié le change',
   nuages.calage.pleine.pixels > 1000 && nuages.calage.pleine.ecart <= 1
     && nuages.calage.demi.ecart > 2,
@@ -1265,24 +1415,27 @@ const couloir = await page.evaluate(({ AIR, LAMP_POST, LAMP_GLOW, APP }) => {
     const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
     const px = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
-    let s = 0, n = 0, jaunes = 0, centre = 0, centreJaunes = 0;
+    let s = 0, n = 0;
     for (let yy = 0; yy < h; yy += 3) for (let xx = 0; xx < w; xx += 3) {
       const i = (yy * w + xx) * 4;
       s += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
       n++;
-      // Le globe de l'applique est peint d'un jaune franc que plus rien ne porte dans le
-      // cadre depuis que les candélabres voisins sont éteints : le compter au centre, c'est
-      // juger que la mesure regarde bien L'APPLIQUE et non un pan de mur endormi.
-      const jaune = px[i] > 200 && px[i + 1] > 150 && px[i + 2] < 140;
-      if (jaune) jaunes++;
-      if (xx > w / 3 && xx < 2 * w / 3 && yy > h / 3 && yy < 2 * h / 3) {
-        centre++;
-        if (jaune) centreJaunes++;
-      }
+      // Plus de comptage de pixels jaunes : le globe de l'applique est toujours ambré, mais
+      // sa lumière est blanche depuis que le halo ne peint plus les murs à l'ambre. Ce sont
+      // les deux mesures ci-dessous — le cadre éteint d'un côté, cassé de l'autre — qui
+      // disent si la mesure regarde bien L'APPLIQUE et non un pan de mur endormi.
     }
-    return { lum: +(s / n).toFixed(1), jaunes, centre, centreJaunes };
+    return { lum: +(s / n).toFixed(1) };
   };
   const avant = rendu(), canalAvant = lectureCanal(), sourcesAvant = sources().length;
+  // Témoin de ce que l'applique seule apporte au cadre : on éteint le canal des lanternes
+  // le temps d'une image, sans rien casser. Ce n'est plus la teinte qui peut le dire — le
+  // globe est ambré mais sa lumière est blanche, et le centre du cadre, lui, n'est pas la
+  // partie la plus claire (le regard est levé vers le globe, le mur s'éclaire au-dessus).
+  const uLampe = mc.world.uniformeLampe.value, teinte = uLampe.clone();
+  uLampe.setScalar(0);
+  const sansHalo = rendu();
+  uLampe.copy(teinte);
   const cible = mc.raycastVoxel(mc.camera.position, { x: face[0], y: 0, z: face[2] }, 4);
   mc.setBlock(choisie.wx, choisie.y, choisie.wz, AIR);
   mc.streamAll();
@@ -1293,7 +1446,7 @@ const couloir = await page.evaluate(({ AIR, LAMP_POST, LAMP_GLOW, APP }) => {
     solide: !!(info && info.solid), emissive: !!(info && info.emissive),
     piedBloc: mc.bloc(depuis.x, choisie.y - 1, depuis.z),
     mur: cible ? `${cible.x},${cible.y},${cible.z}@${cible.t.toFixed(2)}` : 'rien',
-    avant, canalAvant, sourcesAvant, apres, canalApres, sourcesApres,
+    avant, sansHalo, canalAvant, sourcesAvant, apres, canalApres, sourcesApres,
     appliqueApres: mc.bloc(choisie.wx, choisie.y, choisie.wz),
   };
 }, MURALE);
@@ -1308,12 +1461,13 @@ check('l\'applique est un meuble mural : ni solide, ni opaque, mais émissif',
 check('l\'applique compte parmi les sources de lumière du tronçon',
   couloirEclaire && couloir.declaree && couloir.sourcesApres === couloir.sourcesAvant - 1,
   couloirEclaire ? `${couloir.sourcesAvant} sources déclarées, l'applique arrachée → ${couloir.sourcesApres}` : '—');
-check('à minuit, le globe de l\'applique domine le couloir',
-  couloirEclaire && couloir.avant.lum > 60 && couloir.avant.centreJaunes > couloir.avant.centre * 0.08,
-  couloirEclaire ? `${JSON.stringify(couloir.avant)} · ${couloir.eteintes} candélabres éteints autour` : couloir.erreur || '—');
+check('à minuit, l\'applique domine le couloir',
+  couloirEclaire && couloir.avant.lum > 60 && couloir.avant.lum > couloir.sansHalo.lum * 2
+    && couloir.canalAvant.nonNuls > 0,
+  couloirEclaire ? `${JSON.stringify(couloir.avant)} · halo éteint ${JSON.stringify(couloir.sansHalo)} `
+    + `· ${couloir.eteintes} candélabres éteints autour` : couloir.erreur || '—');
 check('casser l\'applique rend le couloir à l\'obscurité',
   couloirEclaire && couloir.appliqueApres === AIR
-    && couloir.apres.jaunes < couloir.avant.jaunes * 0.25
     && couloir.apres.lum < couloir.avant.lum * 0.5
     && couloir.canalApres.nonNuls < couloir.canalAvant.nonNuls,
   couloirEclaire ? `${JSON.stringify(couloir.avant)} → ${JSON.stringify(couloir.apres)} · `

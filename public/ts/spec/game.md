@@ -1,8 +1,13 @@
 lit le code dans modele-game.ts
 générer les config ressources  dans un fichier json modifiable
 
-le autonomieJetpack est la duree pendant laquelle le jetpack peut etre actif ,
-Il consomme de l'energie , l'configNiveauJoueur[autonomieJetpack] donne le temps pour une cellule d'energie
+
+quand on appuye sur espace on saute
+quand on reste appuyer sur espace on monte en utilisant le jetpack quand on relache on redescend
+quand on appuye une deuxieme fois sur espace  en l'air on se met a voller et touche z accelere et touche s decelere si on reapui sur espace alors on descend 
+
+
+
 
 quand on presse espace on monte tant que l'energie' est superieur a zero , quand elle est a zero on redescend si on ne presse pas espace il se recharge
 quand on saute de haut on peu amortir la chute

@@ -3,7 +3,7 @@
 // Needs the static server running (npm start / node server.js).
 import fs from 'node:fs';
 import path from 'node:path';
-import { openGame, makeReporter } from './browser.mjs';
+import { openGame, waitForBoot, makeReporter } from './browser.mjs';
 
 const URL = process.argv[2] || 'http://localhost:8080';
 const SHOTS = process.env.SHOT_DIR || '.qwen/tmp/mc-shots';
@@ -637,7 +637,7 @@ await page.screenshot({ path: path.join(SHOTS, '03-hud-hotbar.png') });
 
 // determinism after reload
 await page.reload({ waitUntil: 'load' });
-await page.waitForFunction(() => !!window.__mc, null, { timeout: 30000 });
+await waitForBoot(page);   // même porte qu'au démarrage : le bucle doit être réveillé aussi
 const secondPass = await page.evaluate(() => {
   const mc = window.__mc;
   const c = mc.atlas.tileCanvas('cobble');
@@ -691,17 +691,30 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
     const cam0 = mc.camera.position;
 
     // Les plans seuls suffisent à choisir les candidats : ils ne dépendent pas du
-    // chargement, contrairement aux voxels.
+    // chargement, contrairement aux voxels. Les immeubles tiennent les centres-bourgs et
+    // le joueur naît aujourd'hui sous un temple, souvent hors de la ville : la recherche
+    // part donc du point d'apparition en anneaux de tronçons et s'arrête à la première
+    // tour, comme le fait le jeu pour son temple d'apparition.
     const found = [];
     let batis = 0;
+    let sonde = 0;
     const originX = Math.floor(cam0.x / 16);
     const originZ = Math.floor(cam0.z / 16);
-    for (let cx = originX - 14; cx <= originX + 14; cx++) {
-      for (let cz = originZ - 14; cz <= originZ + 14; cz++) {
-        for (const plan of mc.villageAt(cx * 16, cz * 16)) {
-          batis++;
-          if (plan.kind !== 'tower' || !plan.stair) continue;
-          found.push({ plan, cx, cz, distance: Math.hypot(cx * 16 - cam0.x, cz * 16 - cam0.z) });
+    const examiner = (cx, cz) => {
+      sonde++;
+      for (const plan of mc.villageAt(cx * 16, cz * 16)) {
+        batis++;
+        if (plan.kind !== 'tower' || !plan.stair) continue;
+        found.push({ plan, cx, cz, distance: Math.hypot(cx * 16 - cam0.x, cz * 16 - cam0.z) });
+      }
+    };
+    for (let r = 0; r <= 40 && !found.length; r++) {
+      if (r === 0) examiner(originX, originZ);
+      else {
+        for (let d = -r; d <= r; d++) {
+          examiner(originX + d, originZ - r);
+          examiner(originX + d, originZ + r);
+          if (d > -r && d < r) { examiner(originX - r, originZ + d); examiner(originX + r, originZ + d); }
         }
       }
     }
@@ -713,6 +726,10 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
       mc.camera.rotation.set(0, 0, 0, 'YXZ');
       mc.player.velocity.set(0, 0, 0);
       mc.player.flyMode = false;
+      // La tour peut être à un demi-kilomètre du berceau : sans égouttage de la file,
+      // le premier pas du joueur se ferait dans un tronçon encore vide.
+      let egouttage = 0;
+      while (egouttage++ < 600 && mc.world.pendingChunks > 0) { mc.streamAll(); mc.step(1 / 120); }
       for (let i = 0; i < 30; i++) mc.step(1 / 120);
     };
     // Marcher, pas téléporter : seul un joueur qui enfonce W révèle une volée trop
@@ -847,6 +864,7 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
       trouve: grimpes.length > 0,
       tours: found.length,
       batis,
+      sonde,
       charges: mc.world.chunks.size,
       cam: [Math.round(cam0.x), Math.round(cam0.z)],
       grimpes,
@@ -857,7 +875,7 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
     probe.trouve
       ? `${probe.grimpes.length} tour(s) gravie(s) sur ${probe.tours} vue(s), dont `
         + `${probe.grimpes[0].chunk.join(',')}#${probe.grimpes[0].lot} à ${probe.grimpes[0].hauteur} niveaux`
-      : `${probe.tours} tour(s) vue(s) sur ${probe.batis} bâtiment(s) dans ${probe.charges} tronçons autour de ${probe.cam}`);
+      : `${probe.tours} tour(s) vue(s) sur ${probe.batis} bâtiment(s) dans ${probe.sonde} tronçons sondés autour de ${probe.cam}`);
   if (probe.trouve) {
     const g = probe.grimpes;
     const combien = `${g.length} immeuble(s)`;
@@ -925,16 +943,28 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
     const originX = Math.floor(cam0.x / 16);
     const originZ = Math.floor(cam0.z / 16);
 
-    // Le couloir le mieux loti autour du point d'apparition.
+    // Le couloir le mieux loti autour du point d'apparition. Un couloir appartient à un
+    // immeuble, donc au centre-bourg — et le joueur naît sous un temple, souvent hors de
+    // la ville : on cherche en anneaux de tronçons jusqu'au premier trouvé.
     let meilleur = null;
-    for (let cx = originX - 12; cx <= originX + 12; cx++) {
-      for (let cz = originZ - 12; cz <= originZ + 12; cz++) {
-        for (const co of mc.couloirsSur(cx * 16, cz * 16, cx * 16 + 15, cz * 16 + 15)) {
-          if (!meilleur || co.cellules.length > meilleur.co.cellules.length) meilleur = { cx, cz, co };
+    let sonde = 0;
+    const examiner = (cx, cz) => {
+      sonde++;
+      for (const co of mc.couloirsSur(cx * 16, cz * 16, cx * 16 + 15, cz * 16 + 15)) {
+        if (!meilleur || co.cellules.length > meilleur.co.cellules.length) meilleur = { cx, cz, co };
+      }
+    };
+    for (let r = 0; r <= 40 && !meilleur; r++) {
+      if (r === 0) examiner(originX, originZ);
+      else {
+        for (let d = -r; d <= r; d++) {
+          examiner(originX + d, originZ - r);
+          examiner(originX + d, originZ + r);
+          if (d > -r && d < r) { examiner(originX - r, originZ + d); examiner(originX + r, originZ + d); }
         }
       }
     }
-    if (!meilleur) return { trouve: false, cam: [Math.round(cam0.x), Math.round(cam0.z)] };
+    if (!meilleur) return { trouve: false, sonde, cam: [Math.round(cam0.x), Math.round(cam0.z)] };
     const { co } = meilleur;
     const cellules = co.cellules.slice().sort((a, b) => (a.wx - b.wx) || (a.wz - b.wz));
     const tete = cellules[0];
@@ -1019,6 +1049,7 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
 
     return {
       trouve: true,
+      sonde,
       couloir: `${tete.wx},${tete.wz} → ${queue.wx},${queue.wz} @${co.y}`,
       colonnes: cellules.length, longeuses: longeuses.length,
       traite, barre, dansApplique,
@@ -1026,7 +1057,7 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
   });
 
   check('le monde chargé contient un couloir d\'immeuble', probe.trouve === true,
-    probe.trouve ? probe.couloir : `aucun couloir autour de ${probe.cam}`);
+    probe.trouve ? probe.couloir : `aucun couloir en ${probe.sonde} tronçons sondés autour de ${probe.cam}`);
   if (probe.trouve) {
     check('un candélabre planté dans le couloir le condamne — le témoin voit les obstacles',
       probe.barre.ok === false,
@@ -1759,6 +1790,15 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
     yaw: window.__mc.camera.rotation.y,
     pitch: window.__mc.camera.rotation.x,
   }));
+  // Compteur d'images sur une fenêtre de temps : c'est l'instrument qui juge que
+  // l'écran d'arrêt ne rend plus rien (les suites sont réveillées d'office par
+  // browser.mjs, d'où le image(false) qui rend à cette page son comportement réel).
+  const imagesEn = (ms) => p.evaluate(async (ms) => {
+    const mc = window.__mc;
+    const a = mc.framesRendues();
+    await new Promise((r) => setTimeout(r, ms));
+    return { images: mc.framesRendues() - a, horsJeu: mc.horsJeu(), pose: mc.ecranPose() };
+  }, ms);
 
   await p.click('#start-btn');
   await p.waitForTimeout(400);
@@ -1766,6 +1806,10 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
   check('le bouton « Cliquer pour jouer » lance la partie',
     !started.blocker && started.lockedByBrowser && started.lockedByControls,
     `voile=${started.blocker} pointeur=${started.lockedByBrowser} isLocked=${started.lockedByControls}`);
+  const enJeu = await imagesEn(300);
+  check('en jeu, le monde est dessiné',
+    enJeu.images > 0 && !enJeu.horsJeu && !enJeu.pose,
+    `${enJeu.images} image(s) en 300 ms, toile masquée=${enJeu.horsJeu}`);
 
   await p.mouse.move(512, 320);
   await p.mouse.move(700, 260, { steps: 6 });
@@ -1783,11 +1827,22 @@ check('aucune ressource externe (le build bureau doit marcher hors ligne)',
     paused.blocker && !paused.lockedByControls,
     `voile=${paused.blocker} isLocked=${paused.lockedByControls}`);
 
+  // Échap doit rendre un écran sans monde : ni image, ni maille tant qu'il est posé.
+  await p.evaluate(() => window.__mc.image(false));
+  const endormi = await imagesEn(400);
+  check("Échap : l'écran d'arrêt ne rend plus le monde",
+    endormi.images === 0 && endormi.horsJeu && endormi.pose,
+    `${endormi.images} image(s) en 400 ms, toile masquée=${endormi.horsJeu}, écran posé=${endormi.pose}`);
+
   await p.click('#start-btn');
   await p.waitForTimeout(400);
   const resumed = await shown();
   check('un second clic reprend la partie', !resumed.blocker && resumed.lockedByControls,
     `voile=${resumed.blocker} isLocked=${resumed.lockedByControls}`);
+  const eveille = await imagesEn(300);
+  check('la reprise remet le monde en mouvement',
+    eveille.images > 0 && !eveille.horsJeu,
+    `${eveille.images} image(s) en 300 ms, toile masquée=${eveille.horsJeu}`);
 
   const startErrors = run.consoleErrors.filter((e) => !/favicon|Failed to load resource/i.test(e));
   check('aucune erreur console pendant le démarrage', startErrors.length === 0,

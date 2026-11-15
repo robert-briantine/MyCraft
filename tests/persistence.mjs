@@ -42,6 +42,10 @@ function watch(page) {
 const FINGERPRINT = (skip) => {
   const mc = window.__mc;
   mc.streamAll();
+  // L'échantillon se juge autour de l'origine, et le joueur peut être né bien plus loin
+  // — un monde neuf s'ouvre dans le temple le plus proche. Ces tronçons-là doivent donc
+  // être générés à la main : `streamAll` ne suit que la caméra.
+  mc.chargerRegion(-48, -48, 48, 48);
   const ignores = new Set((skip || []).map(([x, y, z]) => `${x},${y},${z}`));
   let h = 0;
   let ores = 0;
@@ -88,6 +92,63 @@ check('le slot vient de ?world=', boot.slot === SLOT_A, `slot=${boot.slot}`);
 check('un monde sans sauvegarde annonce la nouveauté', /Nouveau monde/.test(boot.status), boot.status);
 check('un monde neuf n’a pas encore de nom', boot.name === null, JSON.stringify(boot.name));
 check('aucune modification au démarrage', boot.edits === 0, `edits=${boot.edits}`);
+
+// ------------------------------------------- 1b. le réveil d'un monde neuf
+// Un monde qui sort du néant s'ouvre sous la colonnade d'un temple : le joueur découvre
+// d'emblée un repère bâti au lieu d'une plaine anonyme. Il doit être debout sur le
+// dallage du naos — pas noyé dans une colonne ni suspendu au-dessus du vide — et faire
+// face à l'autel, ce qui lui apprend où est l'entrée en levant les yeux.
+const reveil = await page.evaluate(() => {
+  const mc = window.__mc;
+  const a = mc.pointApparition();
+  if (!a) return { absent: true, statut: document.getElementById('world-status').textContent.trim() };
+  mc.chargerRegion(a.ex - 32, a.ez - 32, a.ex + 32, a.ez + 32);
+  mc.settle();
+  const pieds = mc.feetY();
+  const px = Math.floor(mc.camera.position.x);
+  const pz = Math.floor(mc.camera.position.z);
+  const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const d = dirs[a.door];
+  const C = mc.villageParams.templeCellaHalf;
+  const dx = px - a.ex, dz = pz - a.ez;
+  const axial = dx * d[0] + dz * d[1];
+  const tangent = dx * -d[1] + dz * d[0];
+  const sol = mc.bloc(px, Math.round(pieds) - 1, pz);
+  const dessus = [1, 2].map((k) => mc.bloc(px, Math.round(pieds) + k, pz));
+  // La caméra regarde selon (-sin yaw, 0, -cos yaw) ; face à l'autel, cela doit valoir
+  // l'opposé de la direction de la porte.
+  const regard = { x: -Math.sin(mc.camera.rotation.y), z: -Math.cos(mc.camera.rotation.y) };
+  return {
+    apparition: a,
+    ecart: {
+      x: Math.abs(mc.camera.position.x - a.x),
+      y: Math.abs(pieds - a.y),
+      z: Math.abs(mc.camera.position.z - a.z),
+    },
+    axial, tangent, axialAttendu: C - 1, sol, dessus, regard,
+    regardAttendu: { x: -d[0], z: -d[1] },
+    statut: document.getElementById('world-status').textContent.trim(),
+    vierge: mc.mondeVierge(),
+    pierre: [mc.BLOCK.STONE, mc.BLOCK.COBBLE],
+  };
+});
+check('un monde neuf choisit un temple pour point d’apparition',
+  reveil.absent !== true && !!reveil.apparition && reveil.vierge === true,
+  JSON.stringify(reveil.apparition || reveil.statut));
+check('le joueur y est posé, debout sur le dallage du naos',
+  !!reveil.apparition && reveil.ecart.x < 0.6 && reveil.ecart.z < 0.6 && reveil.ecart.y < 0.6
+    && reveil.pierre.includes(reveil.sol) && reveil.dessus.every((b) => b === 0),
+  JSON.stringify(reveil));
+check('il se tient dans le naos, dans l’axe de la porte',
+  !!reveil.apparition && reveil.axial === reveil.axialAttendu && reveil.tangent === 0,
+  JSON.stringify({ axial: reveil.axial, attendu: reveil.axialAttendu, tangent: reveil.tangent }));
+check('il regarde l’autel, le dos à la porte',
+  !!reveil.apparition
+    && Math.abs(reveil.regard.x - reveil.regardAttendu.x) < 0.2
+    && Math.abs(reveil.regard.z - reveil.regardAttendu.z) < 0.2,
+  JSON.stringify({ regard: reveil.regard, attendu: reveil.regardAttendu }));
+check("l’écran d’accueil dit où le joueur s'est réveillé",
+  /réveil dans le temple/.test(reveil.statut), reveil.statut);
 
 const editCells = await page.evaluate(EDIT_CELLS);
 const first = await page.evaluate(FINGERPRINT, editCells);
@@ -150,6 +211,57 @@ const afterMove = readSave(SLOT_A);
 check('un déplacement déclenche une écriture',
   beforeMove && afterMove && (afterMove.player.x !== beforeMove.player.x || afterMove.player.z !== beforeMove.player.z),
   `${beforeMove?.player?.x},${beforeMove?.player?.z} → ${afterMove?.player?.x},${afterMove?.player?.z}`);
+
+// ---------------------------------- 2b. Échap rend la souris, le bouton sait écrire
+// Le joueur qui quitte le monde des yeux veut être sûr que sa construction est en sûreté.
+// L'écran d'arrêt porte donc un bouton d'enregistrement : il écrit tout de suite et dit
+// ce qu'il a fait — une écriture muette ressemble à une écriture qui n'a pas eu lieu.
+const boutonSave = await page.evaluate(async () => {
+  const mc = window.__mc;
+  const gx = Math.round(mc.camera.position.x) + 4;
+  const gy = Math.round(mc.camera.position.y) + 3;
+  const gz = Math.round(mc.camera.position.z);
+  mc.setBlock(gx, gy, gz, mc.BLOCK.GOLD);
+  // Ce que fait le navigateur quand Échap rend le verrou de pointeur.
+  mc.controls.dispatchEvent({ type: 'unlock' });
+  const bouton = document.getElementById('save-btn');
+  const note = document.getElementById('save-note');
+  const avant = {
+    ecran: getComputedStyle(document.getElementById('blocker')).display,
+    texte: bouton.textContent, disabled: bouton.disabled, attente: mc.savePending(),
+  };
+  bouton.click();
+  await new Promise((r) => setTimeout(r, 1200));
+  const apres = { texte: bouton.textContent, note: note.textContent.trim(), attente: mc.savePending() };
+  bouton.click();                       // seconde pression : plus rien sur l'établi
+  await new Promise((r) => setTimeout(r, 600));
+  return {
+    cellule: [gx, gy, gz], or: mc.BLOCK.GOLD, avant, apres,
+    reitere: note.textContent.trim(), hud: document.getElementById('save-status').textContent,
+  };
+});
+check("Échap rouvre l'écran d'arrêt avec un bouton d’enregistrement armé",
+  boutonSave.avant.ecran === 'flex' && boutonSave.avant.disabled === false
+    && /Enregistrer/.test(boutonSave.avant.texte) && boutonSave.avant.attente === true,
+  JSON.stringify(boutonSave.avant));
+check('le bouton écrit le monde sur le disque et le dit',
+  boutonSave.apres.attente === false && /écrit/.test(boutonSave.apres.note)
+    && /sauvegardé/.test(boutonSave.hud),
+  `${boutonSave.apres.note} · ${boutonSave.hud}`);
+const parLeBouton = readSave(SLOT_A);
+const vuLeCube = (() => {
+  if (!parLeBouton || !Array.isArray(parLeBouton.edits)) return false;
+  const [x, y, z] = boutonSave.cellule;
+  for (let i = 0; i < parLeBouton.edits.length; i += 4) {
+    if (parLeBouton.edits[i] === x && parLeBouton.edits[i + 1] === y
+      && parLeBouton.edits[i + 2] === z && parLeBouton.edits[i + 3] === boutonSave.or) return true;
+  }
+  return false;
+})();
+check('le cube posé juste avant a bien atteint le fichier', vuLeCube,
+  `${boutonSave.cellule.join(',')} = or · ${parLeBouton ? `${parLeBouton.cells} cubes` : 'aucun fichier'}`);
+check('une seconde pression dit le disque déjà à jour',
+  /le disque est à jour/.test(boutonSave.reitere), boutonSave.reitere);
 
 // ---------------------------------------------------- 3. reprise après rechargement
 await page.reload({ waitUntil: 'load' });

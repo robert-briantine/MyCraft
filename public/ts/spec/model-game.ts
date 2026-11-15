@@ -63,10 +63,11 @@ interface Joueur {
     armeSlot1: ArmeDescription,
     armeSlot2: ArmeDescription,
     armeSlot3: ArmeDescription,
+    consomationEnergie:Level
     transport: number
     autonomieJetpack: Level
     autonomieApnee: Level
-    rayonAttractionRessource: Level
+    rayonAttractionRessource: Level,
     sac: Sac
 }
 
@@ -74,14 +75,7 @@ interface Joueur {
 
 type SlotArme = FieldsOfType<Joueur, ArmeDescription>
 
-function energiePourTire(arme: ArmeDescription, configArme: ConfigNiveauArme): number {
-    const porte = configArme["porte"][arme.porte]
-    const vitesse = configArme["vitesse"][arme.vitesse]
-    const rayonDegatImpact = configArme["rayonDegatImpact"][arme.rayonDegatImpact]
-    const rayonProjectile = configArme["rayonProjectile"][arme.rayonProjectile]
-    const periodeTire = configArme["periodeTire"][arme.periodeTire]
-    return (porte * vitesse * rayonDegatImpact * rayonProjectile) / periodeTire
-}
+
 
 function initArme(): ArmeDescription {
     return {
@@ -112,7 +106,8 @@ function initJoueur(): Joueur {
         transport: 10,
         vie: 10,
 
-        rayonAttractionRessource: Level.N1
+        rayonAttractionRessource: Level.N1 ,
+        consomationEnergie:Level.N1
 
     }
 
@@ -146,7 +141,9 @@ interface Zone {
 }
 
 interface Config {
+    joueurConfig: ConfigNiveauJoueur
     droneConfig: ConfigNiveauDrone
+    armeConfig: ConfigNiveauArme
     ameliorationArme: { [name in keyof ArmeDescription]: AmeliorationArme }
     ameliorationJoueur: { [name in KeyOfJoueur]: AmeliorationJoueur }
     upgradeAmeliorationJoueur: { [name in UpgradeKeyOfJoueur]: UpgradeAmeliorationJoueur }
@@ -158,6 +155,7 @@ interface Drone {
     droneDescription: DroneDescription
     nid: Nid
     vie: number
+    fireTime?: DroneFireTime
 
 }
 interface Nid {
@@ -167,20 +165,125 @@ interface Nid {
     time: number
     idxProduction: number
 }
+interface JetpackTime {
+    time: number
+}
+interface FireTime {
+    time: number
+    armeActive: SlotArme
+}
+interface DroneFireTime {
+    time: number
+
+}
 class Monde {
-    drones: Drone[] = []
-    nids: Nid[] = []
+    drones: { [id: string]: Drone } = {}
+    nids: { [id: string]: Nid } = {}
     joueur: Joueur
     config: Config
+    armeActive?: SlotArme
+    jetpackTime?: JetpackTime
+    fireTime?: FireTime
     constructor(joueur: Joueur, config: Config) {
         this.joueur = joueur
         this.config = config
     }
+    fire(time: number, arme: SlotArme): boolean {
+        if (this.fireTime) {
+            return false;
+        }
+        const e = this.energiePourTire(arme)
+        if (e < this.joueur.energie) {
+            return false
+        }
+        this.joueur.energie -= e 
+        this.fireTime = {
+            armeActive: arme,
+            time: time
+        }
+        
+        return true;
+
+    }
+    energiePourTire(slotArme: SlotArme): number {
+        const configArme: ConfigNiveauArme = this.config.armeConfig
+        const arme: ArmeDescription = this.joueur[slotArme]
+        const porte = configArme["porte"][arme.porte]
+        const vitesse = configArme["vitesse"][arme.vitesse]
+        const rayonDegatImpact = configArme["rayonDegatImpact"][arme.rayonDegatImpact]
+        const rayonProjectile = configArme["rayonProjectile"][arme.rayonProjectile]
+        const periodeTire = configArme["periodeTire"][arme.periodeTire]
+        const e = (porte * vitesse * rayonDegatImpact * rayonProjectile) /  periodeTire 
+        return Math.round(e /this.config.joueurConfig.consomationEnergie[this.joueur.consomationEnergie])+1
+    }
+    impact(id: string, arme: SlotArme) {
+        const d = this.drones[id]
+        if (d) {
+            d.vie = d.vie - this.config.armeConfig.degat[this.joueur[arme].degat]
+
+        }
+    }
+    fireDrone(time: number, id: string) {
+        const d = this.drones[id]
+        if (d) {
+            if (d.fireTime) {
+                return false
+            }
+            d.fireTime = { time: time }
+            
+
+
+            return true
+        }
+        return false
+
+    }
+    startJetpack(time: number) {
+        if (this.jetpackTime) {
+            return
+        }
+        this.jetpackTime = {
+            time: time
+        }
+    }
+    stopJetpack(time: number) {
+        if (this.joueur.energie > 0) {
+            this.joueur.energie--
+        }
+        this.jetpackTime = undefined
+    }
     step(time: number) {
-        for (const n of this.nids) {
+
+        if (this.fireTime) {
+            let deltat = time - this.fireTime.time
+            if (deltat > this.config.armeConfig.periodeTire[this.joueur[this.fireTime.armeActive].periodeTire]) {
+                this.fireTime = undefined
+            }
+        }
+        for (const [id, d] of Object.entries(this.drones)) {
+            if (d.fireTime) {
+                let deltat = time - d.fireTime.time
+                if (deltat > this.config.armeConfig.periodeTire[d.droneDescription.arme.periodeTire]) {
+                    d.fireTime = undefined
+                }
+            }
+        }
+
+        if (this.jetpackTime) {
+            const deltat = time - this.jetpackTime.time
+            if (deltat > this.config.joueurConfig.autonomieJetpack[this.joueur.autonomieJetpack]) {
+                if (this.joueur.energie > 0) {
+                    this.joueur.energie--
+                    this.jetpackTime.time = time
+                } else {
+                    this.jetpackTime = undefined
+                }
+            }
+        }
+        for (const [id, n] of Object.entries(this.nids)) {
             let p = n.nidDescription.productions[n.idxProduction]
             const deltat = time - n.time
-            let periode: number = this.config.droneConfig["periodeProduction"][p.droneDescription.periodeProduction]
+            let periode: number = this.config.droneConfig.periodeProduction[p.droneDescription.periodeProduction]
             if (deltat > periode) {
                 n.time = time
                 if (n.count === p.count) {
@@ -194,10 +297,10 @@ class Monde {
                 }
                 const drone: Drone = {
                     droneDescription: p.droneDescription,
-                    vie: this.config.droneConfig["vieMax"][p.droneDescription.vieMax],
+                    vie: this.config.droneConfig.vieMax[p.droneDescription.vieMax],
                     nid: n
                 }
-                this.drones.push(drone)
+                this.drones[crypto.randomUUID()] = drone
                 n.count++
 
             }
@@ -208,10 +311,10 @@ class Monde {
 
     }
     dronePourDestruction() {
-        return this.drones.filter((d) => this.nids.every((n) => n !== d.nid) || d.vie <= 0)
+        return Object.entries(this.drones).filter(([id, d]) => Object.values(this.nids).every((n) => n !== d.nid) || d.vie <= 0)
     }
     nidPourDestruction() {
-        return this.nids.filter((n) => n.vie <= 0)
+        return Object.entries(this.nids).filter(([id, n]) => n.vie <= 0)
 
     }
 

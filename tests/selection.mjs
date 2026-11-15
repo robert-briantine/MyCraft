@@ -40,6 +40,9 @@ async function resetArena() {
     mc.player.velocity.set(0, 0, 0);
     mc.releaseAll();
     for (let i = 0; i < 3; i++) mc.step(1 / 120);
+    // Le monde démarre aujourd'hui dans un temple, loin de cette arène : les tronçons
+    // doivent être maillés avant toute mesure de pixels, pas laissés au flot d'images.
+    mc.streamAll();
   }, { CX, CZ, FY, MARKER, STONE });
 }
 
@@ -531,7 +534,7 @@ check('basculer d’un bouton à l’autre re-ancre sur le cube du mode visé',
 // A wireframe that loses the depth test against the block it wraps is invisible while
 // every property still reads "visible": measure the rendered pixels instead.
 await resetArena();
-const painted = await page.evaluate(async ({ MARKER, FY }) => {
+const painted = await page.evaluate(async ({ MARKER, FY, STONE }) => {
   const mc = window.__mc;
   mc.cancelSelection();
   mc.controls.isLocked = true;
@@ -581,14 +584,18 @@ const painted = await page.evaluate(async ({ MARKER, FY }) => {
     return { n, noirs, blancs };
   }
 
-  const ARETES_CUBE = [[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
-  const coinsCube = (cote) => {
-    const out = [];
-    for (const a of [-0.5, 0.5]) for (const b of [-0.5, 0.5]) for (const c of [-0.5, 0.5]) {
-      out.push([MARKER.x + 0.5 + a * cote, MARKER.y + 0.5 + b * cote, MARKER.z + 0.5 + c * cote]);
-    }
-    return out;
-  };
+  // Le filaire respecte maintenant la profondeur : les arêtes que le cube masque derrière
+  // ses propres faces ne se peignent plus — c'est exactement ce qu'on demande. Ce qui doit
+  // l'être, ce sont les quatre arêtes de la face proche, celle que l'œil regarde.
+  const ARETES_QUATRE = [[0,1],[1,2],[2,3],[3,0]];
+  const faceProche = (demi) => [
+    [MARKER.x + 0.5 - demi, MARKER.y + 0.5 - demi, MARKER.z + 0.5 - demi],
+    [MARKER.x + 0.5 - demi, MARKER.y + 0.5 + demi, MARKER.z + 0.5 - demi],
+    [MARKER.x + 0.5 - demi, MARKER.y + 0.5 + demi, MARKER.z + 0.5 + demi],
+    [MARKER.x + 0.5 - demi, MARKER.y + 0.5 - demi, MARKER.z + 0.5 + demi],
+  ];
+  const DEMI_CARRE = 1.04 / 2;      // le carré noir est un cheveu plus grand que le cube
+  const DEMI_APERCU = 0.97 / 2;     // l'aperçu est rentré d'autant sous le carré
   // The face square sits on the marker's west face — the one the eye is looking at.
   const FACE_X = MARKER.x - 0.02, FYE = MARKER.y + 0.5, FZE = MARKER.z + 0.5, S = 0.45;
   const COINS_FACE = [
@@ -604,13 +611,31 @@ const painted = await page.evaluate(async ({ MARKER, FY }) => {
     apercuVisible: mc.selectionPreview.visible,
   };
   const ancre = mc.selectionState().anchor;
-  const avec = { noir: leLongDesSegments(coinsCube(1.04), ARETES_CUBE), blanc: leLongDesSegments(coinsCube(0.97), ARETES_CUBE) };
+  const avec = {
+    noir: leLongDesSegments(faceProche(DEMI_CARRE), ARETES_QUATRE),
+    blanc: leLongDesSegments(faceProche(DEMI_APERCU), ARETES_QUATRE),
+  };
   mc.highlight.visible = false;
-  const sansCarre = { noir: leLongDesSegments(coinsCube(1.04), ARETES_CUBE) };
-  mc.selectionPreview.visible = false;
-  const sansApercu = { blanc: leLongDesSegments(coinsCube(0.97), ARETES_CUBE) };
+  const sansCarre = { noir: leLongDesSegments(faceProche(DEMI_CARRE), ARETES_QUATRE) };
   mc.highlight.visible = true;
+  mc.selectionPreview.visible = false;
+  const sansApercu = { blanc: leLongDesSegments(faceProche(DEMI_APERCU), ARETES_QUATRE) };
   mc.selectionPreview.visible = true;
+
+  // Un mur de pierre levé entre l'œil et le cube marqué : les deux objets restent
+  // `visible: true` — seule la peinture tranche, et elle doit se taire.
+  const mur = [];
+  for (let y = FY - 1; y <= FY + 8; y++) {
+    for (let z = MARKER.z - 4; z <= MARKER.z + 4; z++) mur.push([MARKER.x - 2, y, z, STONE]);
+  }
+  mc.world.setBlocksBulk(mur);
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const derriereLeMur = {
+    noir: leLongDesSegments(faceProche(DEMI_CARRE), ARETES_QUATRE),
+    blanc: leLongDesSegments(faceProche(DEMI_APERCU), ARETES_QUATRE),
+    carre: mc.highlight.visible, apercu: mc.selectionPreview.visible,
+  };
+  mc.world.setBlocksBulk(mur.map(([x, y, z]) => [x, y, z, 0]));
 
   // Back to the idle cursor: the square laid on the aimed face is what shows before
   // any click, so measure it with the selection dropped and a couple of real frames.
@@ -621,24 +646,33 @@ const painted = await page.evaluate(async ({ MARKER, FY }) => {
   const carreSans = leLongDesSegments(COINS_FACE, ARETES_FACE);
   mc.faceMarker.visible = true;
   mc.controls.isLocked = false;
-  return { ancre, avec, sansCarre, sansApercu, carreAvec, carreSans, etat };
-}, { MARKER, FY });
+  return { ancre, avec, sansCarre, sansApercu, derriereLeMur, carreAvec, carreSans, etat };
+}, { MARKER, FY, STONE });
 
 const detail = `${painted.avec.noir.noirs}/${painted.avec.noir.n} noirs, masque ${painted.sansCarre.noir.noirs}/${painted.sansCarre.noir.n}`
   + ` · ${painted.avec.blanc.blancs}/${painted.avec.blanc.n} blancs, masque ${painted.sansApercu.blanc.blancs}/${painted.sansApercu.blanc.n}`
+  + ` · mur ${painted.derriereLeMur.noir.noirs}/${painted.derriereLeMur.noir.n} noirs et ${painted.derriereLeMur.blanc.blancs}/${painted.derriereLeMur.blanc.n} blancs`
   + ` · carré de face ${painted.carreAvec.noirs}/${painted.carreAvec.n}, masque ${painted.carreSans.noirs}/${painted.carreSans.n}`
   + ` · ${JSON.stringify(painted.etat)}`;
 check('le cube marqué en destruction est bien entouré du carré noir',
   painted.ancre && painted.ancre.x === MARKER.x && painted.ancre.y === MARKER.y && painted.ancre.z === MARKER.z
-    && painted.avec.noir.n > 200
-    && painted.avec.noir.noirs >= painted.avec.noir.n * 0.25
+    && painted.avec.noir.n > 80
+    && painted.avec.noir.noirs >= painted.avec.noir.n * 0.2
     && painted.sansCarre.noir.noirs <= painted.sansCarre.noir.n * 0.05,
   detail);
 
 check('le cadre de l’aperçu de sélection est peint',
-  painted.avec.blanc.n > 200
+  painted.avec.blanc.n > 80
     && painted.avec.blanc.blancs >= painted.avec.blanc.n * 0.35
     && painted.sansApercu.blanc.blancs <= painted.sansApercu.blanc.n * 0.1,
+  detail);
+
+// Le défaut que le joueur reprochait au carré : il restait dessiné à travers le relief,
+// et l'on creusait ce qu'on ne voyait pas. Jugé ici, objet par objet, derrière un mur.
+check('rien ne se peint derrière un mur, même si le marqueur se croit visible',
+  painted.derriereLeMur.carre === true && painted.derriereLeMur.apercu === true
+    && painted.derriereLeMur.noir.n > 80 && painted.derriereLeMur.noir.noirs === 0
+    && painted.derriereLeMur.blanc.n > 80 && painted.derriereLeMur.blanc.blancs === 0,
   detail);
 
 check('avant tout clic, un carré est peint sur la face visée',

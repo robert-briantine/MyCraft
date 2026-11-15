@@ -3,7 +3,7 @@
 // Needs the static server running (npm start / node server.js).
 import fs from 'node:fs';
 import path from 'node:path';
-import { openGame, makeReporter } from './browser.mjs';
+import { openGame, waitForBoot, makeReporter } from './browser.mjs';
 
 const URL = process.argv[2] || 'http://localhost:8080';
 const SHOTS = process.env.SHOT_DIR || '.qwen/tmp/mc-shots';
@@ -168,7 +168,7 @@ check('un champ de 16 chunks se complète entièrement',
 
 await page.evaluate(() => window.__mc.setRenderDistance(7));
 await page.reload({ waitUntil: 'load' });
-await page.waitForFunction(() => !!window.__mc, null, { timeout: 30000 });
+await waitForBoot(page);   // même porte qu'au démarrage : le bucle doit être réveillé aussi
 await drain();
 const reloaded = await state();
 check('le réglage survit au rechargement de la page',
@@ -178,11 +178,67 @@ check('le réglage survit au rechargement de la page',
 
 await page.evaluate((key) => localStorage.setItem(key, '{"renderDistance":"totalement"}'), 'mincraft_settings');
 await page.reload({ waitUntil: 'load' });
-await page.waitForFunction(() => !!window.__mc, null, { timeout: 30000 });
+await waitForBoot(page);   // même porte qu'au démarrage : le bucle doit être réveillé aussi
 const corrupt = await state();
 check('un réglage illisible retombe sur la valeur par défaut',
   corrupt.r === corrupt.def && corrupt.inputValue === corrupt.def,
   `${corrupt.r} chunks`);
+
+// ============================================================ 6b. l'écran d'accueil rend seul
+// Le voile est opaque et le bucle d'images s'arrête sous lui — c'est la demande du joueur :
+// « l'écran de début et Échap ne contiennent pas de rendu du monde, ça ralentit l'interface ».
+// Les autres suites jugent le monde réveillé (browser.mjs le demande pour elles) ; ici on
+// vérifie précisément le sommeil, instruments arrêtés compris.
+const veille = await page.evaluate(async () => {
+  const mc = window.__mc;
+  const attente = (ms) => new Promise((r) => setTimeout(r, ms));
+  const mesurer = async (ms) => {
+    const avant = { images: mc.framesRendues(), heure: mc.horloge().heure() };
+    const fileAvant = mc.world.pendingChunks;
+    await attente(ms);
+    return {
+      images: mc.framesRendues() - avant.images,
+      heures: Math.abs(mc.horloge().heure() - avant.heure),
+      file: mc.world.pendingChunks - fileAvant,
+      horsJeu: mc.horsJeu(),
+      pose: mc.ecranPose(),
+    };
+  };
+  // De quoi travailler : sans tronçons en attente, « rien ne se maille » serait vrai pour
+  // la mauvaise raison.
+  mc.setRenderDistance(mc.MAX_RENDER_DISTANCE);
+  mc.image(false);                                  // comme un joueur qui n'a pas cliqué
+  const endormi = await mesurer(400);
+  mc.image(true);                                   // même file, bucle réveillé
+  const reveille = await mesurer(1600);
+  const voile = document.getElementById('blocker');
+  const style = getComputedStyle(voile);
+  // Une couche translucide laisserait transparaître le monde : ni le fond ni l'image ne
+  // doivent porter de canal alpha ouvert.
+  const translucide = /rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*(?:0|0?\.\d+)\s*\)/
+    .test(`${style.backgroundImage} ${style.backgroundColor}`);
+  const couleurPleine = /^rgb\(/.test(style.backgroundColor.trim());
+  mc.setRenderDistance(9);
+  return { endormi, reveille, translucide, couleurPleine, peint: style.backgroundImage !== 'none' };
+});
+check('écran ouvert : plus une seule image de monde',
+  veille.endormi.pose && veille.endormi.images === 0,
+  `${veille.endormi.images} image(s) en 400 ms, écran posé=${veille.endormi.pose}`);
+check('écran ouvert : le temps du monde dort avec l’image',
+  veille.endormi.heures === 0,
+  `heure avancée de ${veille.endormi.heures.toFixed(5)} pendant la veille`);
+check('écran ouvert : rien ne se maille non plus',
+  veille.endormi.file === 0 && veille.reveille.file < 0,
+  `file ${veille.endormi.file} en veille · ${veille.reveille.file} réveillé`);
+check('écran ouvert : la toile est masquée, rien à composer',
+  veille.endormi.horsJeu && !veille.reveille.horsJeu,
+  `hors-jeu=${veille.endormi.horsJeu} en veille, ${veille.reveille.horsJeu} réveillé`);
+check("l'écran est opaque : aucun rendu du monde ne transparaît",
+  veille.peint && veille.couleurPleine && !veille.translucide,
+  `peint=${veille.peint} couleur pleine=${veille.couleurPleine} translucide=${veille.translucide}`);
+check('réveillé, le bucle reprend ses images',
+  veille.reveille.images > 0,
+  `${veille.reveille.images} image(s) en 1,6 s une fois l’écran levé`);
 
 // ============================================================ 7. screenshot + hygiene
 await page.evaluate(() => {

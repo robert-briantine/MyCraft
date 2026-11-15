@@ -19,6 +19,9 @@ export const MAX_NAME_LENGTH = 48;
 // Un fichier corrompu ou tronqué ne doit pas pouvoir faire allouer une table
 // démesurée au chargement.
 const MAX_EDIT_CELLS = 2_000_000;
+// L'eau qui coule n'écrit que autour de la brèche du joueur ; au-delà de quelques dizaines
+// de milliers de cellules, le fichier n'est plus un diff mais une inondation écrite à la main.
+const MAX_FLUX_CELLS = 200_000;
 const MAX_COORD = 1e7;
 // Le monde fait CHUNK_HEIGHT cubes, mais le joueur peut voler au-dessus et tomber
 // sous le vide : la position acceptée au rechargement est plus large que le relief.
@@ -65,14 +68,30 @@ export function cleanWorldName(rawName) {
  * Elle voyage avec le monde parce que le fichier ne porte que le diff du joueur : sans
  * elle, un monde créé avec une île de 900 cubes se régénérerait sur les constantes par
  * défaut et les blocs posés par le joueur se retrouveraient ailleurs.
+ *
+ * `flux` porte les distances de l'**eau de passage** (tableau plat de quatruples, comme
+ * `edits`). Une cellule d'eau absente de cette table est une source pérenne — mer, rivière,
+ * seau posé par le joueur — donc seule l'eau qui coule a quelque chose à écrire : un monde
+ * où personne n'a percé la nappe ne porte pas du tout le champ.
  */
-export function encodeSave({ seed, name, player, edits, monde = null }) {
+export function encodeSave({ seed, name, player, edits, monde = null, flux = null }) {
   const cells = [];
   for (const [key, id] of edits) {
     const first = key.indexOf(',');
     const second = key.indexOf(',', first + 1);
     if (second < 0) continue;
     cells.push(+key.slice(0, first), +key.slice(first + 1, second), +key.slice(second + 1), id);
+  }
+  let fluxCells = null;
+  if (flux && typeof flux[Symbol.iterator] === 'function') {
+    const plats = [];
+    for (const [key, niv] of flux) {
+      const first = key.indexOf(',');
+      const second = key.indexOf(',', first + 1);
+      if (second < 0) continue;
+      plats.push(+key.slice(0, first), +key.slice(first + 1, second), +key.slice(second + 1), niv | 0);
+    }
+    if (plats.length > 0) fluxCells = plats;
   }
   return JSON.stringify({
     version: SAVE_VERSION,
@@ -85,6 +104,7 @@ export function encodeSave({ seed, name, player, edits, monde = null }) {
     // Redondant avec edits.length / 4, mais placé dans l'en-tête : lister les mondes
     // enregistrés lit les premières octets du fichier, jamais le diff entier.
     cells: cells.length / 4,
+    ...(fluxCells ? { fluxCells: fluxCells.length / 4 } : {}),
     player: {
       x: round3(player.x),
       y: round3(player.y),
@@ -93,6 +113,7 @@ export function encodeSave({ seed, name, player, edits, monde = null }) {
       pitch: round4(player.pitch),
     },
     edits: cells,
+    ...(fluxCells ? { flux: fluxCells } : {}),
   });
 }
 
@@ -140,6 +161,25 @@ export function decodeSave(text, { isValidBlock, height = 64 } = {}) {
   }
   player.y = Math.min(MAX_Y, Math.max(MIN_Y, player.y));
 
+  // Les distances de l'eau qui coule. Un fichier plus ancien n'en porte pas : la table
+  // reste vide, ce qui est exactement le bon état — tout nage alors comme une source.
+  // Une distance à zéro serait une source déguisée en filet, donc une eau promise à
+  // sécher ; elle est écartée plutôt que corrigée, parce qu'un fichier qui en écrit une
+  // n'est pas un fichier qu'on veut compléter à l'aveugle.
+  const flux = new Map();
+  const fluxCells = Array.isArray(raw.flux) ? raw.flux : [];
+  if (fluxCells.length % 4 === 0) {
+    const limiteFlux = Math.min(fluxCells.length, MAX_FLUX_CELLS * 4);
+    for (let i = 0; i < limiteFlux; i += 4) {
+      const x = fluxCells[i], y = fluxCells[i + 1], z = fluxCells[i + 2], niv = fluxCells[i + 3];
+      if (!Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(z)) continue;
+      if (!Number.isInteger(niv) || niv < 1 || niv > 255) continue;
+      if (Math.abs(x) > MAX_COORD || Math.abs(z) > MAX_COORD) continue;
+      if (y < 0 || y >= Math.max(MIN_Y, height)) continue;
+      flux.set(`${x},${y},${z}`, niv);
+    }
+  }
+
   return {
     seed: Number.isFinite(raw.seed) ? raw.seed : null,
     // Renvoyé tel quel : la fiche appartient au jeu, qui la nettoie avec ses propres
@@ -150,6 +190,7 @@ export function decodeSave(text, { isValidBlock, height = 64 } = {}) {
     savedAt: Number.isFinite(raw.savedAt) ? raw.savedAt : 0,
     player,
     edits,
+    flux,
   };
 }
 

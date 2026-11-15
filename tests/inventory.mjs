@@ -3,7 +3,7 @@
 // Needs the static server running (npm start / node server.js).
 import fs from 'node:fs';
 import path from 'node:path';
-import { openGame, makeReporter } from './browser.mjs';
+import { openGame, waitForBoot, makeReporter } from './browser.mjs';
 
 const URL = process.argv[2] || 'http://localhost:8080';
 const SHOTS = process.env.SHOT_DIR || '.qwen/tmp/mc-shots';
@@ -230,7 +230,7 @@ check('la hotbar est mémorisée dans localStorage',
   JSON.stringify(stored.saved));
 
 await page.reload({ waitUntil: 'load' });
-await page.waitForFunction(() => !!window.__mc, null, { timeout: 30000 });
+await waitForBoot(page);   // même porte qu'au démarrage : le bucle doit être réveillé aussi
 const afterReload = await state();
 check('la sélection survit au rechargement de la page',
   JSON.stringify(afterReload.blocks) === JSON.stringify(stored.saved) &&
@@ -240,7 +240,7 @@ check('la sélection survit au rechargement de la page',
 // corrupted storage must fall back instead of throwing
 await page.evaluate(() => localStorage.setItem('mincraft_hotbar', '{"pas":"du tout"}'));
 await page.reload({ waitUntil: 'load' });
-await page.waitForFunction(() => !!window.__mc, null, { timeout: 30000 });
+await waitForBoot(page);   // même porte qu'au démarrage : le bucle doit être réveillé aussi
 const afterCorrupt = await state();
 check('une sauvegarde corrompue retombe sur la hotbar par défaut',
   JSON.stringify(afterCorrupt.blocks) === JSON.stringify(initialBlocks),
@@ -248,7 +248,7 @@ check('une sauvegarde corrompue retombe sur la hotbar par défaut',
 
 await page.evaluate(() => localStorage.setItem('mincraft_hotbar', JSON.stringify([999, 1, 2, 3, 4, 5, 6, 7, 8])));
 await page.reload({ waitUntil: 'load' });
-await page.waitForFunction(() => !!window.__mc, null, { timeout: 30000 });
+await waitForBoot(page);   // même porte qu'au démarrage : le bucle doit être réveillé aussi
 const afterBogus = await state();
 check('un identifiant de bloc inconnu est remplacé, pas crashé',
   afterBogus.blocks[0] === DIRT && afterBogus.blocks.every((b) => b >= 1),

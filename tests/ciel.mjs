@@ -310,4 +310,32 @@ check('le champ d’éclairage est reproductible à l’identique',
   Array.from(ecl.champLampes([[10, SOL + 1, 10]], 0, 0)).join()
   === Array.from(ecl.champLampes([[10, SOL + 1, 10]], 0, 0)).join());
 
+// La face d'un bloc **donnée au tronçon voisin** ne peut pas lire le champ de ce dernier :
+// elle interroge `puissanceLampe` sur la cellule du voisin. Les deux lectures doivent dire
+// exactement la même chose, sinon chaque couture de tronçon raye le monde d'une bande noire
+// sous chaque lampe (mesuré le 2026-11-15 dans une cave : les deux faces d'un même pilier
+// valaient 0,24 et 0).
+{
+  const ref = ecl.champLampes([LAMPE], 0, 0);
+  const pts = [[3, SOL + 1, 10], [5, SOL + 1, 10], [9, SOL + 1, 10], [2, SOL + 4, 10], [6, SOL + 2, 12]];
+  const ecart = Math.max(...pts.map(([x, y, z]) =>
+    Math.abs(ecl.puissanceLampe([LAMPE], x, y, z) - ref[index(x, y, z)])));
+  check('la lecture hors champ rend le chiffre du champ, cube par cube', ecart < 1e-6,
+    `écart max ${ecart.toExponential(1)} sur ${pts.length} cellules`);
+}
+{
+  // Le tronçon d'est maille à baseX = CS : sa colonne rx = 1 est la cellule x = CS + 1.
+  const lampesProches = [[CS - 2, SOL + 1, 10]];          // lampe collée à la frontière, chez nous
+  const champVoisin = ecl.champLampes(lampesProches, CS, 0);
+  const ecart = Math.max(...[1, 2, 3].map((rx) => Math.abs(
+    ecl.puissanceLampe(lampesProches, CS + rx, SOL + 1, 10) - champVoisin[rx + 10 * CS + (SOL + 1) * CS * CS])));
+  check('de l’autre côté de la frontière, la lecture hors champ suit le champ du voisin',
+    ecart < 1e-6 && champVoisin[1 + 10 * CS + (SOL + 1) * CS * CS] > 0,
+    `écart max ${ecart.toExponential(1)} · cellule frontalière ${champVoisin[1 + 10 * CS + (SOL + 1) * CS * CS].toFixed(2)}`);
+}
+check('et la portée borne aussi la lecture hors champ',
+  ecl.puissanceLampe([[CS - 1, SOL + 1, 10]], CS + eclairage.LAMPE_PORTEE + 2, SOL + 1, 10) === 0
+  && ecl.puissanceLampe([[CS - 1, SOL + 1, 10]], CS + 1, SOL + 1, 10) > 0,
+  `portée ${eclairage.LAMPE_PORTEE} cubes depuis la frontière`);
+
 process.exit(summary());
