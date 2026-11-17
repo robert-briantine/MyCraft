@@ -10,6 +10,8 @@
 // Deux hôtes partagent ce module : le navigateur passe par Express (server.js),
 // la version bureau écrit dans son propre dossier de données via Rust.
 
+import { cadrerRequete, lireReponse, OPS, STATUTS } from './geom-cadre.js';
+
 export const SAVE_VERSION = 1;
 export const AUTOSAVE_INTERVAL_MS = 2000;
 export const DEFAULT_SLOT = 'default';
@@ -212,11 +214,37 @@ export function setNameInSave(text, name) {
 }
 
 /**
+ * Un envoi binaire se paie deux fois plus vite quand on le donne à Chromium sous forme de
+ * Blob que d'un Uint8Array : mesuré le 2026-11-17, 57 ms contre 196 ms pour 15 Mo sur
+ * localhost — le tampon typé passe par une copie de plus avant d'atteindre la socket.
+ */
+const corpsEnvoyable = (octets) => (octets instanceof Uint8Array ? new Blob([octets]) : octets);
+
+/**
  * Choisit le magasin selon l'hôte. `slot` isole plusieurs mondes (et permet aux
  * tests d'écrire leur propre fichier sans toucher à celui du joueur).
  */
 export function createSaveStore({ slot = DEFAULT_SLOT, tauriCore = null } = {}) {
   const safeSlot = normalizeSlot(slot);
+
+  // Voie binaire du magasin de géométrie — voir le commentaire du bloc géométrie plus bas.
+  async function geometrieBrute(op, target, { a = 0, b = 0, corps = null } = {}) {
+    const reponse = await tauriCore.invoke('geom_brut', cadrerRequete({ op, slot: target, a, b, corps }));
+    return lireReponse(reponse);
+  }
+
+  let binaireVerifie = null;
+  async function sonderGeometrieBrute() {
+    if (binaireVerifie !== null) return binaireVerifie;
+    try {
+      const r = await geometrieBrute(OPS.sonder, safeSlot);
+      binaireVerifie = r.statut === STATUTS.ok && r.a === 1;
+    } catch (e) {
+      console.warn('Voie binaire indisponible pour la géométrie, repli base64 :', e.message);
+      binaireVerifie = false;
+    }
+    return binaireVerifie;
+  }
 
   if (tauriCore) {
     return {
@@ -242,6 +270,114 @@ export function createSaveStore({ slot = DEFAULT_SLOT, tauriCore = null } = {}) 
       async list() {
         const metas = await tauriCore.invoke('list_worlds');
         return Array.isArray(metas) ? metas : [];
+      },
+      // ---- cache d'île ----
+      // Le binaire voyage en base64 : les commandes Tauri existantes échangent des
+      // chaînes, et un aller-retour JSON sur 21 Mo d'entiers coûtait bien plus cher.
+      async loadIsland(slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        const texte = await tauriCore.invoke('load_island', { slot: target });
+        if (typeof texte !== 'string' || texte.length === 0) return null;
+        return base64VersOctets(texte);
+      },
+      async saveIsland(octets, slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        const bytes = await tauriCore.invoke('save_island', { slot: target, payload: octetsVersBase64(octets) });
+        return typeof bytes === 'number' ? bytes : octets.length;
+      },
+      async clearIsland(slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        return tauriCore.invoke('clear_island', { slot: target });
+      },
+      async islandMeta(slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        const meta = await tauriCore.invoke('island_meta', { slot: target });
+        return meta && typeof meta === 'object' ? meta : null;
+      },
+      // ---- géométrie prête pour la carte -------------------------------------
+      // Deux transports, départagés une seule fois par session :
+      //  · **binaire** — une trame MCGF porte les paramètres *devant* les octets, et le
+      //    payload est le tampon lui-même. C'est la seule façon d'obtenir un corps brut de
+      //    Tauri (`process-ipc-message-fn.js` ne regarde que le payload) ; elle rend
+      //    possible l'ajout partiel, donc de ne plus payer la taille du fichier à chaque lot.
+      //  · **base64** — le filet d'origine, conservé parce que le repli `postMessage` de
+      //    Tauri (et Android) ne sait pas envoyer de brut : le sondage tranche, pas une
+      //    supposition sur la plateforme.
+      // Le format est partagé avec Rust dans `public/js/geom-cadre.js`.
+      async loadGeometry(slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        if (await sonderGeometrieBrute()) {
+          try {
+            const r = await geometrieBrute(OPS.lire, target);
+            return r.corps.length ? r.corps : null;   // `a === 0` : pas encore de cache
+          } catch (e) {
+            if (e.conflit) return null;
+            throw e;
+          }
+        }
+        const texte = await tauriCore.invoke('load_geometry', { slot: target });
+        if (typeof texte !== 'string' || texte.length === 0) return null;
+        return base64VersOctets(texte);
+      },
+      async saveGeometry(octets, slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        if (await sonderGeometrieBrute()) {
+          // La réécriture complète reste le filet du jeu (cache disparu, désaccord) : elle
+          // doit au moins voyager en octets, sinon elle coûte 433 ms de fil principal à
+          // 100 Mo — mesuré le 2026-11-17, c'était exactement la saccade du joueur.
+          const r = await geometrieBrute(OPS.ecrire, target, { corps: octets });
+          return r.a;
+        }
+        const bytes = await tauriCore.invoke('save_geometry', { slot: target, payload: octetsVersBase64(octets) });
+        return typeof bytes === 'number' ? bytes : octets.length;
+      },
+      async clearGeometry(slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        return tauriCore.invoke('clear_geometry', { slot: target });
+      },
+      // Ajouter au lieu de réécrire : la voie qui manque au bureau depuis le début. Un
+      // désaccord sur l'état du disque se rend comme sur le web — `{ conflict }`, pas
+      // d'exception — pour que le jeu reprenne sa voie complète sans interrompre la
+      // publication. Sans le binaire, on retrouve le comportement d'avant : refus poli.
+      async appendGeometry(octets, base, slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        if (!(await sonderGeometrieBrute())) return { conflict: true, status: 0 };
+        try {
+          const r = await geometrieBrute(OPS.ajouter, target, { a: base, corps: octets });
+          return { success: true, bytes: r.a };
+        } catch (e) {
+          if (e.conflit) return { conflict: true, status: e.motif || 'conflit' };
+          throw e;
+        }
+      },
+      async putGeometryHead(octets, slot = safeSlot, offset = 0) {
+        const target = normalizeSlot(slot);
+        if (!(await sonderGeometrieBrute())) return { conflict: true, status: 0 };
+        try {
+          await geometrieBrute(OPS.poserTete, target, { a: offset, corps: octets });
+          return { success: true };
+        } catch (e) {
+          if (e.conflit) return { conflict: true, status: e.motif || 'conflit' };
+          throw e;
+        }
+      },
+      // Le magasin a ses octets sous la main : il copie le corps, le jeu n'envoie que sa
+      // table. Impossible en base64 — il faudrait relire, encoder et renvoyer le fichier.
+      async migrateGeometry(region, { attendu, debut }, slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        if (!(await sonderGeometrieBrute())) return { conflict: true, status: 0 };
+        try {
+          const r = await geometrieBrute(OPS.migrer, target, { a: attendu, b: debut, corps: region });
+          return { success: true, bytes: r.a };
+        } catch (e) {
+          if (e.conflit) return { conflict: true, status: e.motif || 'conflit' };
+          throw e;
+        }
+      },
+      async geometryMeta(slot = safeSlot) {
+        const target = normalizeSlot(slot);
+        const meta = await tauriCore.invoke('geometry_meta', { slot: target });
+        return meta && typeof meta === 'object' ? meta : null;
       },
     };
   }
@@ -287,7 +423,154 @@ export function createSaveStore({ slot = DEFAULT_SLOT, tauriCore = null } = {}) 
       const metas = await res.json();
       return Array.isArray(metas) ? metas : [];
     },
+    // ---- cache d'île -------------------------------------------------------
+    // `onProgres` reçoit les octets déjà reçus et le total annoncé : la lecture de
+    // vingt et un méga-octets se juge à l'œil, pas à une barre qui reste à zéro.
+    async loadIsland(slot = safeSlot, onProgres = null) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(`/world-island?slot=${encodeURIComponent(target)}`, { cache: 'no-store' });
+      if (res.status === 204) return null;
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const annonce = Number(res.headers.get('Content-Length')) || 0;
+      if (!res.body || typeof res.body.getReader !== 'function' || !onProgres) {
+        const b = await res.arrayBuffer();
+        if (onProgres) onProgres(b.byteLength, annonce || b.byteLength);
+        return new Uint8Array(b);
+      }
+      const lecteur = res.body.getReader();
+      const morceaux = [];
+      let recus = 0;
+      for (;;) {
+        const { done, value } = await lecteur.read();
+        if (done) break;
+        morceaux.push(value);
+        recus += value.length;
+        onProgres(recus, annonce || recus);
+      }
+      const tous = new Uint8Array(recus);
+      let o = 0;
+      for (const m of morceaux) { tous.set(m, o); o += m.length; }
+      return tous;
+    },
+    async saveIsland(octets, slot = safeSlot) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(`/world-island?slot=${encodeURIComponent(target)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: octets,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return octets.length;
+    },
+    async clearIsland(slot = safeSlot) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(`/world-island?slot=${encodeURIComponent(target)}`, { method: 'DELETE' });
+      if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
+      return res.status !== 404;
+    },
+    async islandMeta(slot = safeSlot) {
+      const mondes = await this.list();
+      const cible = mondes.find((m) => m.slot === normalizeSlot(slot));
+      return cible && cible.ile ? cible.ile : null;
+    },
+    // ---- géométrie prête pour la carte ---------------------------------------
+    // Pas de progression ici : contrairement à l'île (21 Mo d'un coup au démarrage), ce
+    // fichier se lit tronçon par tronçon pendant que le joueur joue déjà.
+    async loadGeometry(slot = safeSlot) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(`/world-geometry?slot=${encodeURIComponent(target)}`, { cache: 'no-store' });
+      if (res.status === 204) return null;
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return new Uint8Array(await res.arrayBuffer());
+    },
+    async saveGeometry(octets, slot = safeSlot) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(`/world-geometry?slot=${encodeURIComponent(target)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: corpsEnvoyable(octets),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return octets.length;
+    },
+    // ---- publication par ajout (voir `EcrivainGeom.publierMorcele`) -------------------
+    // Le fichier déjà sur le serveur n'est plus réécrit : on lui colle des blocs à la fin,
+    // puis on repose l'en-tête — même longueur, donc écrit par-dessus l'ancien. Un 409/413
+    // n'est pas une panne mais un désaccord sur l'état du disque : le jeu bascule alors sur
+    // la réécriture complète, d'où le `{ conflict }` plutôt que l'exception.
+    async appendGeometry(octets, base, slot = safeSlot) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(`/world-geometry/append?slot=${encodeURIComponent(target)}&base=${base}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: corpsEnvoyable(octets),
+      });
+      if (res.status === 409 || res.status === 413) return { conflict: true, status: res.status };
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json().catch(() => ({}));
+      return { success: true, bytes: json.bytes };
+    },
+    async putGeometryHead(octets, slot = safeSlot, offset = 0) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(`/world-geometry/tete?slot=${encodeURIComponent(target)}&offset=${offset}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: corpsEnvoyable(octets),
+      });
+      if (res.status === 400 || res.status === 409) return { conflict: true, status: res.status };
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return { success: true };
+    },
+    // Rattraper un ancien gabarit d'en-tête sans renvoyer le corps : le serveur copie ses
+    // propres octets, on ne lui envoie que la table. Un `PUT` de 618 Mo est impossible depuis
+    // le navigateur (`ERR_BLOB_OUT_OF_MEMORY`, onglet écrasé avec la vue nue) — mesuré le
+    // 2026-11-17 sur le cache du joueur.
+    async migrateGeometry(region, { attendu, debut }, slot = safeSlot) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(
+        `/world-geometry/migrer?slot=${encodeURIComponent(target)}&attendu=${attendu}&debut=${debut}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: corpsEnvoyable(region),
+        });
+      if (res.status === 400 || res.status === 409 || res.status === 413) return { conflict: true, status: res.status };
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json().catch(() => ({}));
+      return { success: true, bytes: json.bytes };
+    },
+    async clearGeometry(slot = safeSlot) {
+      const target = normalizeSlot(slot);
+      const res = await fetch(`/world-geometry?slot=${encodeURIComponent(target)}`, { method: 'DELETE' });
+      if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
+      return res.status !== 404;
+    },
+    async geometryMeta(slot = safeSlot) {
+      const mondes = await this.list();
+      const cible = mondes.find((m) => m.slot === normalizeSlot(slot));
+      return cible && cible.geom ? cible.geom : null;
+    },
   };
+}
+
+// Base64 sans dépendance ni boucle par caractère : `btoa`/`atob` existent dans le
+// navigateur comme dans Node, mais sur des chaînes de 28 Mo il faut découper pour ne
+// pas dépasser les limites d'application de `String.fromCharCode`.
+const PAS_B64 = 0x8000;
+
+function octetsVersBase64(octets) {
+  if (!(octets instanceof Uint8Array)) throw new Error('attendu des octets');
+  let texte = '';
+  for (let i = 0; i < octets.length; i += PAS_B64) {
+    texte += String.fromCharCode.apply(null, octets.subarray(i, i + PAS_B64));
+  }
+  return btoa(texte);
+}
+
+function base64VersOctets(texte) {
+  const bin = atob(texte);
+  const octets = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) octets[i] = bin.charCodeAt(i);
+  return octets;
 }
 
 function round3(v) {

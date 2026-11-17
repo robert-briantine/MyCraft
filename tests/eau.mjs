@@ -553,6 +553,20 @@ let cuveB = null;
 
   await page.reload({ waitUntil: 'load' });
   await waitForBoot(page);
+  // Le monde doit avoir RECHARGÉ ses distances avant qu'on juge quoi que ce soit. La table
+  // des niveaux est globale et répond dès la première frame, mais les éditions — qui sont
+  // le seul support de l'eau de passage — n'arrivent qu'avec `applyEdits`. Pris trop tôt,
+  // le premier cliché de la section suivante ne voyait pas la cuve : les deux cadres se
+  // ressemblaient à 0,0 point et le contrôle mesurait la chance, pas la nappe. On attend
+  // la fenêtre ; un vrai défaut de persistance reste jugé par le contrôle d'en dessous,
+  // qui garde son message « N cellules avant, 0 après ».
+  try {
+    await page.waitForFunction(([x0, z0]) => window.__mc.eauCellules()
+      .some(([x, , zz]) => Math.abs(x - x0) <= 24 && Math.abs(zz - z0) <= 2),
+    [cuveB.x0, cuveB.z0], { timeout: 60000 });
+  } catch {
+    // Volontairement silencieux : le contrôle de persistance qui suit porte le verdict.
+  }
   const apres = await page.evaluate(([x0, z0]) => window.__mc.eauCellules()
     .filter(([x, , zz]) => Math.abs(x - x0) <= 24 && Math.abs(zz - z0) <= 2)
     .map(([x, yy, zz, n]) => `${x},${yy},${zz},${n}`), [cuveB.x0, cuveB.z0]);
@@ -573,11 +587,24 @@ let cuveB = null;
   const compter = ([x0, z0, y]) => {
     const mc = window.__mc;
     const CS = 16;
+    // Les tronçons de la cuve doivent être là AVANT de compter : exiger « zéro génération
+    // » du flot laissait leur présence au bon vouloir du bucle ambiant, et `markChunkDirty`
+    // ne marque rien sur un tronçon absent. Mesuré préexistant (identique sur le game.js de
+    // HEAD et après le budget de rétention) : 0,0 point de gain quand un tronçon manquait,
+    // 25,3 quand ils sont tous là. La région est donc chargée pareillement dans les deux
+    // clichés, puis seulement repeinte — ce que le contrôle juge, c'est l'eau, pas la chance.
+    mc.chargerRegion(x0 - 2, z0 - 2, x0 + 20, z0 + 2);
     for (let cx = Math.floor((x0 - 2) / CS); cx <= Math.floor((x0 + 20) / CS); cx++) {
       for (let cz = Math.floor((z0 - 2) / CS); cz <= Math.floor((z0 + 2) / CS); cz++) mc.world.markChunkDirty(cx, cz);
     }
     mc.camera.position.set(x0 + 3.5, y + 6, z0 + 0.5);
     mc.camera.rotation.set(-Math.PI / 2.3, 0, 0);
+    // L'heure est figée comme dans `nuit.mjs`, et pour la même raison : ce contrôle compare
+    // deux clichés à l'aune des pixels bleutés, donc il juge aussi le soleil. Mesuré
+    // 2026-11-16 sur le même monde, le même état (7 cellules, source posée, mailleurs
+    // accrochés) : +10,3 points de gain à midi, **-0,1 point à minuit**. Sans ce réglage,
+    // la suite tombait quand son temps de wall-clock dérivait vers le soir.
+    mc.reglerHeure(0.5);
     mc.world.updateChunks(x0 + 3, z0, 0, 8000);   // draine la file de remaillage, sans rien générer
     mc.renderer.render(mc.scene, mc.camera);
     const gl = mc.renderer.getContext();
@@ -585,8 +612,34 @@ let cuveB = null;
     const px = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
     let bleus = 0;
-    for (let i = 0; i < px.length; i += 4) if (px[i + 2] > px[i] + 24 && px[i + 2] > 60) bleus++;
-    return { bleus, total: w * h };
+    let empreinte = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i + 2] > px[i] + 24 && px[i + 2] > 60) bleus++;
+      // Un pixel sur seize : à un sur mille (garde `4095`) l'empreinte est restée identique
+      // entre deux clichés dont le bassin avait pourtant disparu (41,4 % contre 25,6 % de
+      // bleus) — elle ne prouvait plus rien et déclenchait des reprises pour rien.
+      if ((i & 63) === 0) empreinte = (empreinte * 31 + px[i] + 3 * px[i + 1] + 7 * px[i + 2]) >>> 0;
+    }
+    // Diagnostic du contrôle : quand il tombe, il doit dire ce que le cliché contenait —
+    // sans ça on cherche au hasard (deux pannes différentes ont été attribuées à tort).
+    let resident = 0, absents = 0, dessines = 0, octets = 0;
+    for (let cx = Math.floor((x0 - 2) / CS); cx <= Math.floor((x0 + 20) / CS); cx++) {
+      for (let cz = Math.floor((z0 - 2) / CS); cz <= Math.floor((z0 + 2) / CS); cz++) {
+        const chunk = mc.world.chunks.get(`${cx},${cz}`);
+        if (!chunk) { absents++; continue; }
+        resident++;
+        octets += chunk.octets;
+        dessines += chunk.meshes.filter((m) => m.parent === mc.scene).length;
+      }
+    }
+    return {
+      bleus, total: w * h, empreinte,
+      eau: mc.eauCellules().filter(([x, , zz]) => Math.abs(x - x0) <= 24 && Math.abs(zz - z0) <= 2).length,
+      source: mc.world.getBlock(x0, y, z0),
+      resident, absents, dessines, octets,
+      camSolide: mc.world.isSolid(Math.round(x0 + 3.5), Math.round(y + 6), Math.round(z0 + 0.5)),
+      heure: +mc.horloge().heure().toFixed(2),
+    };
   };
 
   const avec = await page.evaluate(compter, [cuveB.x0, cuveB.z0, cuveB.y]);
@@ -596,12 +649,34 @@ let cuveB = null;
     mc.eauReveiller(x0, y, z0);
     mc.eauVagues(60);
   }, [cuveB.x0, cuveB.z0, cuveB.y]);
-  const vide = await page.evaluate(compter, [cuveB.x0, cuveB.z0, cuveB.y]);
+  let vide = await page.evaluate(compter, [cuveB.x0, cuveB.z0, cuveB.y]);
+  // Deux clichés au bit près identiques veulent dire que le second n'a rien vu passer :
+  // sous la batterie, la coupe était comptée avant que le tronçon ne soit repeint (le
+  // remaillage d'un tronçon édité passe par la boucle d'animation, pas par `updateChunks`).
+  // Mesuré 2026-11-16 : seule, la suite rend 41,4 % contre 36,0 % ; en batterie, les deux
+  // bras donnaient la même image. On laisse donc tourner de vraies images et on recompte
+  // une fois. Si l'image ne bouge toujours pas, c'est le monde qui ne bouge pas, et le
+  // contrôle garde le droit de tomber.
+  vide.reprise = false;
+  if (vide.empreinte === avec.empreinte) {
+    vide.reprise = true;
+    await new Promise((r) => setTimeout(r, 400));
+    await page.evaluate(async () => {
+      for (let i = 0; i < 10; i++) await new Promise((r) => requestAnimationFrame(() => r()));
+    });
+    vide = await page.evaluate(compter, [cuveB.x0, cuveB.z0, cuveB.y]);
+    vide.reprise = true;
+  }
 
   const gain = (avec.bleus - vide.bleus) / avec.total;
   check('la nappe rendue se voit à l\'écran', gain > 0.01,
     `${(100 * avec.bleus / avec.total).toFixed(1)} % de pixels bleutés avec l'eau, `
-    + `${(100 * vide.bleus / vide.total).toFixed(1)} % sans (${(100 * gain).toFixed(1)} points de gain)`);
+    + `${(100 * vide.bleus / vide.total).toFixed(1)} % sans (${(100 * gain).toFixed(1)} points de gain) · `
+    + `avec[eau=${avec.eau},src=${avec.source},res=${avec.resident},abs=${avec.absents},dess=${avec.dessines},`
+    + `${(avec.octets / 1048576).toFixed(1)} Mo,camSolide=${avec.camSolide},h=${avec.heure}] `
+    + `vide[eau=${vide.eau},src=${vide.source},res=${vide.resident},abs=${vide.absents},dess=${vide.dessines},`
+    + `${(vide.octets / 1048576).toFixed(1)} Mo,h=${vide.heure}]`
+    + `reprise=${vide.reprise ? 'oui' : 'non'} · empreintes ${avec.empreinte}/${vide.empreinte}`);
 }
 
 // Le /favicon.ico que le navigateur réclame seul tombe en 404 sur ce serveur : request

@@ -33,7 +33,16 @@ fn main() {
             world::save_world,
             world::load_world,
             world::clear_world,
-            world::list_worlds
+            world::list_worlds,
+            world::save_island,
+            world::load_island,
+            world::clear_island,
+            world::island_meta,
+            world::save_geometry,
+            world::load_geometry,
+            world::clear_geometry,
+            world::geometry_meta,
+            world::brut::geom_brut
         ])
         .run(tauri::generate_context!())
         .expect("Impossible de démarrer MyCraft");

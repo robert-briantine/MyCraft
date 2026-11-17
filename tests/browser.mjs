@@ -22,14 +22,44 @@ function installCleanup() {
 // The world lives on disk now, so two suites sharing one save would inherit each
 // other's edits and player position. Unless the caller picked a slot itself
 // (persistence.mjs does), every page load gets a throwaway one, removed on exit.
+//
+// `ile=ignorer` is added for the same reason: without it every throwaway world would
+// bake its island cache (nine minutes of terrain generation at the default radius)
+// before the start button unlocks. Suites that judge the loading path itself pass
+// `?ile=auto` in their own URL and keep the real behaviour.
 export function isolatedUrl(url) {
   const target = new URL(url);
-  if (target.searchParams.has('world')) return target.toString();
-  const slot = `e2e-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  target.searchParams.set('world', slot);
-  installCleanup();
-  ephemeralSaves.add(path.join(SAVES_DIR, `${slot}.json`));
-  return target.toString();
+  let touched = false;
+  if (!target.searchParams.has('world')) {
+    const slot = `e2e-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    target.searchParams.set('world', slot);
+    installCleanup();
+    ephemeralSaves.add(path.join(SAVES_DIR, `${slot}.json`));
+    ephemeralSaves.add(path.join(SAVES_DIR, `${slot}.ile.bin`));
+    ephemeralSaves.add(path.join(SAVES_DIR, `${slot}.geom.bin`));
+    touched = true;
+  }
+  if (!target.searchParams.has('ile')) {
+    target.searchParams.set('ile', 'ignorer');
+    touched = true;
+  }
+  // Same reasoning for the mesh cache: a throwaway world has nothing to reuse, and
+  // letting every suite bake ~2 MB of triangles it will never read back only slows the
+  // suite down and leaves files behind. Suites that judge the geometry cache itself pass
+  // `?geom=auto` (or any other value) in their own URL and keep the real behaviour.
+  if (!target.searchParams.has('geom')) {
+    target.searchParams.set('geom', 'ignorer');
+    touched = true;
+  }
+  // The background geometry oven meshes the whole island behind the player's back.
+  // That is what the player asked for, but it moves every meshing counter a suite
+  // reads, so suites leave it off unless they judge the oven itself — same deal as
+  // `ile` and `geom` above.
+  if (!target.searchParams.has('precuire')) {
+    target.searchParams.set('precuire', 'ignorer');
+    touched = true;
+  }
+  return touched ? target.toString() : url;
 }
 
 // Prefer a Chromium already on this machine (Playwright's download cache first)

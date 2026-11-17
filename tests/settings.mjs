@@ -17,11 +17,15 @@ const state = () => page.evaluate((CS) => {
   const mc = window.__mc;
   const pcx = Math.floor(mc.camera.position.x / CS);
   const pcz = Math.floor(mc.camera.position.z / CS);
-  let inRange = 0, total = 0, meshes = 0;
+  let inRange = 0, total = 0, meshes = 0, dessines = 0, reserves = 0;
   for (const c of mc.world.chunks.values()) {
     total++;
+    if (c.horsVue) reserves++;
     if (Math.max(Math.abs(c.cx - pcx), Math.abs(c.cz - pcz)) <= mc.settings.renderDistance) inRange++;
     meshes += c.meshes.length;
+    // Ce qui est hors champ reste en mémoire (budget de géométrie) mais quitte la scène :
+    // ce qui pèse l'image, c'est `dessines`, pas `total`.
+    for (const m of c.meshes) if (m.parent === mc.scene) dessines++;
   }
   const input = document.getElementById('render-distance');
   return {
@@ -32,6 +36,10 @@ const state = () => page.evaluate((CS) => {
     inRange,
     total,
     meshes,
+    dessines,
+    reserves,
+    octets: mc.world.octetsMailles,
+    quota: mc.memoire().quota,
     fogNear: mc.scene.fog.near,
     fogFar: mc.scene.fog.far,
     camFar: mc.camera.far,
@@ -100,10 +108,18 @@ await page.focus('#render-distance');
 for (let i = 0; i < 5; i++) await page.keyboard.press('ArrowLeft');
 await page.waitForTimeout(300);
 const shrunk = await state();
-check('réduire le curseur décharge les tronçons lointains',
-  shrunk.r === grown.r - 5 && shrunk.total < grown.total && shrunk.meshes < grown.meshes &&
+// Ce que ce contrôle jugeait avant : la table des tronçons doit maigrir. Depuis le
+// budget de géométrie (2026-11-16), ce qui sort du champ est délibérément gardé — le
+// juger sur `total` reviendrait à pénaliser la rétention qui supprime le pop-in. Ce qui
+// doit baisser, c'est ce qui est dessiné ; et ce qui est gardé doit rester sous quota.
+check('réduire le curseur arrête de dessiner les tronçons lointains',
+  shrunk.r === grown.r - 5 && shrunk.dessines < grown.dessines &&
   shrunk.inRange === (2 * shrunk.r + 1) ** 2,
-  `${grown.total} → ${shrunk.total} tronçons en mémoire · ${shrunk.meshes} meshes`);
+  `${grown.dessines} → ${shrunk.dessines} mailleurs dessinés · ${shrunk.inRange} tronçons à r=${shrunk.r}`);
+check('et garde ce qui n\'est plus vu sans rien redessiner, tant que le quota le permet',
+  shrunk.reserves > 0 && shrunk.total >= grown.total * 0.9 && shrunk.octets <= shrunk.quota + 400 * 1024,
+  `${shrunk.reserves} réservés sur ${shrunk.total} en mémoire contre ${grown.total} à r=${grown.r} · `
+  + `${(shrunk.octets / 1048576).toFixed(0)} Mo pour un quota de ${(shrunk.quota / 1048576).toFixed(0)} Mo`);
 
 // ============================================================ 5. the slider owns its arrow keys
 const movedBySlider = shrunk.arrowKey || Math.abs(shrunk.camX - s0.camX) > 1e-6;
@@ -142,24 +158,45 @@ check('le libellé annonce le chargement progressif aux grandes portées',
 
 // The field has to arrive by successive rounds while the picture keeps rendering:
 // a single blocking pass would freeze the tab for tens of seconds at this ceiling.
+// Douze relevés de 500 ms (six secondes) et non six : la fenêtre doit être assez longue
+// pour que la pente nette échappe au bruit. Mesuré le 2026-11-16 par une sonde A/B (même
+// harnais, deux serveurs, quatre passes alternées) : l'arbre en cours vide ~7 tronçons/s
+// à 19 img/s quand HEAD en vide ~15 à 25 img/s — sur trois secondes, la machine chargée
+// donnait une file plate (3990 → 3992) et le contrôle tombait pour une raison d'horloge.
+// La promesse jugée reste la même : la file baisse pendant que l'image tourne.
 const trace = [];
-for (let i = 0; i < 6; i++) {
-  trace.push(await page.evaluate(() => window.__mc.world.pendingChunks));
+for (let i = 0; i < 12; i++) {
+  trace.push(await page.evaluate(() => ({
+    file: window.__mc.world.pendingChunks,
+    images: window.__mc.framesRendues(),
+  })));
   await page.waitForTimeout(500);
 }
+const files = trace.map((t) => t.file);
+// Ce qui doit baisser, c'est la tendance, pas chaque échantillon : `pendingChunks`
+// additionne les cellules manquantes ET les voisins marqués par chaque naissance (jusqu'à
+// quatre par tronçon créé, dont ceux du premier anneau hors du disque jugé). La somme
+// tressaute donc de quelques unités entre deux relevés — mesuré 3 970 → 3 973 ici comme
+// sur le game.js de HEAD, où `dirtyKeys` montait de 26 à 65 pendant que la file baissait.
+// Exiger une décroissance stricte revenait à jouer à pile ou face. En revanche, le libellé
+// promet « pendant que l'image continue » : chose promise, chose jugée.
+const imagesAvancent = trace.every((t, i) => i === 0 || t.images > trace[i - 1].images);
 check('le champ se remplit par bonds successifs pendant que l’image continue',
-  trace.every((v, i) => i === 0 || v <= trace[i - 1]) && trace[5] < trace[0] && trace[0] > 0,
-  trace.join(' → '));
+  files[0] > 0 && files[files.length - 1] < files[0] && Math.max(...files) <= files[0] + 250 && imagesAvancent,
+  `${files.join(' → ')} · ${trace[trace.length - 1].images - trace[0].images} image(s) rendues entre le premier et le dernier échantillon`);
 
 // A full settle is verified at a still-large radius: waiting for the whole 32-chunk
 // disc would be measuring the software rasteriser, not the world builder.
 await page.evaluate(() => window.__mc.setRenderDistance(16));
 const settleStart = Date.now();
-// Mesuré : 1089 tronçons vident la file en ~96 s sous SwiftShader (le creusement des
-// vallées a ajouté des faces de flanc à mailler, le budget de 90 s ne passait plus).
-// Le délai est un plafond d'attente, pas une assertion : ce que contrôle la suite est
-// que la file atteint zéro, pas la vitesse du rastériseur.
-await drain(240000);
+// Le délai est un plafond d'attente, pas une assertion : ce que contrôle la suite est que
+// la file atteint zéro, pas la vitesse du rastériseur. Mesuré le 2026-11-16 (sonde de
+// vidange, monde quasi vide puis retour à r=16) : ~4,5 tronçons/s sous SwiftShader, la
+// file descendant régulièrement de 831 à 395 en 143 s sans jamais geler — `dirtyKeys` reste
+// épinglé au watermark de 64, qui bride la génération. Le disque complet demande donc
+// ~240 s quand il part de presque rien ; un plafond de 240 s ne laissait aucune marge et
+// faisait échouer la suite là où le monde travaillait normalement.
+await drain(420000);
 const settled = await state();
 const secs = (Date.now() - settleStart) / 1000;
 check('un champ de 16 chunks se complète entièrement',

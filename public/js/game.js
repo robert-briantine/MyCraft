@@ -12,6 +12,8 @@ import {
 } from './world-config.js';
 import { createMondePreview } from './world-preview.js';
 import { creerEclairage, LAMPE_PORTEE, PLANCHER_NUIT, PLANCHER_PIECE, COUVERTE_MINCE, SEUIL_MUR, PORTEE_CIEL } from './eclairage.js';
+import { CacheIle, EcrivainIle, bornesIle, preparerTranches, codecParDefaut, TRANCHES_MAX } from './ile.js';
+import { CacheGeom, EcrivainGeom, serialiserMaillages, lireEnTete, dequantifierPositions, hachage as hachageGeom, hachageOctets } from './geom-disque.js';
 import { creerEau, EAU } from './eau.js';
 import {
   etatDuCiel, creerHorloge, heureAffichee, bornerDuree,
@@ -110,8 +112,34 @@ const MIN_RENDER_DISTANCE = 2;
 const MAX_RENDER_DISTANCE = 32;
 const DEFAULT_RENDER_DISTANCE = 4;
 const CHUNK_STREAM_BUDGET = 16;   // cells generated synchronously when the slider moves
+// Le même geste borné en **temps**, pas seulement en nombre de cellules : mesuré
+// 2026-11-16, seize cellules à la portée maximale coûtent 250-290 ms sous le logiciel de
+// rendu des tests (et davantage quand d'autres onglets tournent), ce qui veut dire que la
+// promesse du commentaire ci-dessous — « un saut à 32 ne doit pas verrouiller l'onglet » —
+// n'était tenue que par chance. Une cellule coûte ici ce qu'elle coûte ; seule la durée de
+// la tranche est garantie.
+const CHUNK_JUMP_MS = 24;         // wall-clock ceiling for that same synchronous slice
 const WORLD_BOOT_BUDGET = 169;    // 13×13 cells built synchronously under the player
 const CHUNK_FRAME_MS = 10;        // wall-clock ceiling for world building per frame
+// Le mailleur ne prend plus une tranche fixe : il prend **la marge laissée par l'image**.
+// Mesuré le 2026-11-17 sur la traversée froide/chaude, le p95 du temps d'image atteint
+// 93 ms pendant qu'on avance ; les 10 ms fixes s'ajoutaient alors à une image déjà
+// saturée et fabriquaient leur propre sacade. À 60 images/s la formule rend exactement
+// les 10 ms d'avant, donc le comportement connu du jeu est gardé tel quel.
+const CIBLE_IMAGE_MS = 16.7;      // une image à 60 Hz : en dessous, on peut oser mailler
+const BUDGET_MAILLE_MIN_MS = 2;   // jamais zéro : si l'image est chère pour une autre raison
+                                  // (remplissage, autre onglet), couper le flot n'y changerait
+                                  // rien et le monde ne se chargerait plus du tout
+const BUDGET_MAILLE_MAX_MS = 20;  // deux fois l'ancienne tranche, pour rattraper le pop-in
+                                  // plus vite tant que l'image a de la place
+// Netteté : le rendu se paie en pixels, et c'est le seul plafond que le joueur ne pouvait
+// pas toucher. Sans réglage le jeu prenait `min(devicePixelRatio, 2)`, ce qui sur un Windows
+// à 150 % rend 2,25 fois plus de pixels qu'à 1× — mesuré +37 % d'images par seconde rien
+// qu'en redescendant de ×2 à ×1 (12,1 → 16,6 i/s sous rasteriseur logiciel). « native » est
+// très exactement l'ancien comportement, donc personne ne perd son image en mettant à jour.
+const NETTETES = ['native', '1', '0.75', '0.5'];
+const NETTETE_DEFAUT = 'native';
+const PLAFOND_PIXELS_PAR_IMAGE = 2;   // jamais au-delà de ce que le jeu faisait avant ce réglage
 const CHUNK_MESH_WATERMARK = 64;  // stop generating when this many chunks await meshing
 // Part du tri offerte à la direction du regard : un tronçon droit devant est compté
 // comme s'il était un peu plus proche. Sans ce biais, le joueur qui vole au planeur
@@ -122,6 +150,118 @@ const CHUNK_MESH_WATERMARK = 64;  // stop generating when this many chunks await
 // 5,5 i/s : trois fois plus cher pour un gain marginal. Ce qui ne se reverra jamais
 // (derrière le joueur) ne mange donc plus le créneau d'image.
 const BIAIS_DEVANT = 0.3;
+// ---- budget mémoire des mailleurs ----
+// Un tronçon maillé coûte 330 Ko de tampons sommets (mesuré le 2026-11-16 : cinq
+// attributs float32 pour ~6 600 sommets, index uint16 compris — 51 o/sommet). Les
+// jeter dès qu'ils sortent du champ se paie cher : mesuré le même jour, faire retomber
+// la profondeur de 12 à 2 puis la remonter coûte **2 129 reconstructions de mailleurs**
+// pour un rendu strictement identique — 5 à 7 secondes de calcul et le pop-in que le
+// joueur voit en faisant demi-tour. On garde donc ce qui a déjà été maillé tant que la
+// note totale tient sous un plafond, et on n'évince que ce qu'il faut, du plus ancien
+// hors de vue.
+//
+// Le plafond se lit sur le navigateur quand il le dit (`performance.memory`) ; sinon on
+// reste au défaut ci-dessous plutôt que de deviner avec `navigator.deviceMemory`, qui
+// annonce la barrette du poste (32 Go mesurés ici) et non ce qu'un onglet peut tenir.
+// Deux gouvernails, dans cet ordre : la fraction du tas **autorisé**, puis le plafond.
+// Mesuré le 2026-11-16 sur ce poste : `jsHeapSizeLimit` = 4 192 Mo pour l'onglet (la RAM
+// système ne change rien à ce chiffre, c'est V8 qui le borne), 130 Mo usés au démarrage.
+// À 0,35 de la limite cela donne 1 467 Mo, sous le plafond — donc c'est bien la fraction
+// qui gouverne sur un gros onglet, et le plafond qui sert de garde-fou sur les petits.
+// Note : la note ne compte que les tampons sommets ; objets Three et copie GPU ajoutent
+// 10 à 20 % en pratique, d'où la marge laissée sous la moitié du tas.
+const QUOTA_GEOMETRIE_DEFAUT = 384 * 1024 * 1024;   // ~1 160 tronçons gardés à chaud
+const QUOTA_GEOMETRIE_PLANCHER = 96 * 1024 * 1024;  // sous ce seuil, autant évincer sec
+const QUOTA_GEOMETRIE_PLAFOND = 1536 * 1024 * 1024; // ~4 360 tronçons : le disque entier à r=32
+const QUOTA_GEOMETRIE_FRACTION = 0.35;              // part du tas *autorisé* laissée aux géométries
+// Garde-fou d'urgence : au-delà de cette part du tas occupée, on ne discute plus l'éviction.
+const PRESSION_TAS = 0.75;
+const QUOTA_REFRESH_MS = 1000;                      // `performance.memory` n'a pas besoin de l'être plus
+// Au-delà de `radius + GARDE_HORS_VUE`, on jette quoi qu'en dise le budget : la table
+// des tronçons doit rester bornée quand le joueur court dans une seule direction.
+const GARDE_HORS_VUE = 8;
+// Le nombre de couronnes qu'on continue de tenir à la scène au-delà de la portée réglée.
+// Une seule constante, partagée avec le four de fond (`cuireIleGeometrie`) et son lâcher
+// (`_lacherTronconCuit`) : mesuré le 2026-11-16 dans le monde du joueur à profondeur 8,
+// le rangeur rattachait jusqu'à `radius + 2` pendant que le four ne se défendait que
+// jusqu'à `radius + 1`. La couronne du milieu était donc peinte par l'un et taillée hors
+// scène par l'autre — 36 repeintures à chaque demi-tour sur place, toutes à `dist ==
+// radius + 2`, dont 11 derrière un tronçon que le four venait de mailler. Ce que la
+// caméra voit, le four n'y touche pas ; c'est la même frontière, pas deux voisines.
+const MARGE_CHAMP_RENDU = 2;
+
+// ---- géométrie déjà prête pour la carte, sur le disque ----
+// Un tronçon repeint coûte 6,94 ms au mailleur ; reposer ses tampons depuis un fichier
+// n'en coûte que 0,29 (mesuré le 2026-11-16, 40 tronçons, 329 972 sommets). Le cache
+// d'île économise la génération du terrain, celui-ci économise le maillage — et il ne
+// sert à rien si sa forme change : **incrémenter `MAILLE_VERSION` dès que la sortie du
+// mailleur change** (attribut ajouté, seau renommé, uv recalculés), sinon un monde
+// retrouverait des triangles d'hier peints avec les règles d'avant-hier.
+const MAILLE_VERSION = 1;
+// Taille du fichier, réglée par le joueur. Zéro = cache désactivé. Ce chiffre borne ce
+// que le disque accepte, jamais ce que l'onglet garde en mémoire (c'est le quota ci-
+// dessus qui gouverne). Le poids d'un tronçon au format quantifié est mesuré à 23,6 Ko
+// (déflate compris) : 256 Mo tiennent ~11 000 tronçons, une carte très travaillée ; et
+// comme l'île par défaut en compte ~31 400, c'est le palier de 1 Go qui laisse la place
+// de la prétailler entière.
+// Le plus grand budget doit rester sous le plafond que le serveur accepte de lire en
+// mémoire (`MAX_GEOM_BYTES`) : promettre au joueur un fichier que le serveur refuserait de
+// lire, c'est lui garantir un 400 « cache de géométrie invalide » à la première publication.
+// Les deux bougent ensemble — mesuré le 2026-11-16, l'île entière (33 992 tronçons) demande
+// de 800 Mo à 1,1 Go au fichier, selon qu'on compte la table des décalages.
+const GEOM_BUDGETS_MO = [0, 32, 64, 128, 256, 512, 1024, 2048];
+// Mesuré le 2026-11-16 sur l'île de test taillée par le four : 23,6 Ko par tronçon une
+// fois quantifié et compressé. L'île par défaut (~31 400 tronçons) demande donc ~740 Mo :
+// à 512 Mo, le joueur verrait son île s'arrêter à 70 % sans comprendre pourquoi.
+const GEOM_BUDGET_DEFAUT_MO = 1024;
+// Cuisson de fond : ce qu'on prête au mailleur par image quand le joueur a déjà son
+// champ sous les pieds. Assez pour tailler un tronçon par image, pas assez pour que
+// l'image déborde pendant qu'on joue.
+const CUISSON_FOND_MS = 5;
+// Le crédit du four quand le joueur a demandé lui-même de graver l'île depuis le menu.
+// L'écran d'accueil est opaque et ne rend rien : ce temps ne vole aucune image, et c'est
+// ce qui fait passer la cadence de 8,6 à 19,6 tronçons/s (mesuré le 2026-11-16 sur six
+// fenêtres de 60 s — l'île entière en 29 min au lieu de 66). Il reste borné pour que la
+// barre se rafraîchisse et que le menu réponde au clic.
+const CUISSON_PRECUISON_MS = 300;
+const CUISSON_PUBLIER_A = 48;             // des octets déjà payés attendent moins longtemps
+// Halos d'éditions dont dépend la lumière d'un tronçon : une lanterne posée à trois
+// cubes éclaire les murs du voisin, donc son empreinte doit porter au-delà de ses bords.
+const GEOM_HALO_CHUNKS = 2;
+// Files d'attente de cuisson : au-delà, on publie sans attendre l'autosauvegarde, et on
+// cesse d'empiler des blocs compressés en mémoire (32 × ~420 Ko copiés, soit ~13 Mo
+// transient — la file doit rester plus légère que ce qu'elle évite de recalculer).
+const GEOM_PUBLIER_A = 12;
+const GEOM_PUBLIER_APRES_MS = 5000;
+const GEOM_EN_ATTENTE_MAX = 32;
+// Au-delà de cette taille, changer le gabarit de l'en-tête (passer à la table réservée qui
+// permet d'ajouter sans rien déplacer) ne se paie plus : c'est le serveur qui copie ses
+// propres octets (`POST /world-geometry/migrer`). On ne laisse quand même pas cette
+// réécriture tomber sous le joueur — 618 Mo de table et de copie, ce n'est pas une pause
+// de deux millisecondes. Elle attend le repos, voile posé.
+const MIGRATION_CACHE_HORS_REPOS_OCTETS = 32 * 1024 * 1024;
+// Et au-delà de celle-ci, la réécriture complète est interdite : le navigateur ne sait pas
+// envoyer un tel corps (mesuré le 2026-11-17 : `ERR_BLOB_OUT_OF_MEMORY` à 592 Mo, onglet
+// écrasé avec la vue nue). Le cache reste lisible ; le vider le refait par ajouts.
+const PLAFOND_ENVOI_NAVIGATEUR_OCTETS = 128 * 1024 * 1024;
+// Deux tentatives de migration ne se suivent pas de près : juger si elle est possible coûte
+// vingt millisecondes sur les 23 024 lignes du cache du joueur (mesuré le 2026-11-17), ce
+// qui ferait un pic toutes les images derrière le voile si un refus faisait réessayer tout
+// de suite. Le refus reste affiché, il est juste rejugé toutes les vingt secondes.
+const MIGRATION_ESPACE_MS = 20000;
+// Combien de temps un tronçon que le fichier sait peindre a le droit d'attendre sa
+// décompression avant qu'on se résolve à le mailler. Le délai doit couvrir la profondeur
+// de la file de réchauffement, pas seulement une décompression : à 400 ms les tronçons
+// pressés expiraient derrière l'anticipation et étaient mailles pour rien (85 sur 141).
+// Une décompression coûte moins d'un millième du maillage évité ; le plafond n'existe que
+// pour un fichier muet ou corrompu.
+const ATTENTE_DISQUE_MS = 1200;
+// Le temps qu'on laisse à la lecture du fichier de géométrie pour précéder le premier
+// maillage d'un monde. Le maillage coûte 6,9 ms par tronçon et le disque les sait déjà
+// peindre : peindre pendant cette attente est du travail perdu (mesuré 130 reconstructions
+// sur 154 payées pendant ce seul intervalle). Au-delà du plafond, un serveur muet ne doit
+// pas immobiliser le monde — on maille comme si le cache n'existait pas.
+const ATTENTE_CACHE_GEOM_MS = 1500;
 // Parois de référence pour juger une première publication (voir `majMurs`) : quatre
 // tampons partagés par tout le monde plutôt qu'un jeu alloué à chaque tronçon maillé.
 const PLAN_VIDE = {
@@ -130,6 +270,11 @@ const PLAN_VIDE = {
   n: new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT),
   s: new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT),
 };
+// Les quatre parois d'un tronçon, dans l'ordre où le maillage les lit (`mursSemences`).
+const MURS_QUATRE = ['w', 'e', 'n', 's'];
+// Les voisins dont la lumière cuite d'un tronçon hérite : les quatre cloisons et les
+// quatre coins, le maillage lisant les deux avant de peindre.
+const VOISINS_PROCHES = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
 
 // ---- fiche du monde (écran de génération) ----
 // Le slot se lit dans l'URL : c'est lui qui porte l'identité du monde, donc c'est lui
@@ -139,6 +284,20 @@ const PLAN_VIDE = {
 // ait répondu. La relecture du fichier garde un œil sur l'écart (voir `bootWorld`).
 const SAVE_PARAMS = new URLSearchParams(window.location.search);
 const SAVE_SLOT = SAVE_PARAMS.get('world') || 'default';
+// `?ile=ignorer` court-circuite le cache d'île (lecture comme cuisson). Les suites qui
+// ne jugent pas le chargement s'en servent : sans lui, chacune attendrait neuf minutes
+// la première cuisson de son monde jetable.
+const ILE_MODE = (SAVE_PARAMS.get('ile') || 'auto').toLowerCase();
+// `?geom=ignorer` court-circuite le cache de géométrie dans les deux sens : ni lecture,
+// ni écriture. Les suites qui ne jugent pas le maillage s'en servent — sans lui, elles
+// publieraient dans le fichier du monde des triangles que leurs contrôles visuels
+// n'auraient jamais eu l'intention de vérifier.
+const GEOM_MODE = (SAVE_PARAMS.get('geom') || 'auto').toLowerCase();
+// `?precuire=ignorer` tient le four de fond éteint pour la session. Le joueur veut l'île
+// entière taillée, mais les suites qui comptent les passages au mailleur ne peuvent pas
+// juger leurs compteurs pendant qu'un four en taille d'autres à côté : elles l'éteignent,
+// comme elles éteignent déjà le cache d'île et le cache de triangles.
+const PRECUIRE_MODE = (SAVE_PARAMS.get('precuire') || 'auto').toLowerCase();
 
 function lireFicheDuMonde(slot) {
   try {
@@ -187,6 +346,18 @@ function loadSettings() {
     // La météo se règle comme la durée du jour : « auto » laisse le monde tirer ses
     // averses, les deux autres positions rendent le joueur maître du ciel.
     meteo: METEO_MODES.includes(stored.meteo) ? stored.meteo : 'auto',
+    // Taille laissée au cache de géométrie sur le disque. Une valeur hors liste (ancien
+    // réglage, fichier édité à la main) retombe sur le défaut plutôt que sur un chiffre
+    // que l'écrivain refuserait.
+    geomCacheMo: GEOM_BUDGETS_MO.includes(Number(stored.geomCacheMo))
+      ? Number(stored.geomCacheMo) : GEOM_BUDGET_DEFAUT_MO,
+    // Précuire toute l'île en tâche de fond. Le joueur qui ne veut pas qu'on écrive
+    // des centaines de mégaoctets sans le lui demander le décoche ; la taille du cache
+    // reste le plafond dur dans les deux cas.
+    geomPrecuire: stored.geomPrecuire !== false,
+    // Netteté du rendu. Une valeur hors liste (réglage d'un autre appareil, fichier édité
+    // à la main) retombe sur « native », c'est-à-dire sur ce que le jeu faisait avant.
+    netrete: NETTETES.includes(String(stored.netrete)) ? String(stored.netrete) : NETTETE_DEFAUT,
   };
 }
 
@@ -196,6 +367,9 @@ function saveSettings() {
       renderDistance: settings.renderDistance,
       dureeJour: settings.dureeJour,
       meteo: settings.meteo,
+      geomCacheMo: settings.geomCacheMo,
+      geomPrecuire: !!settings.geomPrecuire,
+      netrete: settings.netrete,
     }));
   } catch (e) {
     /* private mode: the setting simply does not survive */
@@ -652,6 +826,40 @@ class World {
     this._lampIndex = null;          // lanternes posées par le joueur, voir lampesAutour
     this.pendingChunks = 0;          // in-range cells still waiting to be generated
     this.dirtyKeys = new Set();      // chunks awaiting a (re)mesh
+    // Comptabilité du budget de géométrie (voir QUOTA_GEOMETRIE_* ci-dessus) : la somme
+    // des tampons sommets des tronçons tenus en mémoire, le quota couramment admis, et
+    // l'instant où il a été relu pour la dernière fois.
+    this.octetsMailles = 0;
+    this.quotaGeometrie = QUOTA_GEOMETRIE_DEFAUT;
+    this._quotaVu = 0;
+    this.quotaForce = null;          // réglage de test : impose un quota sans le navigateur
+    // Cache d'île (voir `public/js/ile.js`) : null tant qu'aucun fichier valide n'a été
+    // relu pour ce monde. Quand il est là, un tronçon connu arrive tout cuit.
+    this.cacheIle = null;
+    // ---- géométrie déjà prête pour la carte (voir `public/js/geom-disque.js`) --------
+    // Le cache d'île économise la génération du terrain ; celui-ci économise le maillage,
+    // trois fois plus cher. Il ne se substitue jamais au mailleur : il l'évite, et seulement
+    // quand l'empreinte du tronçon dit que rien n'a bougé depuis l'écriture.
+    this.cacheGeom = null;           // fichier relu du disque, null si absent ou périmé
+    this.ecrivainGeom = null;        // contenu annoncé du fichier à la prochaine publication
+    this.geomEnAttente = new Map();  // cle -> {cx, cz, octets, empreinte} cuits, pas encore publiés
+    this.geomACuire = new Set();     // clefs maillées mais sans place en file : à cuire dès qu'il y en a
+    this.geomDepuis = 0;             // instant du premier élément en attente
+    this._signatureAtlas = null;     // change dès qu'une tuile est remplacée
+    this.cuissonIle = null;          // plan de cuisson de toute l'île, voir `demarrerCuissonIle`
+    this._chauffeGeom = null;        // réchauffement en vol : un seul pompateur à la fois
+    this._fileChauffe = new Map();   // cle -> [cx, cz], demandes arrivées pendant le pompage
+    // Compteurs de test : ce que le mailleur a réellement payé depuis le dernier relevé,
+    // et ce que le disque lui a évité. Un cache qui marche doit faire tomber le premier.
+    this._rebuilds = 0;
+    this._rebuildsDepuisDisque = 0;
+    this._geomMotifs = {};           // pourquoi une pose depuis le disque a été refusée
+    // La file de maillage est tenue dès ici, pas au premier mot de `bootWorld` : la boucle
+    // d'image tourne déjà quand l'amorçage pose le joueur, et 86 tronçons se maillaient
+    // pendant ce seul intervalle sans que le disque ait eu son mot à dire. La garde se lève
+    // dans le `finally` de `chargerCacheGeom`, y compris quand le réglage est à zéro ; le
+    // plafond horaire la lève de toute façon si l'amorçage n'aboutit jamais.
+    this.cacheGeomEnCours = GEOM_MODE === 'ignorer' ? 0 : performance.now();
     this._offsetCle = null;          // cached nearest-first offset table, keyed by radius+heading
     this._offsets = [];
     this._centre = null;             // chunk du joueur, pour trier à partir de lui
@@ -914,6 +1122,14 @@ class World {
       }
       return m;
     };
+    const derives = {};
+    for (const cote of MURS_QUATRE) derives[cote] = ecart(murs[cote], reference[cote]);
+    // Digest des quatre cloisons, calculé là où elles naissent : l'empreinte du cache de
+    // géométrie s'en sert pour savoir si un bloc cuit hier décrit encore la lumière d'ici,
+    // sans avoir à relire 32 Ko de parois à chaque pose.
+    let dh = 0;
+    for (const cote of MURS_QUATRE) dh = (dh + parseInt(hachageOctets(murs[cote]), 16)) >>> 0;
+    chunk.digestMurs = dh.toString(16);
     // Un voisin qui n'a jamais été maillé recalculera de toute façon : pas la peine de
     // le remettre en file, ce qui doublerait le travail du premier passage du flot.
     const dejaMaille = (fx, fz) => {
@@ -921,7 +1137,7 @@ class World {
       return !!c && c.meshes.length > 0;
     };
     const prevenir = (deltaX, deltaZ, cote) => {
-      if (ecart(murs[cote], reference[cote]) <= SEUIL_MUR) return;
+      if (derives[cote] <= SEUIL_MUR) return;
       if (!avant && !dejaMaille(cx + deltaX, cz + deltaZ)) return;
       this.markChunkDirty(cx + deltaX, cz + deltaZ);
     };
@@ -966,9 +1182,7 @@ class World {
       if (!(y >= 0 && y < CHUNK_HEIGHT)) continue;
       this._touchedChunks(x, y, z, touched);
     }
-    for (const key of touched) {
-      if (this.chunks.has(key)) this.dirtyKeys.add(key);
-    }
+    for (const key of touched) this._marquerSale(key);
     return this.modifiedBlocks.size;
   }
 
@@ -979,7 +1193,7 @@ class World {
     this._overrideIndex = null;
     this._lampIndex = null;          // voir lampesAutour : même cycle de vie que l'index
     this.eau.reinitialiser();
-    for (const key of this.chunks.keys()) this.dirtyKeys.add(key);
+    for (const key of this.chunks.keys()) this._marquerSale(key);
   }
 
   // Edits bucketed per chunk, rebuilt once per mutation batch. Walking the whole
@@ -1068,6 +1282,31 @@ class World {
     const key = this.getChunkKey(cx, cz);
     if (this.chunks.has(key)) return null;
 
+    // Le cache d'île dispense de bruit quand il connaît ce tronçon : la donnée arrive
+    // toute cuite. Un tronçon dont la tranche n'est pas encore décompressée retombe sur
+    // la génération habituelle — et sa tranche est réchauffée pour ses soixante-trois
+    // voisins, qui ne coûteront plus qu'une copie.
+    if (this.cacheIle && this.cacheIle.aLeTroncon(cx, cz)) {
+      const cuit = this.cacheIle.troncon(cx, cz);
+      if (cuit) {
+        this.chunks.set(key, { data: cuit, meshes: [], cx, cz, murs: null, horsVue: 0, aRefaire: false, octets: 0 });
+        return this.chunks.get(key);
+      }
+      const no = this.cacheIle.trancheDe(cx, cz);
+      if (no >= 0 && !this.cacheIle.chaude(no)) this.cacheIle.rechauffer(no);
+    }
+
+    const data = this.fabriquerDonnees(cx, cz);
+    this.chunks.set(key, { data, meshes: [], cx, cz, murs: null, horsVue: 0, aRefaire: false, octets: 0 });
+    return this.chunks.get(key);
+  }
+
+  /**
+   * Le contenu brut d'un tronçon, publié nulle part. La cuisson de l'île en a besoin :
+   * passer par `generateChunkData` y laisserait 31 416 tronçons de 32 Ko en mémoire —
+   * un gigaoctet — et encombrerait la file de maillage de tout l'océan.
+   */
+  fabriquerDonnees(cx, cz) {
     const data = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT);
     const baseX = cx * CHUNK_SIZE;
     const baseZ = cz * CHUNK_SIZE;
@@ -1148,13 +1387,31 @@ class World {
     village.stampLamps(data, cx, cz);
 
     // `murs` garde la luminance calculée sur les quatre parois du tronçon : c'est ce que
-    // les voisins viennent lire quand ils se maillent (voir `mursSemences`).
-    this.chunks.set(key, { data, meshes: [], cx, cz, murs: null });
-    return this.chunks.get(key);
+    // les voisins viennent lire quand ils se maillent (voir `mursSemences`). Il naît à
+    // null et se remplit au maillage — la donnée brute, elle, se suffit d'elle-même.
+    return data;
   }
 
   generateChunk(cx, cz) {
     if (!this.generateChunkData(cx, cz)) return;
+    // Le mailleur ne se paie pas à la génération quand le disque sait déjà peindre : à cet
+    // instant précis rien n'a encore pu être décompressé, et mailler ici jetterait le
+    // résultat un tour plus bas (mesuré 65 reconstructions sur 105 venues de ce seul chemin).
+    // On rend le tronçon sale : `drainerMailles` attendra le bloc, avec son plafond horaire.
+    const cache = this.cacheGeom;
+    const chunk = this.chunks.get(this.getChunkKey(cx, cz));
+    // Deux fenêtres d'attente, même traitement : le fichier n'est pas encore lu (le boot
+    // lit le disque après avoir posé le joueur — mesuré 65 reconstructions venues de là),
+    // ou il le connaît mais son bloc n'est pas encore décompressé.
+    const lectureEnCours = this.cacheGeomEnCours
+      && performance.now() - this.cacheGeomEnCours < ATTENTE_CACHE_GEOM_MS;
+    if (chunk && chunk.meshes.length === 0 && (lectureEnCours
+      || (cache && cache.aLeTroncon(cx, cz) && !cache.estChaud(cx, cz)
+        && cache.empreinteDu(cx, cz) === this.empreinteGeom(cx, cz)))) {
+      this.markChunkDirty(cx, cz);
+      if (cache) this.preparerGeom([[cx, cz]], { max: 4, urgente: true });
+      return;
+    }
     this.rebuildChunk(cx, cz);
   }
 
@@ -1238,17 +1495,652 @@ class World {
     return lampes;
   }
 
-  rebuildChunk(cx, cz) {
-    const key = this.getChunkKey(cx, cz);
-    const chunk = this.chunks.get(key);
-    if (!chunk) return;
-    this.dirtyKeys.delete(key);
+  /** Ce que pèsent les tampons sommets (et l'index) des mailleurs d'un tronçon. */
+  _tailleMaillages(chunk) {
+    let n = 0;
+    for (const mesh of chunk.meshes) {
+      const g = mesh.geometry;
+      for (const nom in g.attributes) n += g.attributes[nom].array.byteLength;
+      if (g.index) n += g.index.array.byteLength;
+    }
+    return n;
+  }
 
+  /** Rend un tronçon à la scène sans rien reconstruire — le retour d'une réserve. */
+  _poserMaillages(chunk) {
+    for (const mesh of chunk.meshes) this.scene.add(mesh);
+  }
+
+  /** Le retire de la scène en gardant ses tampons : visible = dessiné, pas chargé. */
+  _retirerMaillages(chunk) {
+    for (const mesh of chunk.meshes) this.scene.remove(mesh);
+  }
+
+  /** Libère vraiment : c'est le seul chemin qui décroche la géométrie du GPU. */
+  _jeterMaillages(chunk) {
     for (const mesh of chunk.meshes) {
       this.scene.remove(mesh);
       mesh.geometry.dispose();
     }
+    this.octetsMailles -= chunk.octets;
+    chunk.octets = 0;
     chunk.meshes = [];
+  }
+
+  /**
+   * Plafond couramment admis pour la géométrie tenue en mémoire. Le navigateur n'est
+   * pas tenu d'exposer son tas (headless l'omet, Safari l'ignore) : on retombe alors
+   * sur le défaut, jamais sur `navigator.deviceMemory` qui décrit la barrette, pas
+   * l'onglet. Sous pression réelle — tas presque plein — le quota se resserre.
+   */
+  _rafraichirQuota(maintenant) {
+    if (this.quotaForce !== null) return this.quotaForce;
+    if (maintenant - this._quotaVu < QUOTA_REFRESH_MS) return this.quotaGeometrie;
+    this._quotaVu = maintenant;
+    const m = typeof performance !== 'undefined' && performance.memory
+      ? performance.memory : null;
+    if (m && Number.isFinite(m.jsHeapSizeLimit) && m.jsHeapSizeLimit > 0) {
+      // On réserve une part du tas **autorisé**, jamais du tas *libre* : assise sur le
+      // libre, la règle s'auto-réprime en se remplissant (mesuré 2026-11-16 à r=32 : quota
+      // tombé à 917 Mo pendant que la note montait à 1 299 Mo, donc prêt à évincer ~400 Mo
+      // déjà payés au premier demi-tour). Le plafond borne, le plancher garantit, et le
+      // garde-fou ci-dessous ne se déclenche que sous vraie pression du tas.
+      const limite = m.jsHeapSizeLimit;
+      const use = Number.isFinite(m.usedJSHeapSize) ? m.usedJSHeapSize : 0;
+      let quota = Math.max(QUOTA_GEOMETRIE_PLANCHER,
+        Math.min(QUOTA_GEOMETRIE_PLAFOND, limite * QUOTA_GEOMETRIE_FRACTION));
+      if (use > limite * PRESSION_TAS) {
+        quota = Math.min(quota, Math.max(QUOTA_GEOMETRIE_PLANCHER, (limite - use) * 0.5));
+      }
+      this.quotaGeometrie = quota;
+    } else {
+      this.quotaGeometrie = QUOTA_GEOMETRIE_DEFAUT;
+    }
+    return this.quotaGeometrie;
+  }
+
+  /**
+   * Met les tronçons en réserve, puis libère ce que le budget ne permet plus de garder.
+   * Appelé EN TÊTE de `updateChunks` : c'est lui qui décide ce qui a le droit d'être
+   * repeint dans la passe de maillage qui suit. Placé après (mesuré 2026-11-16), un
+   * tronçon revenant dans le champ n'était repeint qu'à l'appel suivant — deux clichés
+   * strictement identiques, 0,0 point de gain.
+   *
+   * Ce qui sort du champ n'est pas jeté : décroché de la scène, tampons gardés. Un
+   * demi-tour ne doit rien recalculer (mesuré 2 129 mailleurs repayés pour rien quand la
+   * profondeur retombe de 12 à 2 puis remonte). On ne libère vraiment que quand la note
+   * dépasse le quota — et alors du plus ancien hors de vue — ou quand le tronçon est trop
+   * loin pour jamais revenir. Seuls les tampons sommets entrent dans la note
+   * (330 Ko/tronçon) ; les 32 Ko de données du terrain suivent le tronçon.
+   */
+  _rangerHorsChamp(pcx, pcz, radius, maintenant) {
+    const quota = this._rafraichirQuota(maintenant);
+    const reserve = [];
+    for (const [key, chunk] of this.chunks) {
+      const dist = Math.max(
+        Math.abs(chunk.cx - pcx),
+        Math.abs(chunk.cz - pcz)
+      );
+      if (dist <= radius + MARGE_CHAMP_RENDU) {
+        if (chunk.horsVue) {
+          chunk.horsVue = 0;
+          this._poserMaillages(chunk);
+          // Soit il a été sali pendant son absence, soit il n'a jamais été peint (né hors
+          // champ après un bond du curseur) : dans les deux cas il doit passer au mailleur.
+          if (chunk.aRefaire || chunk.meshes.length === 0) {
+            chunk.aRefaire = false;
+            this.dirtyKeys.add(key);
+          }
+        }
+        continue;
+      }
+      if (!chunk.horsVue) {
+        chunk.horsVue = maintenant;
+        this._retirerMaillages(chunk);
+      }
+      // Un tronçon où le joueur a posé la main porte ses éditions — et donc aussi l'eau
+      // que l'automate y a écrite, qui passe par le même chemin (`_ecrireEau` appelle
+      // `setBlocksBulk`). Le jeter le ferait renaître vierge aux yeux de l'automate :
+      // `charge(x, z)` redevient faux, la case est court-circuitée, et la nappe reste
+      // inscrite à la sauvegarde sans jamais couler (mesuré 2026-11-16 à trois cents
+      // cubes du joueur : les sept cellules survivaient au rechargement, la vidange ne
+      // les touchait plus). Il reste décroché de la scène ; seuls ses tampons pèsent, et
+      // l'éviction sous quota, plus bas, peut encore le prendre si l'onglet en a besoin.
+      if (dist > radius + GARDE_HORS_VUE && !this._toucheParLeJoueur(key)) {
+        this._jeterMaillages(chunk);
+        this.chunks.delete(key);
+        this.dirtyKeys.delete(key);
+        continue;
+      }
+      if (chunk.octets > 0) reserve.push(chunk);
+    }
+    if (this.octetsMailles > quota && reserve.length > 0) {
+      // Le plus anciennement hors champ saute en premier : c'est ce que le joueur a le
+      // moins de chances de revoir. Sous pression le quota reste un plafond dur — sans
+      // cela, une carte très travaillée ferait gonfler l'onglet sans limite.
+      reserve.sort((a, b) => a.horsVue - b.horsVue);
+      for (const chunk of reserve) {
+        if (this.octetsMailles <= quota) break;
+        this._jeterMaillages(chunk);
+        const cle = this.getChunkKey(chunk.cx, chunk.cz);
+        this.chunks.delete(cle);
+        this.dirtyKeys.delete(cle);
+      }
+    }
+  }
+
+  /** Le joueur a-t-il posé la main sur ce tronçon ? Ses éditions portent aussi son eau. */
+  _toucheParLeJoueur(key) {
+    return this.modifiedBlocks.size > 0 && this._indexOverrides().has(key);
+  }
+
+  // ---- géométrie déjà prête pour la carte ------------------------------------
+  // Rien ici ne remplace le mailleur : si une seule clé ne correspond pas, on repart par
+  // la construction complète. Ce qui est gagné, c'est le temps — 0,29 ms contre 6,94 ms
+  // par tronçon (mesuré le 2026-11-16), soit le prix d'un aller-retour au disque au lieu
+  // de celui d'une lecture du terrain, d'un champ de lumière et de 6 600 sommets refaits.
+
+  /** Ce qui doit correspondre pour qu'un triangle écrit hier soit encore celui d'aujourd'hui. */
+  attenduGeom() {
+    return {
+      chunkSize: CHUNK_SIZE, height: CHUNK_HEIGHT, seed: WORLD_SEEDS, monde: MONDE,
+      mailleVersion: MAILLE_VERSION, atlasSignature: this.signatureAtlas(),
+    };
+  }
+
+  /**
+   * Emprunte l'atlas : dimensions, noms des tuiles et pixels. Le maillage cuit ses uv
+   * d'après la grille des tuiles ; si l'agencement bouge — import de textures, tuile
+   * ajoutée — les triangles du disque peindraient la mauvaise image. Le hash des pixels
+   * est plus strict qu'il n'en a l'air (changer une image sans changer la grille laisse
+   * des uv valides) : on préfère perdre un cache à montrer le mauvais bloc.
+   */
+  signatureAtlas(force = false) {
+    if (this._signatureAtlas !== null && !force) return this._signatureAtlas;
+    let s = 'atlas';
+    try {
+      const c = atlas.canvas;
+      s = `${c.width}x${c.height}|${(atlas.tileNames || []).join(',')}`;
+      const ctx = c.getContext && c.getContext('2d');
+      if (ctx) s += `|${hachageOctets(ctx.getImageData(0, 0, c.width, c.height).data)}`;
+    } catch (e) {
+      // Canvas tainté ou contexte indisponible : dims et noms suffisent à écarter un doute.
+    }
+    this._signatureAtlas = hachageGeom(s);
+    return this._signatureAtlas;
+  }
+
+  /** L'atlas a changé de visage : le fichier du disque ne décrit plus ce monde. */
+  atlasAChange() {
+    this._signatureAtlas = null;
+    this.cacheGeom = null;
+    this.ecrivainGeom = null;
+    this.geomEnAttente.clear();
+  }
+
+  /**
+   * Empreinte de tout ce qui peut avoir repeint ce tronçon depuis l'écriture : ses
+   * éditions **et** celles du halo, parce qu'une lanterne posée à trois cubes éclaire les
+   * murs du voisin. La somme des hash est commutative : l'ordre d'application des éditions
+   * (celui du fichier, puis celui du joueur) ne change pas le résultat.
+   */
+  empreinteGeom(cx, cz) {
+    const index = this._indexOverrides();
+    let h = 0;
+    let n = 0;
+    for (let dz = -GEOM_HALO_CHUNKS; dz <= GEOM_HALO_CHUNKS; dz++) {
+      for (let dx = -GEOM_HALO_CHUNKS; dx <= GEOM_HALO_CHUNKS; dx++) {
+        const bucket = index.get(this.getChunkKey(cx + dx, cz + dz));
+        if (!bucket) continue;
+        for (const [cell, id] of bucket) {
+          h = (h + parseInt(hachageGeom(`${cell}:${id}`), 16)) >>> 0;
+          n++;
+        }
+      }
+    }
+    // Les éditions du joueur ne suffisent pas à décrire un tronçon : l'automate d'eau,
+    // l'estampage du village ou du monument écrivent dans `chunk.data` sans passer par la
+    // carte des éditions. Un bloc posé sur cette foi peignait de l'eau disparue ou un
+    // pavé arraché (mesuré 5 blocs infidèles sur 8 audités). Le contenu réel entre donc
+    // dans l'empreinte, à hauteur de 32 Ko hachés (~0,04 ms), une fois à la cuisson et
+    // une fois à la pose.
+    const chunk = this.chunks.get(this.getChunkKey(cx, cz));
+    const brut = chunk && chunk.data ? hachageOctets(chunk.data) : 'sans-donnees';
+    // La lumière cuite d'un tronçon se lit aussi chez ses voisins. Un bloc cuit alors
+    // qu'un voisin manquait garde une couleur fausse — le mailleur tient l'absent pour
+    // « plein », faute de mieux à lire (mesuré jusqu'à 8,8 % de la couleur cumulée sur un
+    // tronçon). La présence du halo entre donc dans l'empreinte.
+    //
+    // Elle s'arrête là volontairement : y faire entrer l'état de maillage des voisins —
+    // leurs cloisons, par exemple — rendrait le bloc inutilisable au premier passage de
+    // chaque session, ce voisin n'ayant pas encore été peint ici. Mesuré : la repose
+    // tombait à 52/81 et ne décollait ni avec plus de réserve chaude ni avec dix fois
+    // plus de temps d'attente. Ce qui n'est pas reproductible d'une visite à l'autre
+    // n'a rien à faire dans une empreinte.
+    let hVoisins = 0;
+    for (const [dx, dz] of VOISINS_PROCHES) {
+      const v = this.chunks.get(this.getChunkKey(cx + dx, cz + dz));
+      const etat = v ? (v.digestMurs || 'sans-cloisons') : 'absent';
+      hVoisins = (hVoisins + parseInt(hachageGeom(`${dx},${dz}:${etat}`), 16)) >>> 0;
+    }
+    if (n === 0 && brut === 'sans-donnees' && hVoisins === 0) return '0';
+    return `${n.toString(16)}-${h.toString(16)}-${brut}-${hVoisins.toString(16)}`;
+  }
+
+  /**
+   * Repose un tronçon depuis le fichier, sans passer par le mailleur. Ne marche que sur
+   * un bloc déjà décompressé (`preparerGeom` s'en charge en arrière-plan) : décompresser
+   * dans l'image coûterait plus cher que le maillage qu'on voulait éviter.
+   */
+  _poserDepuisDisque(chunk) {
+    const cache = this.cacheGeom;
+    // Compté à chaque refus : « le disque ne sert rien » ne se corrige pas sans savoir
+    // lequel des motifs empêche la pose.
+    const motif = (nom) => { this._geomMotifs[nom] = (this._geomMotifs[nom] || 0) + 1; return false; };
+    if (!cache) return motif('sansCache');            // pas encore chargé (ou monde sans disque)
+    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return motif('reglages');
+    if (!cache.aLeTroncon(chunk.cx, chunk.cz)) return motif('absent');
+    const maillages = cache.pret(chunk.cx, chunk.cz);
+    if (!maillages) return motif('froid');
+    if (cache.empreinteDu(chunk.cx, chunk.cz) !== this.empreinteGeom(chunk.cx, chunk.cz)) return motif('empreinte');
+    const materiaux = { opaque: this.matOpaque, trans: this.matTrans, glow: this.matGlow };
+    for (const m of maillages) {
+      const materiau = materiaux[m.mat];
+      if (!materiau) return motif('seau');                        // seau inconnu : on ne pose rien
+      const geometry = new THREE.BufferGeometry();
+      for (const a of m.attributs) {
+        // Les canaux normalisés se posent tels quels : l'attribut GPU lit l'entier et le
+        // divise lui-même. Seule la position repasse par le CPU, une boucle de lecture.
+        const tableau = a.nom === 'position' ? dequantifierPositions(a.tableau, m.origine) : a.tableau;
+        geometry.setAttribute(a.nom, new THREE.BufferAttribute(tableau, a.itemSize, !!a.normalise));
+      }
+      geometry.setIndex(new THREE.BufferAttribute(m.index, 1));
+      geometry.computeBoundingSphere();
+      const mesh = new THREE.Mesh(geometry, materiau);
+      mesh.renderOrder = m.mat === 'opaque' ? 0 : 1;
+      mesh.userData.seau = m.mat;
+      this.scene.add(mesh);
+      chunk.meshes.push(mesh);
+    }
+    chunk.octets = this._tailleMaillages(chunk);
+    this.octetsMailles += chunk.octets;
+    chunk.venuDuDisque = true;     // drapeau de preuve : les suites jugent la provenance
+    this._geomMotifs.ok = (this._geomMotifs.ok || 0) + 1;
+    return true;
+  }
+
+  /**
+   * Met le tronçon qui vient d'être maillé en file pour le disque. Les tampons sont
+   * copiés immédiatement (~0,05 ms de memcpy pour 420 Ko) : la géométrie reste libre
+   * d'être jetée par le quota avant la publication, et la compression attendra hors image.
+   */
+  _cuissonGeom(cx, cz) {
+    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return;
+    const key = this.getChunkKey(cx, cz);
+    if (this.geomEnAttente.size >= GEOM_EN_ATTENTE_MAX) {
+      // La file est pleine : le tronçon n'est pas perdu, il est inscrit sur la liste
+      // d'attente. Dès que la publication l'aura vidée, `cuireCeQuiAttend` viendra y
+      // puiser tant que la géométrie est en mémoire — sans quoi une traversée rapide
+      // ne laisserait sur le disque que les trente premiers tronçons du voyage.
+      this.geomACuire.add(key);
+      return;
+    }
+    const chunk = this.chunks.get(key);
+    if (!chunk || chunk.meshes.length === 0) return;
+    // Devant un voisin absent, le mailleur n'a rien à lire et le tient pour « plein » :
+    // cuire à ce moment-là grave une lumière fausse que le fichier rejouera indéfiniment
+    // (mesuré six tronçons infidèles sur huit audités, toujours sur le seul canal couleur).
+    // On n'écrit donc qu'une fois les voisins directs installés. Ceux hors du rayon rendu
+    // ne viendront jamais et ne peuvent rien retenir ; la liste d'attente est bornée pour
+    // qu'un monde en chantier ne s'y empile pas sans fin.
+    const centre = this._centre;
+    if (centre) {
+      const r = settings.renderDistance;
+      for (const [dx, dz] of VOISINS_PROCHES) {
+        if (Math.max(Math.abs(cx + dx - centre.pcx), Math.abs(cz + dz - centre.pcz)) > r) continue;
+        const voisin = this.chunks.get(this.getChunkKey(cx + dx, cz + dz));
+        if (!voisin || !voisin.murs) {
+          if (this.geomACuire.size < 256) this.geomACuire.add(key);
+          return;
+        }
+      }
+    }
+    const maillages = [];
+    for (const mesh of chunk.meshes) {
+      const g = mesh.geometry;
+      const nom = mesh.userData.seau;
+      if (!nom) return;                                   // mailleur inconnu : rien d'assurable
+      maillages.push({
+        mat: nom,
+        position: g.attributes.position.array,
+        normal: g.attributes.normal.array,
+        uv: g.attributes.uv.array,
+        color: g.attributes.color.array,
+        aLampe: g.attributes.aLampe.array,
+        index: g.index.array,
+      });
+    }
+    try {
+      const octets = serialiserMaillages(maillages);
+      if (!this.geomEnAttente.size) this.geomDepuis = performance.now();
+      this.geomEnAttente.set(key, {
+        cx, cz, octets, empreinte: this.empreinteGeom(cx, cz),
+      });
+      this.geomACuire.delete(key);
+      // Une pleine file de tronçons déjà payés qui attendent le disque, c'est exactement
+      // le moment d'écrire : sans ce déclenchement, une traversée rapide remplirait les
+      // 32 places puis repartirait les mains vides, faute d'avoir attendu le réveil de
+      // l'économise deux secondes plus tard.
+      if (this.geomEnAttente.size >= GEOM_PUBLIER_A && this._demanderPublicationGeom) {
+        this._demanderPublicationGeom();
+      }
+    } catch (e) {
+      // Un mailleur qui ne se sérialise pas n'est pas motif à casser l'image : le tronçon
+      // est simplement absent du fichier, donc repeint la prochaine fois.
+      console.warn('Tronçon non cuisable :', cx, cz, e.message);
+    }
+  }
+
+  /**
+   * Puise dans la liste d'attente dès qu'il y a de la place : une copie de tampons par
+   * tronçon, seize par tour, soit moins d'une milliseconde. Appelé par l'économise et
+   * après chaque publication, jamais pendant une image déjà chargée.
+   */
+  cuireCeQuiAttend({ max = 16 } = {}) {
+    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo || !this.geomACuire.size) return 0;
+    let faits = 0;
+    for (const key of this.geomACuire) {
+      if (faits >= max || this.geomEnAttente.size >= GEOM_EN_ATTENTE_MAX) break;
+      const virgule = key.indexOf(',');
+      const cx = +key.slice(0, virgule);
+      const cz = +key.slice(virgule + 1);
+      this.geomACuire.delete(key);
+      if (!this.chunks.has(key)) continue;                // plus en mémoire : à recuire à la repeinture
+      this._cuissonGeom(cx, cz);
+      faits++;
+    }
+    return faits;
+  }
+
+  /**
+   * Plan de cuisson de toute l'île, du plus près du joueur au plus loin. Le tronçon est
+   * taillé deux fois, à une couronne d'écart : la première passe pose les cloisons de
+   * lumière (sans elles, le mailleur graine contre le néant et grave une luminance fausse
+   * que l'empreinte barrerait à la pose), la seconde grave le tronçon alors que son
+   * voisinage — à une couronne près, compris le côté extérieur — est déjà jugé.
+   *
+   * La file est plate et portée par DEUX curseurs, `rang` (ce qui se grave) et `devant`
+   * (la frontière des cloisons). Une file par rangées tenait le même coup mais rendait la
+   * main sur un budget court sans jamais graver : les deux passes de rattrapage avalaient
+   * le crédit d'image avant la gravure, et la rangée avançait quand même (mesuré le
+   * 2026-11-16 : 320 tronçons taillés, `faits` resté à zéro, aucun octet au fichier).
+   */
+  demarrerCuissonIle() {
+    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return false;
+    const b = bornesIle(MONDE, CHUNK_SIZE);
+    const centre = this._centre || { pcx: 0, pcz: 0 };
+    const file = [];
+    for (let j = 0; j < b.nz; j++) {
+      const cz = b.cz + j;
+      for (let i = 0; i < b.nx; i++) {
+        const cx = b.cx + i;
+        if (!b.contient(cx, cz)) continue;
+        const dx = Math.abs(cx - centre.pcx);
+        const dz = Math.abs(cz - centre.pcz);
+        file.push({ cx, cz, d: Math.max(dx, dz), e: dx + dz });
+      }
+    }
+    if (!file.length) return false;
+    // Couronne par couronne, et dans la couronne du plus proche au plus loin du joueur :
+    // ce qu'il longe se cuira avant ce qu'il ne verra peut-être jamais.
+    file.sort((p, q) => p.d - q.d || p.e - q.e || p.cx - q.cx || p.cz - q.cz);
+    // Le four parcourt l'île entière : la file de tranches doit tenir le pas devant lui,
+    // sinon chaque tronçon servi retomberait sur le bruit (voir `_tronconPret`).
+    if (this.cacheIle) this.cacheIle.limitesMain = TRANCHES_MAX;
+    this.cuissonIle = {
+      file, rang: 0, devant: 0, lache: 0,
+      mailles: new Set(),                 // clefs passées par la première passe
+      centre: { pcx: centre.pcx, pcz: centre.pcz },
+      attendus: file.length, faits: 0, depuisPublication: 0,
+      dernierProgres: performance.now(),
+      enMarche: true, sature: false, motif: '', attenteTranche: false,
+    };
+    return true;
+  }
+
+  /** Ce que la cuisson de fond a fait attendre, pour l'affichage comme pour les tests. */
+  etatCuissonIle() {
+    const s = this.cuissonIle;
+    if (!s) return null;
+    return {
+      faits: s.faits, attendus: s.attendus, enMarche: s.enMarche,
+      sature: s.sature, motif: s.motif, reste: s.attendus - s.faits,
+      attenteTranche: !!s.attenteTranche,
+      // `attenteTranche` est vrai dès le dernier refus, même si quarante tronçons sont
+      // passés depuis : affiché tel quel, le panneau crierait « bloqué » pendant que la
+      // barre avance (mesuré voile posé : 23,7 tronçons par seconde avec le drapeau levé).
+      // Ce n'est une attente à dire au joueur que si plus rien n'avance vraiment.
+      attenteProlongee: !!s.attenteTranche && performance.now() - s.dernierProgres > 1500,
+    };
+  }
+
+  /**
+   * La donnée brute de ce tronçon est-elle lue du disque cuit ? Le cache d'île rend le
+   * bruit sans prévenir quand la tranche n'est pas décompressée : livré tel quel, le four
+   * graverait dans le fichier de triangles un relief fantaisiste que le monde ne connaît
+   * pas. On refuse donc le tronçon tant que sa tranche dort, en lançant le réchauffement —
+   * `rechauffer` déduplique les appels simultanés, le relancer à chaque image est gratuit.
+   */
+  _tronconPret(cx, cz) {
+    const ci = this.cacheIle;
+    if (!ci || !ci.valide || !ci.aLeTroncon(cx, cz)) return true;   // hors île cuite : le bruit fait foi
+    const no = ci.trancheDe(cx, cz);
+    if (no < 0 || ci.chaude(no)) return true;
+    ci.rechauffer(no);
+    return false;
+  }
+
+  /**
+   * Un tronçon lâché par la cuisson de fond : il n'est ni sous les yeux du joueur, ni
+   * touché par sa main, ni porteur de triangles, ni en route pour le disque. Sans ce
+   * relâchement, parcourir l'île ferait tenir 31 400 tronçons de 32 Ko en mémoire — un
+   * gigaoctet pour rien, le fichier les garde déjà. Mais un tronçon dont les octets
+   * attendent la publication n'est pas encore sur le disque : le lâcher, ce serait le
+   * perdre sans qu'il ait jamais été écrit.
+   */
+  _lacherTronconCuit(cx, cz) {
+    const cle = this.getChunkKey(cx, cz);
+    const chunk = this.chunks.get(cle);
+    if (!chunk || chunk.meshes.length) return false;
+    if (this._toucheParLeJoueur(cle)) return false;
+    if (this.geomEnAttente.has(cle) || this.geomACuire.has(cle) || this.dirtyKeys.has(cle)) return false;
+    const c = this._centre;
+    if (c && Math.max(Math.abs(cx - c.pcx), Math.abs(cz - c.pcz)) <= c.radius + MARGE_CHAMP_RENDU) return false;
+    this.chunks.delete(cle);
+    return true;
+  }
+
+  /** Rend à la mémoire ce que la frontière a dépassé : trois couronnes derrière elle. */
+  _lacherDerriere(s) {
+    const borne = s.file[Math.min(s.rang, s.file.length - 1)];
+    const limite = borne.d - 3;
+    while (s.lache < s.rang && s.file[s.lache].d <= limite) {
+      const t = s.file[s.lache++];
+      this._lacherTronconCuit(t.cx, t.cz);
+    }
+  }
+
+  /**
+   * Le fichier ne peut plus rien recevoir : arrêter le four. Tailler des tronçons que
+   * l'écrivain refusera à chaque publication est du temps de mailleur jeté image après
+   * image, et le joueur ne verrait jamais la raison — le motif porte donc la sentence.
+   */
+  saturerCuissonIle(motif) {
+    const s = this.cuissonIle;
+    if (!s) return;
+    s.enMarche = false;
+    s.sature = true;
+    s.motif = motif;
+  }
+
+  /**
+   * Tranche de cuisson de fond, appelée par l'image quand le joueur a déjà son champ
+   * sous les pieds. Elle rend la main dès que le budget est épuisé, à n'importe quel
+   * endroit de la file : le jeu reste fluide et l'île se taille derrière le joueur.
+   */
+  cuireIleGeometrie(maxMs = CUISSON_FOND_MS) {
+    const s = this.cuissonIle;
+    if (!s || !s.enMarche) return 0;
+    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) { s.enMarche = false; return 0; }
+    const debut = performance.now();
+    let cuits = 0;
+    const epuise = () => performance.now() - debut >= maxMs;
+    const enBoite = (cx, cz) => !!this.ecrivainGeom?.aLeTroncon(cx, cz) || !!this.cacheGeom?.aLeTroncon(cx, cz);
+    // Un tronçon sous les yeux du joueur n'est PAS à cuire par le four : il est déjà tenu
+    // par le flot de rendu, qui pose ses triangles à la scène. Tailler là-bas jetterait la
+    // géométrie visible (la cuisson de fond maille hors scène) et effacerait le décor sous
+    // le nez du joueur — mesuré le 2026-11-16 sur `tests/geom-cache.mjs`, 131 repeintures
+    // au second demi-tour de caméra pour un monde pourtant posé. La frontière est
+    // exactement celle du rangeur (`MARGE_CHAMP_RENDU`) : une couronne de moins ici, et le
+    // four taille juste derrière ce que la caméra montre, donc le rangeur la rattache et
+    // le mailleur la refait — 36 repeintures par demi-tour mesuré dans le monde du joueur.
+    const c = this._centre;
+    const sousLesYeux = (cx, cz) => !!c && Math.max(Math.abs(cx - c.pcx), Math.abs(cz - c.pcz)) <= c.radius + MARGE_CHAMP_RENDU;
+    // Tailler un tronçon hors écran. `horsVue` le signale au draineur : sans ce drapeau,
+    // la marque sale laissée chez le voisin par `majMurs` lui ferait repeindre à l'image
+    // un tronçon que personne ne regarde — et poser à la scène des triangles déjà au fichier.
+    const tailler = (cx, cz, ecrire) => {
+      if (sousLesYeux(cx, cz)) return false;
+      const cle = this.getChunkKey(cx, cz);
+      if (!this.chunks.has(cle) && !this.generateChunkData(cx, cz)) return false;
+      const chunk = this.chunks.get(cle);
+      if (!chunk) return false;
+      chunk.horsVue = 1;
+      this.rebuildChunk(cx, cz, { horsScene: true, ecrire });
+      this.dirtyKeys.delete(cle);
+      cuits++;
+      return true;
+    };
+    try {
+      while (!epuise()) {
+        if (s.rang >= s.file.length) { s.enMarche = false; break; }
+        const cible = s.file[s.rang];
+        if (enBoite(cible.cx, cible.cz) || sousLesYeux(cible.cx, cible.cz)) { s.faits++; s.rang++; continue; }
+        // Première passe : pousser la frontière des cloisons jusqu'à couvrir la couronne
+        // qui entoure la cible. Le curseur `devant` survit entre deux appels, donc un
+        // budget court n'empêche plus la gravure — il ne fait que la retarder d'une image.
+        let pret = true;
+        while (s.devant < s.file.length && s.file[s.devant].d <= cible.d + 1) {
+          const t = s.file[s.devant];
+          if (!sousLesYeux(t.cx, t.cz) && !this._tronconPret(t.cx, t.cz)) { pret = false; break; }
+          const cleT = this.getChunkKey(t.cx, t.cz);
+          if (!s.mailles.has(cleT) && tailler(t.cx, t.cz, false)) s.mailles.add(cleT);
+          s.devant++;
+          if (epuise()) break;
+        }
+        if (!pret) { s.attenteTranche = true; break; }      // tranche froide : on rend la main
+        if (epuise()) break;
+        if (!this._tronconPret(cible.cx, cible.cz)) { s.attenteTranche = true; break; }
+        if (!enBoite(cible.cx, cible.cz)) tailler(cible.cx, cible.cz, true);
+        s.attenteTranche = false;
+        s.faits++;
+        s.dernierProgres = performance.now();
+        s.rang++;
+        s.depuisPublication++;
+        if (s.depuisPublication >= CUISSON_PUBLIER_A) {
+          s.depuisPublication = 0;
+          this._demanderPublicationGeom?.();
+        }
+        this._lacherDerriere(s);
+      }
+    } catch (e) {
+      // Le budget disque est un plafond voulu, pas un accident : on s'arrête proprement
+      // et on le dit, plutôt que de compresser des tronçons que le fichier ne peut pas
+      // recevoir. Le joueur garde ce qui est déjà écrit.
+      s.enMarche = false;
+      s.sature = true;
+      s.motif = e.message || 'cuisson interrompue';
+      console.info('Cuisson de géométrie arrêtée :', s.motif);
+    }
+    return cuits;
+  }
+
+  /** Un bloc devenu faux sort des files d'écriture, mais reste au fichier. */
+  _oublierGeom(key) {
+    this.geomEnAttente.delete(key);
+    this.geomACuire.delete(key);
+    // Le fichier n'est pas retiré de l'écrivain : c'est l'empreinte qui fait foi à la
+    // pose, pas la présence du bloc. Le retirer ici le faisait disparaître pour toujours
+    // dès que le tronçon était sali pendant qu'il était hors champ — sa repeinture attend
+    // son retour, et entre-temps plus rien ne le recuit (mesuré le fichier tombé de 81 à
+    // 9 tronçons en trois visites). Un bloc périmé ne coûte que des octets ; un bloc
+    // absent coûte un maillage.
+  }
+
+  /**
+   * Décompresse à l'avance les tronçons que le mailleur va réclamer. En arrière-plan et
+   * un seul pompateur à la fois : c'est du CPU volé à la frame, et le gain vient
+   * justement de ne jamais le faire pendant qu'elle se construit. Les demandes qui
+   * arrivent pendant qu'un pompage roule entrent dans sa file au lieu d'être perdues —
+   * sinon le premier arrivé accapare tout et les suivants sont maillés pour rien.
+   */
+  preparerGeom(listeCles, { max = 6, urgente = false } = {}) {
+    const cache = this.cacheGeom;
+    if (!cache || GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return Promise.resolve(0);
+    // Deux niveaux dans la file : ce que le mailleur réclame **maintenant** (0) passe
+    // devant ce qu'on anticipe (1). En FIFO pur, un tronçon pressé attendait derrière
+    // vingt-quatre blocs lointains et finissait par expirer — donc par être maillé pour
+    // rien (mesuré 85 poses manquées sur 141).
+    const priorite = urgente ? 0 : 1;
+    for (const [cx, cz] of listeCles) {
+      if (cache.aLeTroncon(cx, cz) && !cache.estChaud(cx, cz)) this._fileChauffe.set(`${cx},${cz}`, [cx, cz, priorite]);
+    }
+    if (this._chauffeGeom) return this._chauffeGeom;
+    const promesse = this._pomperChauffe(max).then((n) => {
+      if (this._chauffeGeom === promesse) this._chauffeGeom = null;
+      return n;
+    }, () => {
+      if (this._chauffeGeom === promesse) this._chauffeGeom = null;
+      return 0;
+    });
+    this._chauffeGeom = promesse;
+    return promesse;
+  }
+
+  async _pomperChauffe(max) {
+    const cache = this.cacheGeom;
+    const plafond = max * 4;              // jamais plus de vingt-quatre blocs d'affilée
+    let faites = 0;
+    while (faites < plafond) {
+      // Le plus pressé d'abord ; à égalité, le plus ancien (l'ordre d'insertion d'une Map
+      // est stable, et on ne retient que ce qui est strictement plus urgent).
+      let cleChoisie = null;
+      let choisi = null;
+      let priorite = Infinity;
+      for (const [k, v] of this._fileChauffe) {
+        if (v[2] < priorite) { priorite = v[2]; cleChoisie = k; choisi = v; if (v[2] === 0) break; }
+      }
+      if (!choisi) break;
+      const [cx, cz] = choisi;
+      this._fileChauffe.delete(cleChoisie);
+      if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) break;   // le joueur a tranché entre-temps
+      if (cache.estChaud(cx, cz)) continue;
+      if (await cache.charger(cx, cz)) faites++;
+    }
+    return faites;
+  }
+
+  rebuildChunk(cx, cz, { horsScene = false, ecrire = true } = {}) {
+    const key = this.getChunkKey(cx, cz);
+    const chunk = this.chunks.get(key);
+    if (!chunk) return;
+    this.dirtyKeys.delete(key);
+    this._jeterMaillages(chunk);
+    // Le disque a peut-être déjà ces triangles : vingt-quatre fois moins cher que de les
+    // refaire. En cas de doute (empreinte, seau inconnu), on tombe et le mailleur suit.
+    if (this._poserDepuisDisque(chunk)) { this._rebuildsDepuisDisque++; return; }
+    this._rebuilds++;
+    chunk.venuDuDisque = false;
 
     const baseX = cx * CHUNK_SIZE;
     const baseZ = cz * CHUNK_SIZE;
@@ -1440,11 +2332,11 @@ class World {
     }
 
     const materiaux = [
-      [buckets.opaque, this.matOpaque, 0],
-      [buckets.trans, this.matTrans, 1],
-      [buckets.glow, this.matGlow, 1],
+      [buckets.opaque, this.matOpaque, 0, 'opaque'],
+      [buckets.trans, this.matTrans, 1, 'trans'],
+      [buckets.glow, this.matGlow, 1, 'glow'],
     ];
-    for (const [bucket, materiau, ordre] of materiaux) {
+    for (const [bucket, materiau, ordre, seau] of materiaux) {
       if (bucket.count === 0) continue;
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(bucket.positions, 3));
@@ -1457,9 +2349,25 @@ class World {
 
       const mesh = new THREE.Mesh(geometry, materiau);
       mesh.renderOrder = ordre;
-      this.scene.add(mesh);
+      // Le nom du seau voyage avec le mailleur : c'est lui qui dit à quel matériau
+      // repartiront ces tampons quand ils reviendront du disque.
+      mesh.userData.seau = seau;
+      // La cuisson de fond fabrique les mêmes tampons pour le fichier, pas pour l'écran :
+      // posés à la scène, ils seraient dessinés avant l'heure et comptés deux fois.
+      if (!horsScene) this.scene.add(mesh);
       chunk.meshes.push(mesh);
     }
+    // La note est tenue ici, pas à l'éviction : c'est le seul endroit qui sache ce qui
+    // vient d'être alloué, et le budget se juge à chaque image.
+    chunk.octets = this._tailleMaillages(chunk);
+    this.octetsMailles += chunk.octets;
+    // Et ce qui vient d'être payé est mis de côté pour le disque : la prochaine partie
+    // le reposera sans rien recalculer.
+    if (ecrire) this._cuissonGeom(cx, cz);
+    // Cuisson de fond : les triangles sont partis vers le fichier, rien ne justifie
+    // qu'ils encombrent encore la mémoire ni la scène. La note redescend par le même
+    // chemin qu'elle est montée (`_jeterMaillages` déduit `chunk.octets`).
+    if (horsScene) this._jeterMaillages(chunk);
   }
 
   /**
@@ -1506,6 +2414,10 @@ class World {
   drainerMailles(dureeAccordee) {
     const entree = performance.now();
     if (this.dirtyKeys.size === 0 || dureeAccordee <= 0) return 0;
+    // Le fichier de géométrie est en cours de lecture : mailler maintenant payerait le
+    // mailleur pour des triangles que le disque sait déjà peindre. On tient la file, sous
+    // réserve du plafond horaire — un serveur muet ne doit pas immobiliser le monde.
+    if (this.cacheGeomEnCours && entree - this.cacheGeomEnCours < ATTENTE_CACHE_GEOM_MS) return 0;
     const echeance = entree + dureeAccordee;
     const c = this._centre;
     const files = [];
@@ -1528,7 +2440,34 @@ class World {
     files.sort((a, b) => a[0] - b[0]);
     for (const [, cx, cz] of files) {
       if (performance.now() > echeance) return performance.now() - entree;
-      if (!this.chunks.has(this.getChunkKey(cx, cz))) continue;
+      const cle = this.getChunkKey(cx, cz);
+      const chunk = this.chunks.get(cle);
+      if (!chunk) continue;
+      // Un tronçon mis en réserve ne se repeint pas pendant qu'il est hors champ : sa
+      // peinture attend le retour. Le peindre ici coûterait 2,5–3,2 ms pour un résultat
+      // que personne ne voit, et le budget mémoire n'aurait servi à rien.
+      if (chunk.horsVue) {
+        chunk.aRefaire = true;
+        this.dirtyKeys.delete(cle);
+        continue;
+      }
+      // Le disque sait peindre ce tronçon, mais son bloc n'est pas encore décompressé :
+      // le mailler maintenant paierait le mailleur pour rien, alors que le résultat est à
+      // un tour de boucle. On repousse dans le **temps** plutôt qu'en nombre de tours :
+      // `updateChunks` peut tourner une vingtaine de fois entre deux images et trois
+      // tours expiraient avant que zlib ait répondu (mesuré 20 poses sur 158 avec un
+      // compteur de tours, 80 dès que la réponse a le temps de tomber). Le plafond horaire
+      // garde la main : un fichier muet ne fait jamais attendre le joueur sur un écran vide.
+      const cache = this.cacheGeom;
+      if (cache && !cache.estChaud(cx, cz) && cache.aLeTroncon(cx, cz)
+        && cache.empreinteDu(cx, cz) === this.empreinteGeom(cx, cz)) {
+        const depuis = chunk.attenteDisqueDepuis || (chunk.attenteDisqueDepuis = entree);
+        if (entree - depuis < ATTENTE_DISQUE_MS) {
+          this.preparerGeom([[cx, cz]], { max: 4, urgente: true });
+          continue;
+        }
+      }
+      chunk.attenteDisqueDepuis = 0;
       this.rebuildChunk(cx, cz);
     }
     return performance.now() - entree;
@@ -1538,7 +2477,17 @@ class World {
   // murale : une grande profondeur de champ se décharge ainsi sur plusieurs images
   // plutôt que de geler l'onglet. `dirX`/`dirZ` portent le regard du joueur — voir
   // `offsetsFor`, qui donne l'ordre de visite.
-  updateChunks(playerX, playerZ, maxCells = Infinity, maxMs = Infinity, dirX = 0, dirZ = 0) {
+  //
+  // Deux enveloppes, pas une : `maxMs` borne la génération du relief (et protège donc la
+  // cadence), `maillageMs` ne borne que la maille et peut ainsi suivre la marge laissée par
+  // l'image sans affamer le terrain. Les fusionner coûte cher, mesuré le 2026-11-17 sous
+  // rasteriseur logiciel : de r=4 à r=7 (160 tronçons à faire naître), le monde se pose en
+  // **31,5 s** avec une enveloppe unique contre **18,8 s** avec deux — soit ×1,7. Ce prix est
+  // payé par la garde d'horloge partagée (`performance.now() > started + maxMs`) : rejouée par
+  // emballage sans elle, la fusion ne coûtait rien (18,1 s). Par défaut (`maxMs * 0.6`), le
+  // comportement reste exactement celui d'avant pour tous les appelants existants.
+  updateChunks(playerX, playerZ, maxCells = Infinity, maxMs = Infinity, dirX = 0, dirZ = 0,
+               maillageMs = maxMs * 0.6) {
     const started = performance.now();
     const pcx = Math.floor(playerX / CHUNK_SIZE);
     const pcz = Math.floor(playerZ / CHUNK_SIZE);
@@ -1547,25 +2496,70 @@ class World {
     const norm = Math.hypot(dirX, dirZ);
     this._dir.x = norm > 1e-4 ? dirX / norm : 0;
     this._dir.z = norm > 1e-4 ? dirZ / norm : 0;
+    // Rangement d'abord : il décide de ce qui a le droit d'être repeint ci-dessous.
+    this._rangerHorsChamp(pcx, pcz, radius, started);
     const offsets = this.offsetsFor(radius, dirX, dirZ);
+    // Le disque se lit en arrière-plan. Deux files de réchauffement, dans l'ordre
+    // d'urgence : les tronçons **à repeindre** que le fichier connaît (leur maillage est
+    // déjà programmé pour cette image), puis les tronçons connus encore vierges — ceux-là
+    // n'ont pas encore demandé leur tour, mais décompresser à l'avance coûte une fraction
+    // du maillage qu'on évite ainsi. Les tronçons absents du fichier sont exclus des deux :
+    // ils n'ont rien à attendre de là et voleraient du CPU à ceux qui comptent.
+    if (this.cacheGeom && !this._chauffeGeom) {
+      const cache = this.cacheGeom;
+      // `estChaud` et non `pret` : un simple état des lieux n'a pas à se faire passer pour
+      // un usage, sinon ce balayage du proche vers le loin recyclerait la file chaude en
+      // faisant croire que les blocs lointains sont les plus récents — et ce sont les
+      // proches qu'on évincerait en premier.
+      const aRepeindre = [];
+      const aAnticiper = [];
+      // L'anticipation ne court pas plus vite que la consommation : le mailleur n'avale
+      // qu'une poignée de tronçons par image, et remplir toute la réserve de blocs lointains
+      // évincerait les blocs proches avant leur tour. La moitié de la réserve reste donc
+      // libre pour les tronçons déjà réclamés par le drain.
+      const placeLibre = Math.max(0, cache.limitesMain - this._fileChauffe.size);
+      const plafondAnticipation = Math.min(12, Math.floor(placeLibre / 2));
+      for (const [dx, dz] of offsets) {
+        const cx = pcx + dx;
+        const cz = pcz + dz;
+        if (!cache.aLeTroncon(cx, cz) || cache.estChaud(cx, cz)) continue;
+        if (this.dirtyKeys.has(this.getChunkKey(cx, cz))) {
+          if (aRepeindre.length < 8) aRepeindre.push([cx, cz]);
+        } else if (aAnticiper.length < plafondAnticipation) {
+          aAnticiper.push([cx, cz]);
+        }
+        if (aRepeindre.length >= 8 && aAnticiper.length >= plafondAnticipation) break;
+      }
+      // `offsetsFor` visite du plus proche au plus loin : les urgents passent devant, et
+      // ils entrent dans la file avec la priorité haute — un tronçon que le drain attend
+      // ne doit jamais attendre derrière une anticipation.
+      if (aRepeindre.length) this.preparerGeom(aRepeindre, { max: 6, urgente: true });
+      if (aAnticiper.length) this.preparerGeom(aAnticiper, { max: 6 });
+    }
 
-    // Le maillage coûte environ trois fois ce que coûte la génération : il lui revient
-    // donc une tranche du budget d'image, et cette tranche est **partagée** entre les
-    // deux passes — sinon chacune consomme sa moitié et l'image déborde. Chaque passe
-    // doit aussi rester sous la fin du budget global : sans cela, une première passe
-    // économe autorisait la seconde à dépasser l'enveloppe (mesuré 11,1 ms pour 10).
-    const finBudget = started + maxMs;
-    const partMaille = maxMs * 0.6;
+    // Deux enveloppes distinctes et **indépendantes**, chacune comptée sur sa propre
+    // consommation :
+    //  - `maxMs` borne la **génération** (le réglage historique, celui qui protège la cadence
+    //    et qui, seul, gouvernait les deux passes avant le 2026-11-17) ;
+    //  - `partMaille` borne la **maille**, partagée entre les deux passages de
+    //    `drainerMailles` — sinon chacun consomme sa part et l'image déborde.
+    // Les séparer est tout l'enjeu : une seule enveloppe adaptative retarde la naissance du
+    // relief de ×1,7 (voir la signature). Compter chaque passe sur son propre temps est la
+    // moitié qui fait le prix : bornée par l'heure absolue d'entrée, la génération s'arrête dès
+    // que la maille a consommé l'enveloppe — c'est exactement ce que coûte la garde partagée,
+    // et ce que ne reproduit pas une fusion qui laisserait à la maille sa propre horloge.
+    const partMaille = Math.max(0, Number.isFinite(maillageMs) ? maillageMs : maxMs * 0.6);
     let tempsMaille = 0;
-    const tranche = () => Math.min(partMaille - tempsMaille, finBudget - performance.now());
+    const tranche = () => partMaille - tempsMaille;
 
     tempsMaille += this.drainerMailles(tranche());
 
     let made = 0;
     let pending = 0;
+    let tempsGener = 0;
     // Le balayage couvre toujours TOUTES les cellules du rayon, sinon `pendingChunks`
     // voudrait dire « ce que nous avons eu le temps de regarder » et non « ce qui reste
-    // à faire » ; seule la génération elle-même est bornée par les seuils et l'horloge.
+    // à faire » ; seule la génération elle-même est bornée par les seuils et son horloge.
     for (const [dx, dz] of offsets) {
       const cx = pcx + dx;
       const cz = pcz + dz;
@@ -1574,9 +2568,12 @@ class World {
       pending++;
       if (made >= maxCells) continue;
       if (this.dirtyKeys.size > CHUNK_MESH_WATERMARK) continue;
-      if (performance.now() > finBudget) continue;
+      if (tempsGener >= maxMs) continue;
       made++; // failures consume budget too, so a bad cell cannot spin forever
-      if (this.generateChunkData(cx, cz)) {
+      const debutCellule = performance.now();
+      const ne = this.generateChunkData(cx, cz);
+      tempsGener += performance.now() - debutCellule;
+      if (ne) {
         // Le tronçon né et ses quatre voisins : chacun doit redessiner la frontière que
         // cette naissance vient de changer. Différer le maillage « jusqu'aux voisins » a
         // été mesuré le 2026-11-15 : cela doublait les repeintures (618 → 1278 sur un
@@ -1592,30 +2589,31 @@ class World {
 
     tempsMaille += this.drainerMailles(tranche());
 
-    // Remove far chunks
-    for (const [key, chunk] of this.chunks) {
-      const dist = Math.max(
-        Math.abs(chunk.cx - pcx),
-        Math.abs(chunk.cz - pcz)
-      );
-      if (dist > radius + 2) {
-        for (const mesh of chunk.meshes) {
-          this.scene.remove(mesh);
-          mesh.geometry.dispose();
-        }
-        chunk.meshes = [];
-        this.chunks.delete(key);
-        this.dirtyKeys.delete(key);
-      }
-    }
-
     this.pendingChunks = pending + this.dirtyKeys.size;
     return { generated: made, pending: this.pendingChunks };
   }
 
   markChunkDirty(cx, cz) {
-    const key = this.getChunkKey(cx, cz);
-    if (this.chunks.has(key)) this.dirtyKeys.add(key);
+    this._marquerSale(this.getChunkKey(cx, cz));
+  }
+
+  /**
+   * Met un tronçon à repeindre — ou l'inscrit comme tel s'il est hors champ. Un tronçon
+   * réservé ne doit PAS entrer dans `dirtyKeys` : il n'est pas à l'image, le mailler
+   * maintenant coûterait 2,5–3,2 ms pour rien, et le compter là ferait grimper
+   * `pendingChunks` d'un travail différé (mesuré le 2026-11-16 : la file remontait entre
+   * deux repesintes à la portée maximale, 3 977 → 3 981, parce que chaque naissance
+   * marquait ses voisins réservés).
+   */
+  _marquerSale(key) {
+    // Ce qui doit être repeint ne peut plus venir du disque : le bloc écrit hier n'est
+    // plus celui de maintenant. On le retire des deux files avant même de savoir si le
+    // tronçon est chargé — un tronçon évincé porte encore son bloc sur le disque.
+    this._oublierGeom(key);
+    const chunk = this.chunks.get(key);
+    if (!chunk) return;
+    if (chunk.horsVue) chunk.aRefaire = true;
+    else this.dirtyKeys.add(key);
   }
 
   // Repaints the atlas tiles of a block type (custom texture upload).
@@ -1625,6 +2623,7 @@ class World {
     const names = new Set([info.tiles.side, info.tiles.top, info.tiles.bottom]);
     let ok = false;
     for (const n of names) ok = atlas.overrideTile(n, source) || ok;
+    if (ok) this.atlasAChange();      // les uv du disque ne désignent plus la même image
     return ok;
   }
 
@@ -1634,6 +2633,7 @@ class World {
     const names = new Set([info.tiles.side, info.tiles.top, info.tiles.bottom]);
     let ok = false;
     for (const n of names) ok = atlas.restoreTile(n) || ok;
+    if (ok) this.atlasAChange();
     return ok;
   }
 }
@@ -2338,7 +3338,20 @@ applyFogForDistance(settings.renderDistance);
 
 const renderer = new THREE.WebGLRenderer({ antialias: false });
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+/** Le ratio que vaut un réglage de netteté — « native » est l'ancien `min(devicePixelRatio, 2)`. */
+function ratioNetrete(reglage = settings.netrete) {
+  const plafond = Math.min(window.devicePixelRatio || 1, PLAFOND_PIXELS_PAR_IMAGE);
+  if (reglage === NETTETE_DEFAUT) return plafond;
+  const n = Number(reglage);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, plafond) : plafond;
+}
+
+function appliquerNetrete() {
+  renderer.setPixelRatio(ratioNetrete());
+}
+
+appliquerNetrete();
 document.body.appendChild(renderer.domElement);
 
 // Lighting
@@ -2909,7 +3922,7 @@ function setRenderDistance(value) {
   settings.renderDistance = next;
   applyFogForDistance(next);
   syncDistanceControl(next); // keep the slider and its readout honest for any caller
-  world.updateChunks(camera.position.x, camera.position.z, CHUNK_STREAM_BUDGET);
+  world.updateChunks(camera.position.x, camera.position.z, CHUNK_STREAM_BUDGET, CHUNK_JUMP_MS);
   saveSettings();
   return next;
 }
@@ -3697,6 +4710,36 @@ function setMeteoMode(value) {
 syncMeteoControl();
 if (meteoSelect) meteoSelect.addEventListener('input', () => setMeteoMode(meteoSelect.value));
 
+// ---- netteté du rendu -----------------------------------------------------
+// Le joueur n'avait aucune prise sur le nombre de pixels rendus. Le curseur ne touche
+// jamais au monde, seulement au canevas : « native » garde exactement l'image d'avant.
+const netreteSel = document.getElementById('netrete');
+const netreteValue = document.getElementById('netrete-value');
+const NETTETE_LIBELLES = {
+  native: 'native', 1: '1×', '0.75': '0,75×', '0.5': '0,5×',
+};
+
+function syncNetreteControl() {
+  if (!netreteSel) return;
+  netreteSel.value = settings.netrete;
+  if (netreteValue) {
+    const r = renderer.getPixelRatio();
+    netreteValue.textContent = `${NETTETE_LIBELLES[settings.netrete] || settings.netrete} · ${Math.round(r * 100)} %`;
+  }
+}
+
+function reglerNetrete(valeur) {
+  const next = NETTETES.includes(String(valeur)) ? String(valeur) : NETTETE_DEFAUT;
+  settings.netrete = next;
+  appliquerNetrete();
+  syncNetreteControl();
+  saveSettings();
+  return next;
+}
+
+syncNetreteControl();
+if (netreteSel) netreteSel.addEventListener('change', () => reglerNetrete(netreteSel.value));
+
 startBtn.addEventListener('click', () => {
   if (!worldReady) return;   // stays disabled until the save has been read back
   inventory.hide();
@@ -3719,6 +4762,7 @@ controls.addEventListener('unlock', () => {
   // Échap ouvre cet écran : le bouton d'enregistrement s'y présente dans l'état réel du
   // disque, et sa note explique une bonne fois ce que l'autosauvegarde fait déjà seule.
   majBoutonEnregistrer();
+  syncGeomBarre();           // idem pour la barre de pré-cuisson : elle doit dire l'état vrai
   if (saveNote && !saveNote.textContent) {
     saveNote.textContent = `Le monde s’économise seul toutes les ${Math.round(AUTOSAVE_INTERVAL_MS / 1000)} s ; ce bouton écrit tout de suite.`;
   }
@@ -3771,10 +4815,15 @@ let lastSaveHudText = null;
 // Any block written by the player has to reach the disk eventually.
 world.onEdit = () => { saveDirty = true; };
 
-function markWorldWritten() {
+// Ce qui a été écrit se juge sur ce que LE PAYLOAD contenait, pas sur l'état du moment
+// où il revient. Sans cette précaution, une écriture partie juste avant une édition se
+// termine après elle et déclare « écrit » un fichier qui ne connaît pas l'édition : le
+// disque reste en retard jusqu'à la prochaine édition (mesuré le 2026-11-16 par
+// `tests/persistence.mjs`, quatre cubes absents du fichier avec `savePending()` faux).
+function markWorldWritten(empreinte) {
   saveDirty = false;
-  writtenEdits = world.modifiedBlocks.size;
-  writtenPos.copy(camera.position);
+  writtenEdits = empreinte ? empreinte.edits : world.modifiedBlocks.size;
+  if (empreinte) writtenPos.copy(empreinte.pos); else writtenPos.copy(camera.position);
 }
 
 // Cheap enough to run every frame: no allocation, no serialisation.
@@ -3809,12 +4858,14 @@ async function flushWorldSave({ force = false, beacon = false } = {}) {
     seed: WORLD_SEEDS, name: worldName, player: player.saveState(),
     edits: world.modifiedBlocks, monde: MONDE, flux: world.eauNiveaux,
   });
+  // L'empreinte est prise ICI, avec le payload : c'est lui qui part sur le disque.
+  const empreinteEcrite = { edits: world.modifiedBlocks.size, pos: camera.position.clone() };
 
   // On the way out the response is worthless, so prefer the one transport the
   // browser promises to deliver after the page is gone.
   if (beacon && saveStore.mode === 'web' && saveStore.saveSoon(text)) {
     lastWriteAt = now;
-    markWorldWritten();
+    markWorldWritten(empreinteEcrite);
     return true;
   }
   if (writingSave) return false;
@@ -3824,7 +4875,7 @@ async function flushWorldSave({ force = false, beacon = false } = {}) {
   finECriture = (async () => {
     try {
       await saveStore.save(text);
-      markWorldWritten();
+      markWorldWritten(empreinteEcrite);
       return true;
     } catch (e) {
       console.warn('Sauvegarde impossible :', e);
@@ -3841,7 +4892,14 @@ async function flushWorldSave({ force = false, beacon = false } = {}) {
 // bucle pendant des minutes, et une écriture du disque n'a rien à attendre de la
 // prochaine image. Le garde-fis est le même (throttlée, et muette tant que rien n'a
 // changé), seul son réveil change de nature.
-setInterval(() => { if (worldReady) flushWorldSave(); }, AUTOSAVE_INTERVAL_MS);
+// La géométrie cuite voyage sur le même réveil : elle s'écrit après le monde, jamais
+// pendant une image. Un joueur qui vole sans rien poser ne salit aucune sauvegarde mais
+// fait mailler des centaines de tronçons — le cache doit avancer aussi dans ce cas-là.
+setInterval(() => {
+  if (!worldReady) return;
+  flushWorldSave();
+  verifierPublicationGeom();
+}, AUTOSAVE_INTERVAL_MS);
 
 function describeAge(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return 'à l’instant';
@@ -3945,31 +5003,736 @@ async function readStoredWorld() {
   }
 }
 
+// ==================== CACHE D'ÎLE ====================
+// Le relief se régénère depuis la graine, mais il coûte 18 ms par tronçon — neuf minutes
+// et demie pour les 31 416 tronçons de l'île par défaut (mesuré le 2026-11-16). Le cache
+// supprime ce temps : le fichier entier (21 Mo compressés) tient en mémoire et chaque
+// tronçon se relit à la demande. Tout décompresser d'un coup coûterait 982 Mo, ce qu'aucun
+// onglet ne supporte — c'est donc la lecture qui est instantanée, pas la mise en RAM.
+//
+// Trois moments : lire le fichier (`chargerCacheIle`), le réchauffer autour du joueur
+// (`rechaufferAutour`), et, s'il manque ou est périmé, le fabriquer (`cuireIle`) — la
+// cuisson s'étale sur des milliers de petites yielded pour que la barre se peigne et que
+// le joueur puisse entrer avant la fin.
+
+const ileEl = document.getElementById('ile');
+const ileBarreEl = document.getElementById('ile-barre');
+const ilePleinEl = document.getElementById('ile-remplissage');
+const ileTexteEl = document.getElementById('ile-texte');
+const ilePasserBtn = document.getElementById('ile-passer');
+const ileRefaireBtn = document.getElementById('ile-refaire');
+
+const ileEtat = {
+  cache: null,
+  phase: 'attente',        // attente | lecture | cuisson | publication | pret | incomplete | passe
+  recus: 0,
+  octetsAttendus: 0,
+  octets: 0,
+  faits: 0,
+  total: 0,
+  attendus: 0,             // tronçons que compte le disque de l'île, selon la fiche
+  complet: false,
+  laisseLibre: false,      // le joueur peut entrer pendant qu'il reste à cuire
+  motif: '',
+  cuisson: null,
+  annulee: false,
+};
+
+/** Combien de tronçons devrait tenir un cache complet pour la fiche en cours. */
+function compterTronconsDeIle() {
+  const bornes = bornesIle(MONDE, CHUNK_SIZE);
+  let n = 0;
+  for (let j = 0; j < bornes.nz; j++)
+    for (let i = 0; i < bornes.nx; i++)
+      if (bornes.contient(bornes.cx + i, bornes.cz + j)) n++;
+  return n;
+}
+
+function ileAttendue() {
+  return { seed: MONDE.graine, monde: MONDE, chunkSize: CHUNK_SIZE, height: CHUNK_HEIGHT };
+}
+
+function decrireOctets(n) {
+  if (!Number.isFinite(n)) return '?';
+  if (n >= 1048576) return `${(n / 1048576).toFixed(1)} Mo`;
+  if (n >= 1024) return `${Math.round(n / 1024)} Ko`;
+  return `${n} o`;
+}
+
+// Repère de départ de la cuisson : seul moyen d'estimer ce qui reste à attendre.
+const ileMarques = { start: 0 };
+
+function afficherIle() {
+  if (!ileEl || !ilePleinEl || !ileTexteEl) return;
+  const e = ileEtat;
+  let plein = 0;
+  let texte = '';
+  if (e.phase === 'lecture') {
+    plein = e.octetsAttendus ? e.recus / e.octetsAttendus : 0;
+    texte = `Lecture du cache de l’île… ${decrireOctets(e.recus)} sur ${decrireOctets(e.octetsAttendus)}`;
+  } else if (e.phase === 'cuisson') {
+    plein = e.total ? e.faits / e.total : 0;
+    const reste = e.total && e.faits ? Math.max(0, Math.round((e.total - e.faits) * (performance.now() - ileMarques.start) / Math.max(1, e.faits) / 1000)) : null;
+    texte = `Fabrication du cache de l’île… ${e.faits} / ${e.total} tronçons`
+      + (reste !== null ? ` · reste ~${reste < 60 ? `${reste} s` : `${Math.round(reste / 60)} min`}` : '');
+  } else if (e.phase === 'publication') {
+    plein = 1;
+    texte = 'Publication du cache sur le disque…';
+  } else if (e.phase === 'pret') {
+    plein = 1;
+    const s = e.cache ? e.cache.stats() : null;
+    texte = s
+      ? (e.complet || !e.attendus
+        ? `Île entière sur le disque · ${s.troncons} tronçons · ${decrireOctets(s.octets)} (${s.codec})`
+        : `Île sur le disque · ${s.troncons} / ${e.attendus} tronçons — le reste se cuira en tâche de fond`)
+      : '';
+  } else if (e.phase === 'incomplete') {
+    plein = e.total ? e.faits / e.total : 1;
+    texte = `Cache incomplet (arrêté à ${e.faits} / ${e.total}) — le reste cuit maintenant, sans vous retenir`;
+  } else if (e.phase === 'passe') {
+    plein = e.total ? e.faits / e.total : 0;
+    texte = e.motif || 'Cache laissé de côté — le terrain se générera à la volée';
+  }
+  ilePleinEl.style.width = `${Math.round(Math.max(0, Math.min(1, plein)) * 100)}%`;
+  if (ileBarreEl) ileBarreEl.setAttribute('aria-valuenow', String(Math.round(plein * 100)));
+  ileTexteEl.textContent = texte;
+  ileEl.hidden = e.phase === 'attente';
+  if (ilePasserBtn) ilePasserBtn.hidden = !(e.phase === 'cuisson' || e.phase === 'lecture');
+  if (ileRefaireBtn) ileRefaireBtn.hidden = !!ileEtat.cuisson;
+}
+
+/** Rend la main à la boucle d'images : la cuisson ne doit jamais geler l'onglet. */
+function rendreLaMain() {
+  return new Promise((rendre) => setTimeout(rendre, 0));
+}
+
+/** Relit le fichier d'île du disque. Renvoie false s'il manque ou ne correspond pas. */
+async function chargerCacheIle() {
+  ileEtat.phase = 'lecture';
+  ileEtat.recus = 0;
+  ileEtat.octetsAttendus = 0;
+  afficherIle();
+  let octets = null;
+  try {
+    octets = await saveStore.loadIsland(saveStore.slot, (lus, total) => {
+      ileEtat.recus = lus;
+      ileEtat.octetsAttendus = total || ileEtat.octetsAttendus;
+      if ((lus & 0x3ffff) < 0x4000) afficherIle();        // une repesinte par ~256 Ko reçus
+    });
+  } catch (e) {
+    ileEtat.motif = `cache illisible (${e.message})`;
+    return false;
+  }
+  if (!octets || octets.length === 0) return false;
+  const cache = new CacheIle(octets, ileAttendue());
+  if (!cache.valide) {
+    ileEtat.motif = cache.motif || 'format non reconnu';
+    console.info('Cache d’île écarté :', ileEtat.motif);
+    return false;
+  }
+  ileEtat.cache = cache;
+  ileEtat.octets = octets.length;
+  ileEtat.attendus = compterTronconsDeIle();
+  ileEtat.complet = cache.stats().troncons >= ileEtat.attendus;
+  world.cacheIle = cache;
+  return true;
+}
+
+/** Réchauffe les tranches qui couvrent les tronçons autour d'un point, avant d'y mailler. */
+async function rechaufferAutour(x, z, rayon) {
+  const cache = ileEtat.cache;
+  if (!cache) return 0;
+  const pcx = Math.floor(x / CHUNK_SIZE);
+  const pcz = Math.floor(z / CHUNK_SIZE);
+  const liste = [];
+  for (let dz = -rayon; dz <= rayon; dz++)
+    for (let dx = -rayon; dx <= rayon; dx++) liste.push([pcx + dx, pcz + dz]);
+  // Pas de plafond à 8 : la demande porte sur tout le champ rendu et `preparerTranches`
+  // ajuste la file chaude dessus. Bornée à 8, elle laissait les tranches du bord froides
+  // et ces tronçons repartaient du bruit malgré le fichier (mesuré 5 sur 49 à r=4).
+  return preparerTranches(cache, liste, { max: TRANCHES_MAX });
+}
+
+/**
+ * Cuit toute l'île et l'écrit sur le disque. Les tronçons déjà présents dans un cache
+ * partiel sont relus (coût d'une tranche) plutôt que régénérés, ce qui rend la reprise
+ * bon marché après un arrêt. Des points d'étape publient régulièrement : rien n'est
+ * perdu de ce qui est déjà cuit si l'onglet meurt en route.
+ */
+async function cuireIle() {
+  if (ileEtat.cuisson) return ileEtat.cuisson;
+  const bornes = bornesIle(MONDE, CHUNK_SIZE);
+  const herite = ileEtat.cache;
+  let total = 0;
+  for (let j = 0; j < bornes.nz; j++)
+    for (let i = 0; i < bornes.nx; i++)
+      if (bornes.contient(bornes.cx + i, bornes.cz + j)) total++;
+
+  ileEtat.total = total;
+  ileEtat.attendus = total;      // même compte : c'est le disque de l'île, selon la fiche
+  ileEtat.faits = 0;
+  ileEtat.annulee = false;
+  ileEtat.phase = 'cuisson';
+  ileMarques.start = performance.now();
+  afficherIle();
+
+  const ecrivain = new EcrivainIle({
+    chunkSize: CHUNK_SIZE, height: CHUNK_HEIGHT, seed: MONDE.graine, monde: MONDE,
+    bornes, codec: codecParDefaut(),
+  });
+
+  const promesse = (async () => {
+    let dernierEnvoi = performance.now();
+    let tour = 0;
+    for (let j = 0; j < bornes.nz && !ileEtat.annulee; j++) {
+      for (let i = 0; i < bornes.nx && !ileEtat.annulee; i++) {
+        const cx = bornes.cx + i;
+        const cz = bornes.cz + j;
+        if (!bornes.contient(cx, cz)) continue;
+        let d = null;
+        if (herite && herite.aLeTroncon(cx, cz)) {
+          const no = herite.trancheDe(cx, cz);
+          if (no >= 0) await herite.rechauffer(no);
+          d = herite.troncon(cx, cz);
+        }
+        if (!d) d = world.fabriquerDonnees(cx, cz);       // sans passer par le monde : 1 Go sinon
+        await ecrivain.ajouter(cx, cz, d);
+        ileEtat.faits++;
+        // Une pause tous les seize tronçons suffit à garder la barre vivante ; pendant
+        // la partie on rend la main deux fois plus souvent, le rendu passe avant.
+        if (++tour % (worldReady && !ecranPose() ? 8 : 16) === 0) {
+          afficherIle();
+          await rendreLaMain();
+        }
+        if (performance.now() - dernierEnvoi > 45000) {
+          ileEtat.phase = 'publication';
+          afficherIle();
+          try { await saveStore.saveIsland(await ecrivain.publier()); } catch (e) { console.warn('Étape non publiée :', e); }
+          ileEtat.phase = 'cuisson';
+          dernierEnvoi = performance.now();
+          afficherIle();
+        }
+      }
+    }
+
+    ileEtat.phase = 'publication';
+    afficherIle();
+    let ecrit = false;
+    try {
+      const fichier = await ecrivain.publier();
+      await saveStore.saveIsland(fichier);
+      const relu = new CacheIle(fichier, ileAttendue());
+      if (relu.valide) {
+        ileEtat.cache = relu;
+        world.cacheIle = relu;
+        ileEtat.octets = fichier.length;
+        ileEtat.complet = relu.stats().troncons >= (ileEtat.attendus || ileEtat.total);
+      }
+      ecrit = true;
+    } catch (e) {
+      console.warn('Cache d’île non publié :', e);
+      ileEtat.motif = `publication impossible (${e.message})`;
+    }
+    ileEtat.phase = ileEtat.annulee || !ecrit ? 'incomplete' : 'pret';
+    ileEtat.cuisson = null;
+    afficherIle();
+    demarrerSansCache();          // la barre est arrivée au bout : plus rien ne retient le joueur
+    return ecrit && !ileEtat.annulee;
+  })();
+
+  ileEtat.cuisson = promesse;
+  return promesse;
+}
+
+function laisserTomberLeCacheIle() {
+  ileEtat.annulee = true;
+  ileEtat.laisseLibre = true;
+  if (!ileEtat.cuisson) {
+    ileEtat.phase = 'passe';
+    afficherIle();
+  }
+  demarrerSansCache();
+}
+
+/** Ce que le joueur peut faire même sans cache : entrer en jeu. */
+function demarrerSansCache() {
+  if (startBtn.disabled && worldReady) startBtn.disabled = false;
+}
+
+if (ilePasserBtn) ilePasserBtn.addEventListener('click', laisserTomberLeCacheIle);
+
+if (ileRefaireBtn) ileRefaireBtn.addEventListener('click', async () => {
+  ileRefaireBtn.disabled = true;
+  try { await saveStore.clearIsland(saveStore.slot); } catch (e) { console.warn('Cache non effacé :', e); }
+  ileEtat.cache = null;
+  world.cacheIle = null;
+  ileEtat.phase = 'attente';
+  ileEtat.motif = '';
+  await cuireIle();
+  ileRefaireBtn.disabled = false;
+});
+
+// ==================== géométrie déjà prête pour la carte ======================
+// Le cache d'île rend le relief ; celui-ci rend les triangles. Il s'écrit tout seul,
+// pendant que le joueur joue, et se lit tronçon par tronçon : jamais il ne retient le
+// démarrage, jamais il ne bloque une image. Trois moments comme pour l'île — relire le
+// fichier (`chargerCacheGeom`), le publier par petites touches (`publierGeometrie`,
+// accroché à l'économise du monde), et le jeter quand le joueur n'en veut plus.
+
+const geomNoteEl = document.getElementById('geom-note');
+const geomTailleSel = document.getElementById('geom-taille');
+const geomTailleValue = document.getElementById('geom-taille-value');
+const geomJeterBtn = document.getElementById('geom-jeter');
+const geomPrecuireEl = document.getElementById('geom-precuire');
+const geomPrecuireValue = document.getElementById('geom-precuire-value');
+
+const geomEtat = { octets: 0, publies: 0, motif: '', enCours: false, etape: '', depuis: 0, migrationEssai: 0 };
+
+// ---- la barre de progression des triangles, sur l'écran d'accueil ----
+// Elle ne bloque pas l'entrée en jeu : reposer un tronçon depuis le fichier coûte 0,29 ms
+// contre 6,94 ms au mailleur, donc attendre l'île entière n'a d'intérêt que si le joueur le
+// demande. D'où le bouton, qui prête alors au four le crédit qu'aucune image ne vient lui
+// disputer (l'écran posé ne rend rien).
+const geomBlocEl = document.getElementById('geom');
+const geomBarreEl = document.getElementById('geom-barre');
+const geomRemplissageEl = document.getElementById('geom-remplissage');
+const geomTexteEl = document.getElementById('geom-texte');
+const geomPrecuireBtnEl = document.getElementById('geom-precuire-ile');
+let precuisonDemandee = false;              // pour cette session, le joueur veut l'île gravie
+
+// Le compte des tronçons de l'île, une seule fois : la barre de l'accueil doit dire où
+// on en est AVANT même que le four soit armé (sinon le joueur voit un bloc vide et ne
+// sait pas ce que le bouton lui promet). `bornesIle` parcourt toute la grille, on garde
+// donc le résultat — il ne change pas tant que la fiche du monde est la même.
+let _totalTronconsIle = 0;
+function totalTronconsIle() {
+  if (_totalTronconsIle) return _totalTronconsIle;
+  const b = bornesIle(MONDE, CHUNK_SIZE);
+  let n = 0;
+  for (let j = 0; j < b.nz; j++)
+    for (let i = 0; i < b.nx; i++)
+      if (b.contient(b.cx + i, b.cz + j)) n++;
+  _totalTronconsIle = n;
+  return n;
+}
+
+/**
+ * Combien de tronçons de l'île sont déjà gravés. Le compteur du four ne convient pas ici :
+ * il repart de zéro à chaque session, alors que le fichier, lui, sait déjà tout ce qu'il
+ * porte — la barre retomberait à 0 % au premier clic du joueur (mesuré : 2 % affichés au
+ * menu, puis 0 % dès que le four s'arme). L'écrivain est construit À PARTIR du fichier relu
+ * (option `existant`) et s'enrichit ensuite : son compte est l'union des deux, jamais une
+ * somme qui compterait deux fois les mêmes tronçons.
+ */
+function tronconsPrets() {
+  const e = world.ecrivainGeom;
+  if (e) return e.entrees.size;
+  return world.cacheGeom?.stats()?.troncons ?? 0;
+}
+
+function syncGeomBarre() {
+  if (!geomBlocEl || !geomRemplissageEl) return;
+  const actif = settings.geomCacheMo > 0 && GEOM_MODE !== 'ignorer';
+  geomBlocEl.hidden = !actif;
+  if (!actif) return;
+  const c = world.etatCuissonIle();
+  const total = c?.attendus || ileEtat.attendus || totalTronconsIle();
+  const prets = tronconsPrets();
+  const pct = total ? Math.min(100, Math.round((100 * prets) / total)) : 0;
+  geomRemplissageEl.style.width = `${pct}%`;
+  if (geomBarreEl) geomBarreEl.setAttribute('aria-valuenow', String(pct));
+  if (geomTexteEl) {
+    geomTexteEl.textContent = prets === 0 && !c
+      ? `rien n'est encore gravé · ${total} tronçons à tailler pour l'île entière`
+      : c?.sature ? `triangles arrêtés à ${prets}/${total} — ${c.motif || 'taille du disque atteinte'}`
+      : `${prets}/${total} tronçons prêts · ${decrireOctets(geomEtat.octets)} au fichier`
+        + (geomEtat.etape ? ` · ${geomEtat.etape}` : '')
+        + (c?.attenteProlongee ? ' · en attente d’une tranche du relief' : '');
+  }
+  if (geomPrecuireBtnEl) {
+    geomPrecuireBtnEl.textContent = precuisonDemandee ? '⏸ Suspendre la pré-cuisson' : '⚙ Pré-cuire l’île';
+  }
+}
+
+function syncGeomControl() {
+  if (geomTailleSel) geomTailleSel.value = String(settings.geomCacheMo);
+  if (geomTailleValue) {
+    geomTailleValue.textContent = settings.geomCacheMo
+      ? `${settings.geomCacheMo} Mo · ${decrireOctets(geomEtat.octets)} écrits`
+      : 'désactivé';
+  }
+  if (geomPrecuireEl) geomPrecuireEl.checked = !!settings.geomPrecuire;
+  if (geomPrecuireValue) {
+    const c = world.etatCuissonIle();
+    geomPrecuireValue.textContent = !settings.geomCacheMo ? 'cache éteint'
+      : !settings.geomPrecuire ? 'au fil des pas'
+      : !c ? 'plan en cours…'
+      : c.sature ? `arrêté à ${c.faits}/${c.attendus} — taille atteinte`
+      : c.attenteProlongee ? `${c.faits}/${c.attendus} · en attente d'une tranche d'île`
+      : c.enMarche ? `${c.faits}/${c.attendus} tronçons taillés`
+      : `île taillée · ${c.faits}/${c.attendus}`;
+  }
+  if (geomNoteEl) {
+    const s = world.cacheGeom ? world.cacheGeom.stats() : null;
+    geomNoteEl.textContent = geomEtat.motif || (s
+      ? `${s.troncons} tronçons sur le disque (${s.codec}) · ${s.decompresse} reposés sans recalcul`
+      + (world.geomEnAttente.size ? ` · ${world.geomEnAttente.size} en file` : '')
+      : (GEOM_MODE === 'ignorer' ? 'Cache laissé de côté pour cette session.' : ''));
+  }
+  syncGeomBarre();          // la barre de l'accueil lit le même état, jamais un autre compte
+}
+
+/** Relit le fichier de géométrie. Renvoie false s'il manque ou ne décrit pas ce monde. */
+async function chargerCacheGeom() {
+  // Tenir la file de maillage pendant la lecture : voir `drainerMailles`. Le garde se lève
+  // dans tous les cas, y compris quand le joueur a mis le budget à zéro — sinon la pose
+  // du monde resterait suspendue jusqu'au plafond horaire.
+  world.cacheGeomEnCours = performance.now();
+  try {
+    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return false;
+    return await lireCacheGeom();
+  } finally {
+    world.cacheGeomEnCours = 0;
+  }
+}
+
+async function lireCacheGeom() {
+  let octets = null;
+  try {
+    octets = await saveStore.loadGeometry(saveStore.slot);
+  } catch (e) {
+    geomEtat.motif = `géométrie illisible (${e.message})`;
+    return false;
+  }
+  if (!octets || !octets.length) return false;
+  const attendu = world.attenduGeom();
+  const cache = CacheGeom.depuis(octets, attendu);
+  if (!cache) {
+    // Pas une erreur : un monde qui change de graine, de fiche, d'atlas ou de mailleur
+    // doit simplement repeindre. Le fichier reste sur le disque, au cas où cela revient.
+    const motif = lireEnTeteGeom(octets, attendu);
+    geomEtat.motif = `triangles du disque écartés : ${motif}`;
+    console.info('Cache de géométrie écarté :', motif);
+    syncGeomControl();
+    return false;
+  }
+  world.cacheGeom = cache;
+  // Vingt-quatre blocs décompressés en main (~11 Mo) : assez pour que la file de maillage
+  // puise dedans sans que le plus ancien soit jeté avant d'avoir été posé.
+  world.cacheGeom.limitesMain = 48;
+  // La capacité annonce à l'écrivain combien de lignes de table réserver dans son en-tête :
+  // c'est ce qui lui permet d'ajouter des blocs sans jamais déplacer les anciens. L'île
+  // borne le nombre de tronçons possibles, donc la réservation ne grossira pas en route.
+  world.ecrivainGeom = new EcrivainGeom({
+    ...attendu, maxOctets: settings.geomCacheMo * 1048576, existant: octets,
+    capaciteEntrees: totalTronconsIle(),
+  });
+  geomEtat.octets = octets.length;
+  geomEtat.motif = '';
+  syncGeomControl();
+  return true;
+}
+
+/** Le motif précis du refus, pour que le joueur sache pourquoi ça repart de zéro. */
+function lireEnTeteGeom(octets, attendu) {
+  const r = lireEnTete(octets, attendu);
+  return r.ok ? 'cache pourtant accepté au premier regard' : r.motif;
+}
+
+/**
+ * Écrit la file sur le disque. Appelé sur le rythme de l'économise du monde — donc après
+ * la sauvegarde, hors boucle d'image — et seulement si quelque chose vaut le déplacement :
+ * compresser trente tronçons coûte quelques dizaines de millisecondes, réparties entre
+ * deux awaited pour ne jamais manger une image.
+ */
+async function publierGeometrie() {
+  if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return false;
+  if (geomEtat.enCours) return false;
+  if (!world.geomEnAttente.size) return false;
+  // Un fichier écrit avant la table réservée ne peut pas grossir par ajout : il faudrait
+  // déplacer tous les blocs, donc tout réécrire. Sur un gros cache — le joueur a 618 Mo
+  // gravés — cette migration ne doit pas tomber pendant qu'il joue ; elle attend le repos,
+  // voile posé, où aucune image n'est comptée. On décide AVANT de vider la file, sans quoi
+  // chaque tentative reporterait le travail en RAM au lieu de le laisser dans la file bornée.
+  const ecrivain = world.ecrivainGeom;
+  const auRepos = imageForcee === false && ecranPose();
+  if (ecrivain && !ecrivain.appendable && (ecrivain.base || 0) > MIGRATION_CACHE_HORS_REPOS_OCTETS
+    && !auRepos) {
+    geomEtat.motif = 'cache à migrer : la réécriture attend une pause du joueur';
+    return false;
+  }
+  geomEtat.enCours = true;
+  // Nommée à chaque étape : une publication qui ne revient pas doit dire où elle est
+  // restée, sinon `enCours` vrai pour toujours se confond avec un monde sans rien à écrire.
+  const etape = (nom) => { geomEtat.etape = nom; geomEtat.depuis = performance.now(); };
+  let ajoutes = 0;
+  try {
+    etape('en-tête');
+    const attendu = world.attenduGeom();
+    const aPublier = [...world.geomEnAttente.entries()];
+    if (!world.ecrivainGeom) {
+      world.ecrivainGeom = new EcrivainGeom({
+        ...attendu, maxOctets: settings.geomCacheMo * 1048576, capaciteEntrees: totalTronconsIle(),
+      });
+    }
+    for (const [cle, e] of aPublier) {
+      etape(`compression ${ajoutes}/${aPublier.length} · ${cle}`);
+      try {
+        await world.ecrivainGeom.ajouterSerialise(e.cx, e.cz, e.octets, e.empreinte);
+        ajoutes++;
+      } catch (err) {
+        if (/budget/.test(err.message)) {
+          // Le disque est plein : on s'arrête là. Si même le premier tronçon n'a pas
+          // trouvé de place, le fichier est déjà à son plafond — cuire la suite ne sert à
+          // rien, le four l'apprend ici plutôt que de payer le mailleur image après image.
+          if (!ajoutes) world.saturerCuissonIle(err.message);
+          break;
+        }
+        if (err && err.suspendu) {
+          // Un transformateur qui ne rend pas la main, deux fois de suite : ce tronçon est
+          // laissé au mailleur plutôt que de tenir tout le fichier en otage. Il sera recuit
+          // à la prochaine repeinture ; les autres, eux, atteignent le disque.
+          console.warn('Tronçon non compressé, laissé au mailleur :', cle, err.message);
+          geomEtat.motif = `transcodage suspendu sur ${cle} — les autres tronçons sont écrits`;
+          world.geomEnAttente.delete(cle);
+          world.geomACuire.delete(cle);
+          continue;
+        }
+        throw err;
+      }
+      // Rendu hors d'atteinte : le tronçon a sa place dans l'écrivain, la file n'a plus
+      // à porter ses 420 Ko.
+      world.geomEnAttente.delete(cle);
+    }
+    if (!ajoutes) return false;
+    // D'abord la voie bon marché : **ajouter** au fichier ce qui est neuf. Elle n'existe
+    // que si l'en-tête en place a le gabarit réservé (sans quoi déplacer le corps fausserait
+    // tous les décalages) et ne coûte que les blocs neufs. La voie complète, elle, payait la
+    // taille entière du fichier à chaque lot — mesuré le 2026-11-17 : 1 496 ms d'envoi pour
+    // 15 Mo déjà en boîte, publié tous les douze tronçons, soit le rendu saccadé du joueur.
+    etape('table des décalages');
+    const tenterAjout = async () => {
+      const morcele = world.ecrivainGeom.publierMorcele();
+      if (!morcele) return false;
+      etape(`ajout · ${(morcele.append.length / 1024) | 0} Ko`);
+      const ajoute = await saveStore.appendGeometry(morcele.append, morcele.base, saveStore.slot);
+      if (ajoute && ajoute.success) {
+        etape(`table · ${morcele.table.octets.length} o`);
+        const tete = await saveStore.putGeometryHead(morcele.table.octets, saveStore.slot, morcele.table.offset);
+        if (tete && tete.success) {
+          world.ecrivainGeom.marquerAjout(morcele, ajoute.bytes);
+          geomEtat.octets = ajoute.bytes;
+          return true;
+        }
+      }
+      // Refusé (fichier disparu, désaccord de taille, magasin du bureau sans append) ou
+      // interrompu : les octets déjà collés restent là, orphelins hors de la table — donc
+      // invisibles — jusqu'à la réécriture.
+      world.ecrivainGeom.appendable = false;
+      return false;
+    };
+    let ecrit = await tenterAjout();
+    if (!ecrit && !world.ecrivainGeom.appendable) {
+      // Cache gravé avant la réservation d'en-tête : ses blocs devraient tous bouger. Les
+      // renvoyer est matériellement impossible depuis le navigateur — mesuré le 2026-11-17
+      // sur les 618 Mo du joueur : `ERR_BLOB_OUT_OF_MEMORY`, et l'onglet écrasé avec la vue
+      // `Uint8Array` nue. Le serveur a ces octets sous la main : il les copie, le jeu ne lui
+      // envoie que sa table (~4 Mo), puis les tronçons neufs partent par ajout.
+      const depuis = performance.now() - geomEtat.migrationEssai;
+      if (geomEtat.migrationEssai && depuis < MIGRATION_ESPACE_MS) {
+        // Un refus récent se laisse rejuger plus tard : le juger coûte vingt millisecondes
+        // sur les vingt-trois mille lignes du cache, et le voile posé fait défiler soixante
+        // images par seconde.
+        geomEtat.motif = `migration attendue (${Math.ceil((MIGRATION_ESPACE_MS - depuis) / 1000)} s)`;
+      } else {
+        geomEtat.migrationEssai = performance.now();
+        const migration = world.ecrivainGeom.preparerMigration();
+        if (migration) {
+          etape(`migration · ${migration.attendu >> 20} Mo copiés chez le serveur · table ${migration.region.length >> 10} Ko`);
+          const migre = await saveStore.migrateGeometry(
+            migration.region, { attendu: migration.attendu, debut: migration.debut }, saveStore.slot);
+          if (migre && migre.success) {
+            world.ecrivainGeom.marquerMigration(migration, migre.bytes);
+            geomEtat.octets = migre.bytes;
+            ecrit = await tenterAjout() || world.ecrivainGeom.nouveaux.size === 0;
+          } else {
+            geomEtat.motif = `migration refusée (${(migre && migre.status) || '?'}) — la réécriture complète attend`;
+          }
+        } else if (world.ecrivainGeom.motifMigration) {
+          // Refusée par l'écrivain lui-même : le dire, sinon le joueur ne voit qu'un cache qui
+          // ne progresse plus et personne ne sait pourquoi.
+          geomEtat.motif = `migration impossible : ${world.ecrivainGeom.motifMigration}`;
+        }
+      }
+    }
+    if (ecrit) {
+      geomEtat.publies += ajoutes;
+      geomEtat.motif = '';
+      syncGeomControl();
+      world.cuireCeQuiAttend({ max: GEOM_EN_ATTENTE_MAX });
+      return true;
+    }
+    if (world.ecrivainGeom.aCorpsManquants) {
+      // Des blocs publiés ont rendu leur copie mémoire : c'est au fichier du serveur de la
+      // rendre. S'il a disparu entre-temps, ces tronçons sont oubliés — le four les recuit.
+      etape('rechargement du fichier');
+      try {
+        const relus = await saveStore.loadGeometry(saveStore.slot);
+        if (relus && relus.length) world.ecrivainGeom.completerDepuis(relus, attendu);
+        else world.ecrivainGeom.jeterCorpsSansMemoire();
+      } catch (e) {
+        world.ecrivainGeom.jeterCorpsSansMemoire();
+      }
+    }
+    if ((world.ecrivainGeom.base || 0) > PLAFOND_ENVOI_NAVIGATEUR_OCTETS) {
+      // Et au-delà, le navigateur ne sait tout simplement pas l'envoyer : mesuré le
+      // 2026-11-17 sur les 618 Mo du joueur, un corps de 592 Mo échoue en
+      // `ERR_BLOB_OUT_OF_MEMORY` et la vue `Uint8Array` nue écrase l'onglet. Le cache en
+      // place reste lisible tel quel ; le joueur peut le vider pour repartir d'un fichier
+      // neuf, que la voie d'ajout remplira sans jamais rien réécrire.
+      // La raison de la migration est conservée devant : sans quoi ce texte général écrase
+      // le « pourquoi » précis (mesuré le 2026-11-17, elle noyait le vrai motif).
+      geomEtat.motif = `${world.ecrivainGeom.motifMigration ? `migration impossible : ${world.ecrivainGeom.motifMigration} · ` : ''}cache trop volumineux pour une réécriture depuis le navigateur — le vider le refait proprement`;
+      syncGeomControl();
+      return false;
+    }
+    const fichier = await world.ecrivainGeom.publier();
+    etape(`envoi au serveur · ${(fichier.length / 1024) | 0} Ko`);
+    await saveStore.saveGeometry(fichier);
+    // Le fichier porte tout : plus rien de ces octets n'a à vivre en RAM.
+    world.ecrivainGeom.marquerReecriture(fichier.length);
+    geomEtat.octets = fichier.length;
+    geomEtat.publies += ajoutes;
+    geomEtat.motif = '';
+    syncGeomControl();
+    // La place libérée dans la file se remplit tout de suite : c'est ce qui fait qu'une
+    // longue traversée finit par tout écrire, et non les seuls premiers tronçons.
+    world.cuireCeQuiAttend({ max: GEOM_EN_ATTENTE_MAX });
+    return true;
+  } catch (e) {
+    console.warn('Géométrie non publiée :', e);
+    geomEtat.motif = `publication manquée (${e.message}) — les tronçons attendent la prochaine`;
+    syncGeomControl();
+    return false;
+  } finally {
+    geomEtat.enCours = false;
+    geomEtat.etape = '';
+  }
+}
+
+/** Ce que l'économise du monde nous autorise à écrire sans peser sur l'image. */
+function verifierPublicationGeom() {
+  if (!worldReady || GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return false;
+  // D'abord remettre en file ce qui avait été refusé faute de place, ensuite seulement
+  // juger si le moment d'écrire est venu.
+  world.cuireCeQuiAttend();
+  const n = world.geomEnAttente.size;
+  if (!n) return false;
+  const attends = performance.now() - world.geomDepuis > GEOM_PUBLIER_APRES_MS;
+  if (n < GEOM_PUBLIER_A && !attends) return false;
+  publierGeometrie();
+  return true;
+}
+
+/** Vide le fichier et la mémoire du cache : le monde se repeindra à la main du mailleur. */
+async function jeterGeometrie() {
+  world.cacheGeom = null;
+  world.ecrivainGeom = null;
+  world.geomEnAttente.clear();
+  world.geomACuire.clear();
+  world._fileChauffe.clear();
+  geomEtat.octets = 0;
+  geomEtat.publies = 0;
+  geomEtat.motif = '';
+  geomEtat.migrationEssai = 0;          // un cache vidé se rejuge sans attendre l'espace
+  try { await saveStore.clearGeometry(saveStore.slot); } catch (e) { console.warn('Géométrie non effacée :', e); }
+  syncGeomControl();
+  return true;
+}
+
+/** Le joueur change la taille du cache : on reporte immédiatement, sans redémarrer. */
+async function reglerBudgetGeom(valeur) {
+  const next = GEOM_BUDGETS_MO.includes(Number(valeur)) ? Number(valeur) : GEOM_BUDGET_DEFAUT_MO;
+  settings.geomCacheMo = next;
+  saveSettings();
+  world.cacheGeom = null;
+  world.ecrivainGeom = null;
+  world.geomEnAttente.clear();
+  world.geomACuire.clear();
+  world._fileChauffe.clear();
+  world.cuissonIle = null;             // le plan de cuisson suit la nouvelle taille
+  geomEtat.octets = 0;
+  if (next) await chargerCacheGeom(); else syncGeomControl();
+  return next;
+}
+
+/** Le joueur décide si l'île se taille toute seule en tâche de fond. */
+function precuireIle(vrai = true) {
+  settings.geomPrecuire = !!vrai;
+  saveSettings();
+  world.cuissonIle = null;                 // le plan se refait sur la nouvelle volonté
+  return settings.geomPrecuire;
+}
+
+if (geomTailleSel) geomTailleSel.addEventListener('change', () => reglerBudgetGeom(geomTailleSel.value));
+if (geomPrecuireEl) geomPrecuireEl.addEventListener('change', () => { precuireIle(geomPrecuireEl.checked); syncGeomControl(); });
+if (geomPrecuireBtnEl) geomPrecuireBtnEl.addEventListener('click', () => {
+  precuisonDemandee = !precuisonDemandee;
+  if (precuisonDemandee) {
+    // Le hook d'animation refuse d'armer le four quand le réglage est éteint ; demander la
+    // pré-cuisson depuis le menu l'engage donc nécessairement — sinon le bouton n'aurait
+    // aucun effet et la barre resterait à « plan en cours… » sans que rien ne l'explique.
+    settings.geomPrecuire = true;
+    saveSettings();
+    if (!world.cuissonIle) world.demarrerCuissonIle();
+  }
+  syncGeomControl();
+});
+if (geomJeterBtn) geomJeterBtn.addEventListener('click', () => jeterGeometrie());
+// Le monde sait qu'il a produit des blocs à écrire mais ne connaît pas le magasin : c'est
+// ici que la file pleine devient une écriture.
+world._demanderPublicationGeom = verifierPublicationGeom;
+
 async function bootWorld() {
   startBtn.disabled = true;
   setWorldStatus('Chargement du monde…');
   let saved = null;
   try {
     saved = await readStoredWorld();
-    if (saved) {
-      // Le fichier porte peut-être une fiche de génération différente de celle du
-      // magasin local — mémoire locale effacée, monde copié d'une autre machine. C'est
-      // le fichier qui a raison : sans lui, les blocs posés par le joueur retomberaient
-      // sur un relief qu'il n'a jamais vu. On range la fiche et on repart une fois ; le
-      // garde de session ferme la porte à une boucle de rechargements.
-      if (saved.monde && !memesMondes(saved.monde, MONDE)) {
-        const cleGarde = `mincraft_fiche_vue:${saveStore.slot}`;
-        try {
-          localStorage.setItem(mondeStorageKey(saveStore.slot), JSON.stringify(clampMonde(saved.monde)));
-          if (!sessionStorage.getItem(cleGarde)) {
-            sessionStorage.setItem(cleGarde, '1');
-            window.location.reload();
-            return;
-          }
-        } catch (e) {
-          console.warn('Fiche du monde non mémorisée :', e);
+    // Le fichier porte peut-être une fiche de génération différente de celle du
+    // magasin local — mémoire locale effacée, monde copié d'une autre machine. C'est
+    // le fichier qui a raison : sans lui, les blocs posés par le joueur retomberaient
+    // sur un relief qu'il n'a jamais vu. On range la fiche et on repart une fois ; le
+    // garde de session ferme la porte à une boucle de rechargements.
+    if (saved && saved.monde && !memesMondes(saved.monde, MONDE)) {
+      const cleGarde = `mincraft_fiche_vue:${saveStore.slot}`;
+      try {
+        localStorage.setItem(mondeStorageKey(saveStore.slot), JSON.stringify(clampMonde(saved.monde)));
+        if (!sessionStorage.getItem(cleGarde)) {
+          sessionStorage.setItem(cleGarde, '1');
+          window.location.reload();
+          return;
         }
+      } catch (e) {
+        console.warn('Fiche du monde non mémorisée :', e);
       }
+    }
+    // Le cache d'île se lit ici, avant la première pierre posée par le boot : c'est lui
+    // qui décide si le relief arrive instantanément ou s'il reste à le fabriquer. Après
+    // la fiche, surtout pas avant — une fiche corrigée ci-dessus recharge la page, et
+    // cuire l'île sous une fiche périmée ne servirait à rien.
+    const ileIgnoree = ILE_MODE === 'ignorer';
+    // Tenir la file de maillage dès ici : la lecture du cache d'île qui suit est un `await`,
+    // donc une fenêtre d'images pendant laquelle le mailleur pourrait partir sans rien savoir.
+    if (GEOM_MODE !== 'ignorer' && settings.geomCacheMo) world.cacheGeomEnCours = performance.now();
+    const ilePret = ileIgnoree ? false : await chargerCacheIle();
+    // Les triangles du disque se relisent avant la première pierre posée par le boot :
+    // les passages d'`updateChunks` ci-dessous maileraient sans savoir que le fichier sait
+    // déjà peindre (mesuré 130 reconstructions sur 154 payées dans ce seul intervalle).
+    // La lecture ne dépend ni des éditions ni de la fiche — seule la pose compare les
+    // empreintes, et elle a lieu bien plus tard, au moment où le tronçon arrive à l'écran.
+    await chargerCacheGeom();
+    if (saved) {
       // Un nom passé par l'URL (création ou renommage à l'instant) prime : c'est
       // l'intention la plus récente, le fichier peut encore porter l'ancienne.
       if (!worldName) worldName = cleanWorldName(saved.name);
@@ -3982,10 +5745,30 @@ async function bootWorld() {
       // portent doivent exister avant qu'on y pose le joueur, sinon il traverse la dalle
       // libre d'air et tombe jusqu'au fond du monde.
       const reveil = resoudreApparition();
-      if (reveil) world.updateChunks(reveil.x, reveil.z, WORLD_BOOT_BUDGET);
+      if (reveil) {
+        if (ilePret) await rechaufferAutour(reveil.x, reveil.z, 6);
+        world.updateChunks(reveil.x, reveil.z, WORLD_BOOT_BUDGET);
+      }
       player.placeAtSpawn();
       world.updateChunks(camera.position.x, camera.position.z, WORLD_BOOT_BUDGET);
       savedAtLocal = Date.now();
+    }
+    // Les triangles du disque ont été relus plus haut, avant le premier `updateChunks`.
+    if (!ilePret && !ileIgnoree) {
+      // Rien d'exploitable sur le disque : on cuit sous les yeux du joueur, sans le
+      // retenir — « Entrer quand même » le laisse partir pendant que la barre avance.
+      cuireIle();
+    } else if (ilePret) {
+      ileEtat.phase = 'pret';
+      afficherIle();
+      await rechaufferAutour(camera.position.x, camera.position.z, Math.max(4, settings.renderDistance));
+      // Un cache arrêté en route vaut ce qu'il vaut : ce qui est dessus arrive
+      // instantanément, le reste se cuira derrière le joueur. Le retenir pour ça
+      // n'aurait pas de sens — il a déjà un sol sous les pieds.
+      if (!ileEtat.complet) {
+        ileEtat.laisseLibre = true;
+        cuireIle();
+      }
     }
   } catch (e) {
     // Replaying a save must never be able to lock the player out of the game: fall
@@ -3995,8 +5778,13 @@ async function bootWorld() {
     player.placeAtSpawn();
   } finally {
     worldReady = true;
-    startBtn.disabled = false;
+    // Le bouton ne se débloque qu'une fois l'île lue — ou laissée de côté, ou en cours
+    // de cuisson : la promesse faite au joueur est qu'ensuite plus rien n'apparaît
+    // sous ses pieds. `demarrerSansCache` le rend dès que la cuisson tombe, et un cache
+    // déjà partiel ne retient personne : il a un sol sous les pieds dès l'entrée.
+    startBtn.disabled = ileEtat.cuisson !== null && !ileEtat.annulee && !ileEtat.laisseLibre;
     majBoutonEnregistrer();
+    syncGeomBarre();         // le menu s'affiche avec sa barre déjà remplie de ce que sait le disque
   }
   if (worldNameInput && !worldNameInput.value) worldNameInput.value = worldName || '';
   // Dire où le joueur se réveille : sans cette ligne, un monde neuf qui s'ouvre sous une
@@ -4289,6 +6077,9 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  // Une fenêtre qu'on déplace sur un autre écran change de `devicePixelRatio` sans jamais
+  // prévenir : le ratio se recalcule ici, sinon « native » resterait figé sur l'écran d'avant.
+  appliquerNetrete();
 });
 
 // ==================== GAME LOOP ====================
@@ -4296,6 +6087,20 @@ let lastTime = performance.now();
 let fps = 0;
 let frameCount = 0;
 let fpsTimer = 0;
+// Ce qu'a coûté la dernière image, lissé (20 % de poids à la nouvelle). C'est la seule
+// boussole du budget de maillage : le nombre d'images par seconde affiché au joueur ne se
+// décide qu'à la seconde, alors que le mailleur doit trancher image par image.
+let dureeImageEMA = CIBLE_IMAGE_MS;
+
+/**
+ * La part d'image laissée au mailleur. À 60 images/s elle rend les 10 ms d'avant ; quand
+ * l'image déborde déjà elle se replie sur le plancher, et quand elle a de la place elle
+ * double pour rattraper le pop-in plus vite.
+ */
+function budgetMaillage() {
+  const marge = CIBLE_IMAGE_MS - dureeImageEMA;
+  return Math.max(BUDGET_MAILLE_MIN_MS, Math.min(BUDGET_MAILLE_MAX_MS, CHUNK_FRAME_MS + marge));
+}
 
 const underwaterEl = document.getElementById('underwater');
 const swimHintEl = document.getElementById('swim-hint');
@@ -4362,8 +6167,13 @@ function animate() {
   requestAnimationFrame(animate);
 
   const now = performance.now();
-  const deltaTime = Math.min((now - lastTime) / 1000, 0.1);
+  const brute = now - lastTime;
+  const deltaTime = Math.min(brute / 1000, 0.1);
   lastTime = now;
+  // Une image à quatre secondes (onglet passé en arrière-plan, réveil sous le voile) n'est
+  // pas une mesure : bornée à 250 ms, elle ne peut pas plomber le lissage pour les vingt
+  // images qui suivent et priver le monde de mailleur sans raison.
+  dureeImageEMA += (Math.min(brute, 250) - dureeImageEMA) * 0.2;
 
   if (reglageOuvert) return;
   // L'écran d'accueil est opaque : rien du monde n'est visible derrière lui, donc rien
@@ -4374,7 +6184,31 @@ function animate() {
     veilleAppliquee = enVeille;
     renderer.domElement.classList.toggle('hors-jeu', enVeille);
   }
-  if (enVeille) return;
+  if (enVeille) {
+    // Le voile est opaque : rien ne se dessine, aucune physique, aucune horloge. Une seule
+    // chose a le droit de continuer, si le joueur l'a demandée depuis le menu — graver des
+    // triangles. Elle maille HORS scène, ne touche ni la caméra ni le rendu, et son crédit
+    // n'est disputé par aucune image : c'est là qu'il rapporte le plus (mesuré 19,6 tronçons
+    // par seconde contre 8,6 pendant qu'on joue).
+    if (precuisonDemandee && !ileEtat.cuisson && settings.geomCacheMo > 0 && GEOM_MODE !== 'ignorer') {
+      // Un four désarmé avant l'appel du bouton (`cuissonIle === false`, posé par l'accroche
+      // d'image sous `?precuire=ignorer` ou quand la file était vide) ne doit pas rendre le
+      // bouton muet : la demande explicite prime sur ce défaut et le réarme — sinon la barre
+      // resterait à zéro sans jamais dire pourquoi.
+      if (!world.cuissonIle && !world.demarrerCuissonIle()) world.cuissonIle = false;
+      if (world.cuissonIle) {
+        world.cuireIleGeometrie(CUISSON_PRECUISON_MS);
+      }
+      syncGeomBarre();
+    }
+    // Le voile posé est le seul moment où la migration d'un vieux cache a le droit de tomber
+    // (`publierGeometrie` l'y renvoie). Sans cet appel, elle attendait une pause que personne
+    // ne venait vérifier — le cache du joueur restait donc bloqué indéfiniment, et mesuré
+    // le 2026-11-17 aucune requête de migration ne partait. Ce qui est déjà payé part ici :
+    // aucune image n'est comptée derrière le voile, donc rien n'est volé au rendu.
+    verifierPublicationGeom();
+    return;
+  }
   framesRendues++;
 
   // FPS counter
@@ -4412,8 +6246,10 @@ function animate() {
     // Ce que le joueur regarde se décharge en premier : au planeur à 34 cubes/s, il
     // traverse son propre champ rendu en moins de quatre secondes.
     directionRegard.set(0, 0, -1).applyQuaternion(camera.quaternion);
+    // L'enveloppe du relief reste celle d'avant (10 ms) ; seule la maille suit la marge
+    // laissée par l'image. Les confondre affame le terrain quand l'image est lente.
     world.updateChunks(camera.position.x, camera.position.z, Infinity, CHUNK_FRAME_MS,
-      directionRegard.x, directionRegard.z);
+      directionRegard.x, directionRegard.z, budgetMaillage());
     majEau(deltaTime);
 
     // The pending cuboid owns the cursor while it lasts; otherwise square off the face
@@ -4435,9 +6271,27 @@ function animate() {
     if (world.pendingChunks > 0) {
       directionRegard.set(0, 0, -1).applyQuaternion(camera.quaternion);
       world.updateChunks(camera.position.x, camera.position.z, Infinity, CHUNK_FRAME_MS,
-        directionRegard.x, directionRegard.z);
+        directionRegard.x, directionRegard.z, budgetMaillage());
     }
   }
+
+  // L'île se taille derrière le joueur : le plan ne se construit qu'une fois et le crédit
+  // d'image n'est prêté au mailleur que quand le champ rendu est déjà posé. Ni dans la
+  // branche « souris capturée » ni dans celle de l'aperçu — la cuisson regarde le monde,
+  // pas la souris, et les sondes de test ne capturent jamais le pointeur.
+  //
+  // Deux gardes, mesurées le 2026-11-16 : le four ne doit rien demander pendant que les
+  // blocs cuisent (il les affamait et le fichier d'île restait à zéro octet), et il suit
+  // le joueur — un plan trié depuis la plage ne doit pas s'obstiner à tailler l'autre
+  // bout du monde pendant qu'on attend sous les pieds.
+  if (world.cuissonIle === null && !ileEtat.cuisson) {
+    if (!settings.geomPrecuire || PRECUIRE_MODE === 'ignorer' || !world.demarrerCuissonIle()) world.cuissonIle = false;
+  }
+  if (world.cuissonIle && world._centre) {
+    const c = world._centre, o = world.cuissonIle.centre;
+    if (Math.max(Math.abs(c.pcx - o.pcx), Math.abs(c.pcz - o.pcz)) > c.radius + 8) world.cuissonIle = null;
+  }
+  if (world.cuissonIle && !ileEtat.cuisson && world.pendingChunks === 0) world.cuireIleGeometrie();
 
   updateSelectionHud();
   updateWaterHud();
@@ -4744,6 +6598,32 @@ window.__mc = {
   DEFAULT_RENDER_DISTANCE,
   CHUNK_STREAM_BUDGET,
   CHUNK_FRAME_MS,
+  // ---- netteté et cadence ----
+  // Ce que jugent les suites : le canevas réellement alloué (pas l'intention du réglage),
+  // et la part d'image que le bucle prête au mailleur image par image.
+  NETTETES,
+  reglerNetrete: (valeur) => reglerNetrete(valeur),
+  netrete: () => ({
+    reglage: settings.netrete,
+    ratio: renderer.getPixelRatio(),
+    tampon: [renderer.domElement.width, renderer.domElement.height],
+    fenetre: [window.innerWidth, window.innerHeight],
+    devicePixelRatio: window.devicePixelRatio,
+  }),
+  budgetMaillage: () => ({
+    ms: +budgetMaillage().toFixed(2),
+    ema: +dureeImageEMA.toFixed(1),
+    cible: CIBLE_IMAGE_MS,
+    min: BUDGET_MAILLE_MIN_MS,
+    max: BUDGET_MAILLE_MAX_MS,
+    fixe: CHUNK_FRAME_MS,
+  }),
+  /** Pose le lissage du temps d'image : sans ce levier, rien ne prouve que le budget suit l'image. */
+  reglerDureeImage: (ms) => {
+    dureeImageEMA = Number.isFinite(ms) ? Math.max(0, ms) : CIBLE_IMAGE_MS;
+    return dureeImageEMA;
+  },
+  MARGE_CHAMP_RENDU,
   WORLD_BOOT_BUDGET,
   SETTINGS_STORAGE_KEY,
   keys,
@@ -4792,6 +6672,115 @@ window.__mc = {
       }
     }
     return faits;
+  },
+  // ---- budget mémoire des mailleurs ----
+  // Ce que jugent les suites de rétention : la note courante de tampons, le quota admis,
+  // et de quoi l'imposer pour éprouver l'éviction sans saturer un poste de test.
+  memoire: () => {
+    let reserves = 0, troncons = 0, meshesDessines = 0;
+    for (const c of world.chunks.values()) {
+      troncons++;
+      if (c.horsVue) reserves++;
+      else meshesDessines += c.meshes.length;
+    }
+    return {
+      octetsMailles: world.octetsMailles,
+      quota: world._rafraichirQuota(performance.now()),
+      troncons,
+      reserves,
+      meshesDessines,
+      exposeParLeNavigateur: !!(typeof performance !== 'undefined' && performance.memory
+        && Number.isFinite(performance.memory.jsHeapSizeLimit)),
+    };
+  },
+  reglerQuotaGeometrie(octets) {
+    world.quotaForce = Number.isFinite(octets) && octets > 0 ? Math.floor(octets) : null;
+    return world.quotaForce;
+  },
+  // ---- géométrie prête pour la carte ----
+  // Ce que jugent les suites : un tronçon reposé depuis le disque ne doit rien au
+  // mailleur, et un bloc touché par le joueur ne doit jamais revenir du fichier.
+  geomMode: GEOM_MODE,
+  geomEtat: () => ({
+    motif: geomEtat.motif,
+    octets: geomEtat.octets,
+    publies: geomEtat.publies,
+    enFile: world.geomEnAttente.size,
+    aCuire: world.geomACuire.size,
+    aChauffer: world._fileChauffe.size,
+    enCours: geomEtat.enCours,
+    etape: geomEtat.etape,
+    etapeDepuis: geomEtat.enCours ? Math.round(performance.now() - geomEtat.depuis) : 0,
+    budgetMo: settings.geomCacheMo,
+    stats: world.cacheGeom ? world.cacheGeom.stats() : null,
+    version: MAILLE_VERSION,
+    cuisson: world.etatCuissonIle(),
+  }),
+  /** Le mailleur a-t-il été appelé depuis le dernier appel ? (le cache doit répondre zéro) */
+  rebuildsDepuis() {
+    const n = world._rebuilds;
+    const d = world._rebuildsDepuisDisque;
+    world._rebuilds = 0;
+    world._rebuildsDepuisDisque = 0;
+    return { mailles: n, depuisDisque: d };
+  },
+  geomPret: (cx, cz) => !!(world.cacheGeom && world.cacheGeom.pret(cx, cz)),
+  publierGeometrie: () => publierGeometrie(),
+  chargerCacheGeom: () => chargerCacheGeom(),
+  jeterGeometrie: () => jeterGeometrie(),
+  reglerBudgetGeom: (mo) => reglerBudgetGeom(mo),
+  /** Cuisson de fond forcée, hors cadence d'image : ce jugent les suites. */
+  cuireGeometrieFond: (maxMs = 1000) => {
+    if (world.cuissonIle === null) world.demarrerCuissonIle();   // la sonde n'attend pas l'image
+    return world.cuireIleGeometrie(maxMs);
+  },
+  precuireIle: (vrai = true) => precuireIle(vrai),
+  // ---- cache d'île ----
+  // Ce que jugent les suites de chargement : l'état de la barre, ce que le cache sait
+  // déjà, et de quoi vider ou relancer une cuisson sans passer par la souris.
+  ileMode: ILE_MODE,
+  ileEtat: () => ({
+    phase: ileEtat.phase,
+    motif: ileEtat.motif,
+    faits: ileEtat.faits,
+    total: ileEtat.total,
+    octets: ileEtat.octets,
+    attendus: ileEtat.attendus,
+    complet: ileEtat.complet,
+    laisseLibre: ileEtat.laisseLibre,
+    cache: !!ileEtat.cache,
+    cuisson: !!ileEtat.cuisson,
+    stats: ileEtat.cache ? ileEtat.cache.stats() : null,
+  }),
+  ileBarre: () => (ileEl && !ileEl.hidden
+    ? { pleine: ilePleinEl.style.width, texte: ileTexteEl.textContent }
+    : null),
+  // La barre des triangles, jugée comme celle de l'île : ce que le joueur lit, pas ce que
+  // l'état interne promet. Et le bouton, pilotable pour les suites qui ne savent pas cliquer.
+  geomBarre: () => (geomBlocEl && !geomBlocEl.hidden
+    ? {
+        pleine: geomRemplissageEl.style.width, texte: geomTexteEl.textContent,
+        aria: geomBarreEl?.getAttribute('aria-valuenow') ?? null, prets: tronconsPrets(),
+      }
+    : null),
+  precuireIleMaintenant: (vrai = true) => {
+    precuisonDemandee = !!vrai;
+    if (precuisonDemandee) {
+      settings.geomPrecuire = true;
+      saveSettings();
+      if (!world.cuissonIle) world.demarrerCuissonIle();
+    }
+    syncGeomControl();
+    return precuisonDemandee;
+  },
+  ileCuire: () => cuireIle(),
+  ileRelire: () => chargerCacheIle(),
+  ileRechauffer: (x, z, rayon) => rechaufferAutour(x, z, rayon),
+  async ileEffacer() {
+    ileEtat.cache = null;
+    world.cacheIle = null;
+    try { await saveStore.clearIsland(saveStore.slot); } catch (e) { /* rien à effacer */ }
+    return true;
   },
   feetY() { return player.feetY; },
   respawn: () => player.respawn(),

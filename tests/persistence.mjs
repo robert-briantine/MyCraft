@@ -322,6 +322,18 @@ check('la liste expose les métadonnées du monde',
   JSON.stringify(metaA));
 
 // Supprimer le monde non actif laisse l'actif intact.
+//
+// On rend d'abord la main à la page du monde B : une page encore vivante continue d'y
+// publier ses triangles, et le serveur refuse à juste titre d'écrire dans un fichier que
+// quelqu'un vient d'effacer. Mesuré le 2026-11-17, ce 409 de `/world-geometry/append`
+// faisait tomber « aucune réponse HTTP en erreur », et la réécriture de secours du client
+// ressuscitait le cache que le test venait de supprimer. Ce n'est pas le comportement du
+// joueur — on ne supprime pas depuis la liste un monde qu'on est en train de jouer.
+await pageB.waitForFunction(
+  () => { const e = window.__mc.geomEtat(); return !e.enCours && e.enFile === 0; },
+  null, { timeout: 20000 },
+).catch(() => {});
+await pageB.close();
 await page.evaluate((slot) => window.__mc.deleteWorld(slot), SLOT_B);
 await page.waitForFunction(
   (slot) => ![...document.querySelectorAll('.world-pick')].some((b) => b.dataset.slot === slot),
