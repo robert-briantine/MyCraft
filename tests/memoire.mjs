@@ -18,12 +18,19 @@ const page = await browser.newPage({ viewport: { width: 900, height: 560 } });
 const erreurs = [];
 page.on('pageerror', (e) => erreurs.push(e.message));
 
-/** Remplit la profondeur courante jusqu'à épuisement de la file. */
+/**
+ * Remplit la profondeur courante jusqu'à épuisement de la file et DIT si elle a épuisé.
+ * Le plafond est une patience de harnais, pas une exigence du jeu : à 4 000 passes, un
+ * flot qui boucle sur place ne tombe pas, il gèle la suite (mesuré 2026-11-18, plus de
+ * dix minutes sans un octet de plus au journal). La convergence est donc renvoyée et
+ * jugée, sinon le seul symptôme d'un né serait notre attente.
+ */
 const REMPLIR = `(maxCellules) => {
   const mc = window.__mc, w = mc.world, p = mc.camera.position;
   w.updateChunks(p.x, p.z, Infinity, 120000);
   let garde = 0;
-  while (w.pendingChunks > 0 && garde++ < 4000) w.updateChunks(p.x, p.z, maxCellules, 120000);
+  while (w.pendingChunks > 0 && garde++ < 300) w.updateChunks(p.x, p.z, maxCellules, 120000);
+  return { passes: garde, draine: w.pendingChunks === 0 };
 }`;
 
 async function ouvrir() {
@@ -39,9 +46,13 @@ async function ouvrir() {
 }
 
 const reglages = async (r) => page.evaluate(({ r, code }) => {
-  window.__mc.settings.renderDistance = r;
-  new Function('maxCellules', `return (${code})(maxCellules)`)(256);
-  return window.__mc.memoire();
+  // La profondeur se règle par le geste du joueur, pas en écrivant le réglage : la brume
+  // suit alors le rayon. Poser `settings.renderDistance` à la main laisserait la brume aux
+  // valeurs d'avant, et la frontière de ce qui se maille jugerait un disque qui ne
+  // correspond plus à rien de rendu (mesuré le 2026-11-18 sur cette même suite).
+  window.__mc.setRenderDistance(r);
+  const rempli = new Function('maxCellules', `return (${code})(maxCellules)`)(256);
+  return Object.assign(window.__mc.memoire(), rempli);
 }, { r, code: REMPLIR });
 
 try {
@@ -100,9 +111,26 @@ try {
   // ==================== SOUS PRESSION, L'ÉVICTION JOUE ====================
   await page.evaluate(() => window.__mc.reglerQuotaGeometrie(2 * 1024 * 1024));
   const presse = await reglages(8);
-  check('sous un quota minuscule, tout ce qui est hors vue est libéré',
-    presse.reserves === 0 && presse.octetsMailles < large.octetsMailles,
-    `${presse.reserves} réservé(s) · ${(presse.octetsMailles / 1048576).toFixed(1)} Mo contre ${(large.octetsMailles / 1048576).toFixed(1)} Mo`);
+  // Ce que la pression doit arracher, ce sont les TRIANGLES, pas la donnée du terrain :
+  // un tronçon hors champ gardé sans tampons coûte 32 Ko et suit le tronçon (voir la fiche
+  // « Budget de géométrie »). Exiger `reserves === 0` confondait les deux depuis que la
+  // frontière rendue est plus serrée que le champ chargé — mesuré 31 tronçons réservés à
+  // zéro octet sous un quota forcé, comptés comme une faute.
+  const reservesGardeurs = await page.evaluate(() => {
+    let n = 0, octets = 0;
+    for (const c of window.__mc.world.chunks.values()) {
+      if (c.horsVue && c.octets > 0) { n++; octets += c.octets; }
+    }
+    return { n, mo: +(octets / 1048576).toFixed(1) };
+  });
+  check('sous un quota minuscule, plus aucun tronçon hors vue ne garde de triangles',
+    reservesGardeurs.n === 0 && presse.octetsMailles < large.octetsMailles,
+    `${reservesGardeurs.n} réservé(s) avec tampons (${reservesGardeurs.mo} Mo)`
+    + ` · ${(presse.octetsMailles / 1048576).toFixed(1)} Mo contre ${(large.octetsMailles / 1048576).toFixed(1)} Mo`
+    + ` · ${presse.reserves} réservés ne gardant rien`);
+  check('et sous la pression le flot converge au lieu de boucler sur place',
+    presse.draine && presse.passes < 120,
+    `${presse.passes} passe(s) pour vider la file` + (presse.draine ? '' : ' — JAMAIS VIDÉE (né)'));
   check('mais ce que le joueur regarde reste dessiné',
     presse.meshesDessines > 0 && presse.troncons >= 60,
     `${presse.meshesDessines} mailleurs dessinés · ${presse.troncons} tronçons en mémoire`);
@@ -122,7 +150,7 @@ try {
     let x = cx * mc.CHUNK_SIZE + 3, z = cz * mc.CHUNK_SIZE + 5, y = 4;
     for (let essai = 0; essai < 60 && w.getBlock(x, y, z) !== mc.BLOCK.AIR; essai++) y++;
     // On réduit : le tronçon passe en réserve.
-    mc.settings.renderDistance = 2;
+    mc.setRenderDistance(2);
     new Function('maxCellules', `return (${code})(maxCellules)`)(256);
     const reserve = !!w.chunks.get(cle)?.horsVue;
     // On salit pendant l'absence.

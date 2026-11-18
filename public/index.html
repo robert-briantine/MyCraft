@@ -402,36 +402,14 @@
       </select>
       <output id="netrete-value" for="netrete">—</output>
     </div>
-    <div class="setting-row">
-      <label for="geom-taille">Triangles sur le disque</label>
-      <select id="geom-taille">
-        <option value="0">Désactivé</option>
-        <option value="32">32 Mo</option>
-        <option value="64">64 Mo</option>
-        <option value="128">128 Mo</option>
-        <option value="256">256 Mo</option>
-        <option value="512">512 Mo</option>
-        <option value="1024">1 Go · île entière</option>
-        <!-- Mesuré le 2026-11-16 : un tronçon gravé pèse 23,6 à 32 Ko au fichier selon
-             qu'on compte ou non table des décalages, et l'île en compte 33 992 — entre
-             800 Mo et 1,1 Go. Un palier au-dessus laisse respirer une carte travaillée. -->
-        <option value="2048">2 Go</option>
-      </select>
-      <output id="geom-taille-value" for="geom-taille">—</output>
-    </div>
-    <div class="setting-row">
-      <label for="geom-precuire">Précuire toute l'île</label>
-      <input type="checkbox" id="geom-precuire" checked>
-      <output id="geom-precuire-value" for="geom-precuire">—</output>
-    </div>
-    <p class="setting-note">Ce que le mailleur a déjà payé est écrit sur le disque, dans la forme même que réclame la carte graphique : au retour, les décors se posent sans être recalculés. Le fichier se remplit tout seul pendant que vous jouez, et se vide à chaque bloc touché.</p>
+    <p class="setting-note">Ce que le mailleur a déjà payé est écrit sur le disque, dans la forme même que réclame la carte graphique : au retour, les décors se posent sans être recalculés. Le fichier se remplit tout seul pendant que vous jouez — et pendant que vous attendez à l'accueil, où rien ne se dessine, il taille l'île entière. Sa place est calculée depuis la mémoire de l'onglet, comme celle des géométries en RAM ; il se vide à chaque bloc touché.</p>
     <p class="setting-note" id="geom-note"></p>
     <div class="setting-actions">
       <button id="geom-jeter" title="Effacer les triangles cuits : le monde sera repeint par le mailleur">Jeter les triangles du disque</button>
     </div>
     <p class="setting-note">Aperçu en direct derrière ce panneau · valeur mémorisée entre les sessions</p>
     <p class="setting-note">Le soleil se lève à l'est, culmine à midi et se couche derrière le relief ; la nuit tombe sur le monde et les lanternes des villes s'allument. Sous terre il fait noir en toute heure — posez-y une lanterne.</p>
-    <p class="setting-note">De temps en temps le ciel devient gris et la pluie tombe : le relief perd sa lumière et la brume se resserre. Sous un toit, on reste au sec. « Ciel clair » ou « averse continue » pour imposer la météo.</p>
+    <p class="setting-note">Le ciel change avant la pluie : il grise d'abord, puis les gouttes tombent, et quand l'averse s'achève il retrouve son bleu progressivement. Les nuages dérivent avec le vent, et de temps en temps une journée entière se découvre — le soleil y brille davantage dans un ciel profond. Sous un toit, on reste au sec. « Ciel clair » ou « averse continue » pour imposer la météo.</p>
   </details>
 
   <div class="worldgen-entry">
@@ -468,16 +446,14 @@
 
   <!-- Cache de triangles : la deuxième barre. Elle ne bloque pas l'entrée — les décors
        déjà taillés se posent 24 fois plus vite qu'ils ne se recalculent, donc attendre
-       l'île entière n'a de sens que si le joueur le demande lui-même. -->
+       l'île entière n'a jamais de sens ici. Le four taille derrière le voile, sans case à
+       cocher et sans bouton : c'est là que son temps ne coûte aucune image. -->
   <div id="geom" hidden>
     <div class="ile-barre" role="progressbar" aria-label="Cuisson des triangles de l'île"
          aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="geom-barre">
       <div id="geom-remplissage"></div>
     </div>
     <p id="geom-texte" class="setting-note"></p>
-    <div class="ile-actions">
-      <button id="geom-precuire-ile" title="Graver l'île entière pendant que vous attendez ici : rien ne se dessine derrière, ce temps ne coûte aucune image. Compté ~25 min pour les 33 992 tronçons ; ce qui est gravé tient sur le disque et repart de là au prochain lancement.">⚙ Pré-cuire l’île</button>
-    </div>
   </div>
 
   <div class="save-row">

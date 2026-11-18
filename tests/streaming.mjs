@@ -34,8 +34,12 @@ const r = await page.evaluate(() => {
   const pcx = Math.floor(X / CS), pcz = Math.floor(Z / CS);
 
   mc.image(true);
-  mc.settings.renderDistance = rayon;
   mc.camera.position.set(X, 40, Z);
+  // La profondeur se règle par le geste du joueur : la brume suit le rayon, et la frontière
+  // de ce qui a droit à une maille juge le même disque que l'image. Écrire
+  // `settings.renderDistance` à la main laisserait la brume aux valeurs d'avant — le flot
+  // se jugerait alors sur un champ que rien ne rend (mesuré le 2026-11-18).
+  mc.setRenderDistance(rayon);
 
   // --- ordre de visite ----------------------------------------------------
   const adossant = W.offsetsFor.call(mc.world, rayon, 1, 0);
@@ -120,7 +124,7 @@ const r = await page.evaluate(() => {
     uneCote = Math.max(uneCote, performance.now() - t);
   }
 
-  mc.settings.renderDistance = mc.DEFAULT_RENDER_DISTANCE;
+  mc.setRenderDistance(mc.DEFAULT_RENDER_DISTANCE);
   return {
     ordre, N, nesDevant, nesDerriere, nesTotal,
     gardes: garde, manquants, sansMaillage, enPlace, apresDrain,

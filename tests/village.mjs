@@ -2565,8 +2565,18 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   };
 
   let maisonsJugees = 0, maisonsEclairees = 0, toursJugees = 0, toursEclairees = 0;
-  let lanternes = 0, scellees = 0, sansDalle = 0, tetesCoupees = 0, genantes = 0, enterrees = 0;
-  let poteauxEnImmeuble = 0, piecesJugees = 0, piecesEclairees = 0, hallsJuges = 0, hallsEclaires = 0;
+  let poteauxEnBati = 0, piecesJugees = 0, piecesEclairees = 0, hallsJuges = 0, hallsEclaires = 0;
+  // Couverture : ce que le joueur reprochait au candélabre, ce n'est pas sa lumière, c'est
+  // sa case. Passé au mur, le globe doit quand même porter jusqu'au fond de la pièce.
+  let plusLoigne = 0, maisonLaPlusLoigne = null, casesMarchees = 0;
+  // Les deux baies de deux sur deux demandées le 2026-11-18 : « revoie la construction des
+  // maisons pour avoir deux fenêtres de 2 cubes sur 2 cubes comme dans les pièces d'immeuble
+  // et pas des petites fenêtres de 1 cube ». Trois choses se jugent : le verre levé dans le
+  // monde est exactement celui que le plan déclare (ni un trou de quinconce oublié, ni une
+  // baie non estampée), ces cellules dessinent bien deux rectangles de deux sur deux, et ils
+  // sont sur la façade sur rue, là où le passant les voit.
+  let maisonsFideles = 0, maisonsBienPercees = 0, maisonsBaiesSurRue = 0;
+  const memeEmpreinte = (a, b) => a.size === b.size && [...a].every((v) => b.has(v));
   const APP = [BLOCK.LAMP_WALL_O, BLOCK.LAMP_WALL_E, BLOCK.LAMP_WALL_N, BLOCK.LAMP_WALL_S];
   const estApplique = (id) => APP.includes(id);
   for (let cx = -6; cx <= 6; cx++) {
@@ -2576,47 +2586,110 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
         if (tour) toursJugees++; else maisonsJugees++;
         // `p.x0`/`p.z0` sont relatifs au tronçon propriétaire du plan.
         const px = cx * CHUNK_SIZE + p.x0, pz = cz * CHUNK_SIZE + p.z0;
-        let trouvee = false;
+        // Un seul balayage : les globes muraux de l'emprise, et tout candélabre qui y
+        // traînerait encore — pied comme lanterne, à toute hauteur. Le poteau est banni du
+        // bâti depuis le 2026-11-18 (« des appliques dans toutes les maisons à la place d'un
+        // lampadaire au milieu qui bouche le passage ») : sa case compte pleine à la marche,
+        // quand bien même le bloc dessine une silhouette fine.
+        const globes = [];
         for (let x = px; x < px + p.w; x++) {
           for (let z = pz; z < pz + p.d; z++) {
             for (let y = p.siteH; y <= p.siteH + p.height + 1; y++) {
-              if (blocIci(x, y, z) !== BLOCK.LAMP_GLOW) continue;
-              trouvee = true; lanternes++;
-              if (tour) poteauxEnImmeuble++;
-              // Le pied sous la lanterne, la dalle sous le pied, le vide au-dessus : une
-              // lanterne murée ou suspendue ne serait plus jamais posable à la main.
-              if (blocIci(x, y - 1, z) !== BLOCK.LAMP_POST) scellees++;
-              if (!blocIci(x, y - 2, z)) sansDalle++;
-              if (blocIci(x, y + 1, z)) tetesCoupees++;
-              // Deux hauteurs, deux règles : au niveau du pied, le tour compte comme la
-              // largeur de passage et doit être libre ; à hauteur de lanterne, un mur de
-              // côté est normal (lampe d'angle) mais il faut que la lumière sorte et qu'une
-              // face reste à casser — deux des quatre faces comptent.
-              let facesLibres = 0;
-              for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-                if (blocIci(x + dx, y - 1, z + dz)) genantes++;   // bloquerait le passage
-                if (!blocIci(x + dx, y, z + dz)) facesLibres++;
-              }
-              if (facesLibres < 2) enterrees++;
+              const b = blocIci(x, y, z);
+              if (estApplique(b)) globes.push({ wx: x, wz: z });
+              else if (b === BLOCK.LAMP_POST || b === BLOCK.LAMP_GLOW) poteauxEnBati++;
             }
           }
+        }
+        // La portée d'une lampe est de 9 cubes (`LAMPE_PORTEE`) ; exiger qu'aucune case
+        // marchable n'en soit qu'à moitié plus loin juge le fond de la pièce sans dépendre
+        // du nombre de globes tirés. Mesuré sur 139 maisons et 2 706 cases marchables : le
+        // cas le plus lointain est à 5 cubes.
+        let pireIci = 0;
+        if (!tour) {
+          for (let x = px + 1; x < px + p.w - 1; x++) {
+            for (let z = pz + 1; z < pz + p.d - 1; z++) {
+              for (let y = p.siteH; y <= p.siteH + p.height; y++) {
+                if (blocIci(x, y, z) !== BLOCK.AIR) continue;         // on n'y marche pas
+                if (!blocIci(x, y - 1, z)) continue;                  // pas de dalle
+                if (blocIci(x, y + 1, z) !== BLOCK.AIR) continue;     // garde-tête
+                casesMarchees++;
+                let d = Infinity;
+                for (const g of globes) {
+                  const dd = Math.max(Math.abs(g.wx - x), Math.abs(g.wz - z));
+                  if (dd < d) d = dd;
+                }
+                if (d > pireIci) pireIci = d;
+              }
+            }
+          }
+          if (pireIci > plusLoigne) {
+            plusLoigne = pireIci;
+            maisonLaPlusLoigne = { x: px, z: pz, w: p.w, d: p.d, globes: globes.length };
+          }
+          // Tout le verre du pourtour, à toute hauteur du mur, confronté cube pour cube à
+          // ce que le plan déclare. Le quinconce qui perçait un cube sur deux avant cette
+          // demande survivrait ici sous forme de cellules « en plus ».
+          const relevees = new Set();
+          for (let x = px; x < px + p.w; x++) {
+            for (let z = pz; z < pz + p.d; z++) {
+              if (!(x === px || x === px + p.w - 1 || z === pz || z === pz + p.d - 1)) continue;
+              for (let y = p.siteH + 1; y <= p.siteH + p.height; y++) {
+                if (blocIci(x, y, z) === BLOCK.GLASS) relevees.add(`${x},${y},${z}`);
+              }
+            }
+          }
+          const attendues = new Set();
+          for (const b of (p.baies || [])) {
+            for (let y = b.yBas; y <= b.yHaut; y++) {
+              attendues.add(`${cx * CHUNK_SIZE + b.lx},${y},${cz * CHUNK_SIZE + b.lz}`);
+            }
+          }
+          let ecartDeVitrage = 0;
+          for (const c of relevees) if (!attendues.has(c)) ecartDeVitrage++;
+          for (const c of attendues) if (!relevees.has(c)) ecartDeVitrage++;
+          if (!ecartDeVitrage && attendues.size) maisonsFideles++;
+          // Les colonnes vitrées se regroupent en baies : deux colonnes jointives portant le
+          // même empilement de rangées font une baie de deux sur deux.
+          const colonnes = new Map();
+          for (const c of attendues) {
+            const [sx, sy, sz] = c.split(',').map(Number);
+            const leLongX = p.doorSide === 0 || p.doorSide === 2;
+            const cle = `${leLongX ? `z${sz}` : `x${sx}`}|${leLongX ? sx : sz}`;
+            if (!colonnes.has(cle)) colonnes.set(cle, new Set());
+            colonnes.get(cle).add(sy);
+          }
+          const baies = [];
+          const vues = new Set();
+          for (const cle of colonnes.keys()) {
+            if (vues.has(cle)) continue;
+            vues.add(cle);
+            const [plan, uStr] = cle.split('|');
+            const ys = colonnes.get(cle);
+            let u = Number(uStr), l = 1;
+            while (colonnes.has(`${plan}|${u + l}`) && memeEmpreinte(colonnes.get(`${plan}|${u + l}`), ys)) {
+              vues.add(`${plan}|${u + l}`);
+              l++;
+            }
+            baies.push({ plan, l, h: ys.size });
+          }
+          if (baies.length === 2 && baies.every((b) => b.l === 2 && b.h === 2)) maisonsBienPercees++;
+          // Et les deux sont bien sur la façade où donne la porte — le passant doit les voir
+          // en arrivant, sinon le dessin s'est replié sur un pignon sans qu'on le remarque.
+          const faceAttendue = p.doorSide === 0 ? `z${pz}`
+            : p.doorSide === 2 ? `z${pz + p.d - 1}`
+            : p.doorSide === 1 ? `x${px}` : `x${px + p.w - 1}`;
+          if (baies.length === 2 && baies.every((b) => b.plan === faceAttendue)) maisonsBaiesSurRue++;
         }
         // L'immeuble, lui, ne se meuble que d'appliques (demandé le 2026-11-12) : le
         // poteau occupe toute sa case à la marche, donc où qu'on le plantât dans une
         // pièce de quatre cases libres il condamnait l'entrée d'une porte. Il est jugé
         // clair à ses globes muraux, et son emprise doit ignorer tout candélabre — pied
-        // comme lanterne, à toute hauteur du bâti.
-        let appliquesIci = 0;
-        for (let x = px; x < px + p.w; x++) {
-          for (let z = pz; z < pz + p.d; z++) {
-            for (let y = p.siteH; y <= p.siteH + p.height + 1; y++) {
-              if (estApplique(blocIci(x, y, z))) appliquesIci++;
-            }
-          }
-        }
+        // comme lanterne, à toute hauteur du bâti. La maison est jugée sur la même règle
+        // depuis le 2026-11-18 : un globe au mur par maison, au minimum.
         if (tour) {
-          if (appliquesIci > 0) toursEclairees++;
-        } else if (trouvee) maisonsEclairees++;
+          if (globes.length > 0) toursEclairees++;
+        } else if (globes.length > 0) maisonsEclairees++;
         const ox = cx * CHUNK_SIZE, oz = cz * CHUNK_SIZE;
         const apt = p.appartements;
         if (apt) {
@@ -2641,25 +2714,48 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
       }
     }
   }
-  check('les maisons s\'éclairent elles-mêmes',
-    maisonsJugees >= 10 && maisonsEclairees / maisonsJugees > 0.8,
-    `${maisonsEclairees}/${maisonsJugees} maisons portant une lanterne`);
+  // Demandé le 2026-11-18 : « mets des appliques dans toutes les maisons à la place d'un
+  // lampadaire au milieu qui bouche le passage ». Le candélabre est donc banni du bâti —
+  // maison comme immeuble — et la lumière d'intérieur ne vient plus que du mur. Jugé ici
+  // par l'absence (plus un pied, plus une lanterne dans aucune emprise) ET par la présence
+  // (toute maison porte au moins un globe, et aucune case où l'on marche n'en est loin).
+  check('les maisons s\'éclairent au mur, chacune portant ses appliques',
+    maisonsJugees >= 10 && maisonsEclairees === maisonsJugees,
+    `${maisonsEclairees}/${maisonsJugees} maisons avec au moins une applique`);
+  check('plus un seul candélabre debout dans une maison ou un immeuble',
+    poteauxEnBati === 0,
+    `${poteauxEnBati} pied(s) ou lanterne(s) dans une emprise de bâti`);
+  check('le fond d\'une maison reste à portée de son globe mural',
+    casesMarchees > 500 && plusLoigne <= 7,
+    `cas le plus lointain à ${plusLoigne} cubes`
+    + ` (${JSON.stringify(maisonLaPlusLoigne)}) · ${casesMarchees} cases marchables jugées · portée d\'une lampe 9`);
   check('les immeubles s\'éclairrent au mur, jamais au poteau',
-    toursJugees >= 3 && toursEclairees === toursJugees && poteauxEnImmeuble === 0,
-    `${toursEclairees}/${toursJugees} immeubles clairs · ${poteauxEnImmeuble} candélabre(s) dans une emprise d'immeuble`);
+    toursJugees >= 3 && toursEclairees === toursJugees,
+    `${toursEclairees}/${toursJugees} immeubles clairs`);
+  // Demandé le 2026-11-18 : « deux fenêtres de 2 cubes sur 2 cubes comme dans les pièces
+  // d'immeuble et pas des petites fenêtres de 1 cube ». Jugé du monde vers le plan et du
+  // plan vers le monde : une baie estampée sans être déclarée, ou un trou de quinconce
+  // oublié, font échec dans un sens ou l'autre.
+  check('les maisons se percent de deux baies de deux sur deux',
+    maisonsJugees >= 10 && maisonsBienPercees === maisonsJugees,
+    `${maisonsBienPercees}/${maisonsJugees} maisons avec exactement deux baies de 2×2`);
+  check('et ne portent aucune autre vitre que leurs deux baies',
+    maisonsFideles === maisonsJugees,
+    `${maisonsFideles}/${maisonsJugees} maisons dont le verre levé est exactement celui du plan`);
+  check('les deux baies regardent la rue, de part et d\'autre de la porte',
+    maisonsBaiesSurRue === maisonsJugees,
+    `${maisonsBaiesSurRue}/${maisonsJugees} maisons portant ses deux baies sur sa façade sur rue`);
   check('chaque pièce et chaque hall d\'immeuble tient sa lumière au mur',
     piecesJugees > 0 && piecesEclairees === piecesJugees && hallsJuges > 0 && hallsEclaires === hallsJuges,
     `${piecesEclairees}/${piecesJugees} pièces · ${hallsEclaires}/${hallsJuges} halls avec une applique`);
-  check('aucune lanterne n\'est scellée dans un mur ni privée de dalle',
-    scellees === 0 && sansDalle === 0 && tetesCoupees === 0,
-    `${scellees} sans pied · ${sansDalle} sans dalle · ${tetesCoupees} sous un plafond`);
-  check('une lanterne d\'intérieur ne barre jamais le passage',
-    genantes === 0, `${genantes} cases voisines occupées sur ${lanternes} lanternes`);
-  check('chaque lanterne d\'intérieur garde des faces pour éclairer et se faire casser',
-    enterrees === 0, `${enterrees} lanternes avec moins de deux faces libres`);
 
   // Le temple : la nef doit être claire, sinon le monument reste un coffre noir la nuit.
+  // C'est aussi le seul intérieur où un candélabre se dresse encore — depuis que maisons et
+  // immeubles sont éclairés du mur. Les règles qui gardaient les lanternes murées,
+  // suspendues ou génantes viennent donc s'y juger : laissées sur le bâti vide, elles
+  // passeraient vertes sans rien contrôler.
   let nefEclairee = 0, templesJuges = 0;
+  let lanternes = 0, scellees = 0, sansDalle = 0, tetesCoupees = 0, genantes = 0, enterrees = 0;
   for (let i = -4; i <= 4; i++) {
     for (let j = -4; j <= 4; j++) {
       const t = gen.templeAt(i, j);
@@ -2667,10 +2763,26 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
       templesJuges++;
       const demi = VILLAGE.templeCellaHalf + 1;
       let vue = false;
-      for (let x = t.ex - demi; x <= t.ex + demi && !vue; x++) {
-        for (let z = t.ez - demi; z <= t.ez + demi && !vue; z++) {
+      for (let x = t.ex - demi; x <= t.ex + demi; x++) {
+        for (let z = t.ez - demi; z <= t.ez + demi; z++) {
           for (let y = t.socle - 1; y <= t.socle + 3; y++) {
-            if (blocIci(x, y, z) === BLOCK.LAMP_GLOW) { vue = true; break; }
+            if (blocIci(x, y, z) !== BLOCK.LAMP_GLOW) continue;
+            vue = true; lanternes++;
+            // Le pied sous la lanterne, la dalle sous le pied, le vide au-dessus : une
+            // lanterne murée ou suspendue ne serait plus jamais posable à la main.
+            if (blocIci(x, y - 1, z) !== BLOCK.LAMP_POST) scellees++;
+            if (!blocIci(x, y - 2, z)) sansDalle++;
+            if (blocIci(x, y + 1, z)) tetesCoupees++;
+            // Deux hauteurs, deux règles : au niveau du pied, le tour compte comme la
+            // largeur de passage et doit être libre ; à hauteur de lanterne, un mur de côté
+            // est normal (lampe d'angle) mais il faut que la lumière sorte et qu'une face
+            // reste à casser — deux des quatre faces comptent.
+            let facesLibres = 0;
+            for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+              if (blocIci(x + dx, y - 1, z + dz)) genantes++;   // bloquerait le passage
+              if (!blocIci(x + dx, y, z + dz)) facesLibres++;
+            }
+            if (facesLibres < 2) enterrees++;
           }
         }
       }
@@ -2680,6 +2792,14 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   check('la nef du temple s\'éclaire la nuit',
     templesJuges >= 2 && nefEclairee === templesJuges,
     `${nefEclairee}/${templesJuges} monuments avec une lanterne dans la nef`);
+  check('aucun candélabre n\'est scellé dans un mur ni privé de dalle',
+    lanternes > 0 && scellees === 0 && sansDalle === 0 && tetesCoupees === 0,
+    `${scellees} sans pied · ${sansDalle} sans dalle · ${tetesCoupees} sous un plafond`
+    + ` sur ${lanternes} lanternes de nef`);
+  check('un candélabre ne barre jamais le passage',
+    genantes === 0, `${genantes} cases voisines occupées sur ${lanternes} lanternes`);
+  check('chaque candélabre garde des faces pour éclairer et se faire casser',
+    enterrees === 0, `${enterrees} lanternes avec moins de deux faces libres`);
 
   // Les candélabres de voirie n'ont pas à pâtir de ce nouveau passage : la règle du vide
   // autour du pied ne s'applique qu'à l'intérieur, sans quoi une avenue entière perdrait
@@ -2706,10 +2826,19 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   for (let cx = -6; cx <= 6; cx++) {
     for (let cz = -6; cz <= 6; cz++) {
       for (const p of gen.buildingAt(cx, cz)) {
-        const apt = p.appartements;
-        if (!apt) continue;
-        immeubles++;
         const ox = cx * CHUNK_SIZE, oz = cz * CHUNK_SIZE;
+        const apt = p.appartements;
+        if (!apt) {
+          // L'ébrasement d'une porte de maison compte comme celui d'une porte de pièce :
+          // un globe scellé dans la baie, devant le battant ou juste derrière, pendrait
+          // dans le passage de celui qui entre.
+          if (!p.door) continue;
+          for (const c of [p.door.baie, p.door.front, p.door.in]) {
+            if (c) seuils.add(`${ox + c.lx},${oz + c.lz}`);
+          }
+          continue;
+        }
+        immeubles++;
         for (const s of apt.pieces) {
           const px = ox + s.porte.lx, pz = oz + s.porte.lz;
           for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) seuils.add(`${px + dx},${pz + dz}`);
@@ -2719,6 +2848,7 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
   }
   let couloirs = 0, couloirsSombre = 0, appliques = 0, sansMur = 0, enterree = 0, surVitre = 0;
   let poteauxEnCouloir = 0, lanterneAuSeuil = 0, faceAPorte = 0;
+  let etagesDeMaison = 0, etagesSombres = 0;
   // Une applique se scelle contre un mur plein — jamais dans l'ébrasement d'une porte, qui
   // est creusé sur trois cubes, ni sur une baie vitrée, qui n'est pas un support — et elle
   // garde son cube libre devant elle comme au-dessus d'elle, sinon elle disparaît sous la
@@ -2753,15 +2883,26 @@ check('seuls les terrains assez plats sont bâtis', !tropAccidentee, tropAcciden
         }
         if (!trouvee) couloirsSombre++;
       }
-      // Pièces et halls : mêmes exigences, jugés sur leurs propres cellules.
+      // Pièces et halls d'immeuble, puis pièces de maison : mêmes exigences, jugées sur
+      // leurs propres cellules — la règle ne change pas d'un bâti à l'autre depuis que tous
+      // se éclairrent du mur.
       for (const co of gen.piecesDImmeubleSur(...bornes)) {
         for (const c of co.cellules) jugerApplique(c.wx, c.wz, co.y + 1);
+      }
+      for (const co of gen.piecesDeMaisonSur(...bornes)) {
+        etagesDeMaison++;
+        let trouvee = false;
+        for (const c of co.cellules) if (jugerApplique(c.wx, c.wz, co.y + 1)) trouvee = true;
+        if (!trouvee) etagesSombres++;
       }
     }
   }
   check('les couloirs d\'immeuble s\'éclairrent au mur',
     immeubles >= 3 && couloirs > 0 && couloirsSombre === 0,
     `${couloirs} couloirs jugés sur ${immeubles} immeubles, ${appliques} appliques, ${couloirsSombre} sans lumière`);
+  check('chaque niveau d\'une maison tient sa lumière au mur',
+    etagesDeMaison >= 10 && etagesSombres === 0,
+    `${etagesDeMaison - etagesSombres}/${etagesDeMaison} niveaux de maison avec au moins un globe`);
   check('une applique se scelle contre un mur plein et garde son cube libre',
     appliques > 0 && sansMur === 0 && enterree === 0 && surVitre === 0,
     `${sansMur} sans mur porteur · ${surVitre} sur vitre · ${enterree} ensevelies sur ${appliques} appliques`);

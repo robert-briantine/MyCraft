@@ -19,7 +19,7 @@ import {
   etatDuCiel, creerHorloge, heureAffichee, bornerDuree,
   DUREE_JOUR_DEFAUT, DUREE_JOUR_BORNES, HEURE_DEPART,
 } from './ciel.js';
-import { creerMeteo, cielSousPluie, METEO_MODES } from './meteo.js';
+import { creerMeteo, habillerCiel, METEO_MODES } from './meteo.js';
 
 // ===================== CONSTANTS =====================
 const CHUNK_SIZE = 16;
@@ -189,6 +189,17 @@ const GARDE_HORS_VUE = 8;
 // radius + 2`, dont 11 derrière un tronçon que le four venait de mailler. Ce que la
 // caméra voit, le four n'y touche pas ; c'est la même frontière, pas deux voisines.
 const MARGE_CHAMP_RENDU = 2;
+// Le champ rendu est un carré `(2r+1)²`; la brume, elle, ferme un cercle à
+// `r·16·0,98`. Mesuré le 2026-11-18 sur un coin vierge à profondeur 12: **29 % des
+// mailles et 31 % des triangles** pendaient à la scène au-delà de la brume pleine — payés
+// au maillage (2,5–3,2 ms pièce), au tas, au tri caché du four et au frustum, pour rendre
+// exactement ce que la brume peignait déjà. On ne maille donc ni n'accroche ce que la
+// brume efface: la frontière devient le carré **et** le disque. La marge couvre l'assiette
+// d'un arbre dont le tronc est juste dedans et la cime derrière la brume. Jugée sur la
+// brume **sèche** (`brumeSere.far`), jamais `scene.fog.far`: l'averse serre la brume vers
+// l'intérieur, et une frontière qui la suivrait culotterait la couronne à chaque averse
+// pour la repeindre à chaque éclaircie.
+const MARGE_BRUME = 1;
 
 // ---- géométrie déjà prête pour la carte, sur le disque ----
 // Un tronçon repeint coûte 6,94 ms au mailleur ; reposer ses tampons depuis un fichier
@@ -198,22 +209,51 @@ const MARGE_CHAMP_RENDU = 2;
 // mailleur change** (attribut ajouté, seau renommé, uv recalculés), sinon un monde
 // retrouverait des triangles d'hier peints avec les règles d'avant-hier.
 const MAILLE_VERSION = 1;
-// Taille du fichier, réglée par le joueur. Zéro = cache désactivé. Ce chiffre borne ce
-// que le disque accepte, jamais ce que l'onglet garde en mémoire (c'est le quota ci-
-// dessus qui gouverne). Le poids d'un tronçon au format quantifié est mesuré à 23,6 Ko
-// (déflate compris) : 256 Mo tiennent ~11 000 tronçons, une carte très travaillée ; et
-// comme l'île par défaut en compte ~31 400, c'est le palier de 1 Go qui laisse la place
-// de la prétailler entière.
-// Le plus grand budget doit rester sous le plafond que le serveur accepte de lire en
-// mémoire (`MAX_GEOM_BYTES`) : promettre au joueur un fichier que le serveur refuserait de
-// lire, c'est lui garantir un 400 « cache de géométrie invalide » à la première publication.
-// Les deux bougent ensemble — mesuré le 2026-11-16, l'île entière (33 992 tronçons) demande
-// de 800 Mo à 1,1 Go au fichier, selon qu'on compte la table des décalages.
-const GEOM_BUDGETS_MO = [0, 32, 64, 128, 256, 512, 1024, 2048];
-// Mesuré le 2026-11-16 sur l'île de test taillée par le four : 23,6 Ko par tronçon une
-// fois quantifié et compressé. L'île par défaut (~31 400 tronçons) demande donc ~740 Mo :
-// à 512 Mo, le joueur verrait son île s'arrêter à 70 % sans comprendre pourquoi.
-const GEOM_BUDGET_DEFAUT_MO = 1024;
+// Taille du fichier : **calculée, plus réglée**. Ce chiffre borne ce que le disque accepte,
+// jamais ce que l'onglet garde en mémoire (c'est le quota ci-dessus qui gouverne). La règle
+// est celle du quota de géométrie : une part du tas **autorisé**
+// (`performance.memory.jsHeapSizeLimit`), jamais du tas *libre* — assise sur le libre elle
+// s'auto-réprimerait en se remplissant, et pire qu'en mémoire : changer la taille du cache
+// ici jette le fichier relu et repart de zéro (`reglerBudgetGeom`). Le tas gouverne pourtant
+// bien un fichier, parce que ses octets y transitent — blocs compressés en file, ~420 Ko
+// pièce — et que le serveur les relit entiers avant de les valider.
+//
+// Mesuré le 2026-11-16 : un tronçon quantifié et compressé pèse 23,6 Ko, l'île par défaut
+// (~31 400 tronçons) demande donc ~740 Mo. À 0,25 du tas, un onglet Chrome de 4 096 Mo — le
+// chiffre relevé sur ce poste — reçoit 1 024 Mo : exactement le palier qui laissait la place
+// de prétailler l'île entière. Un petit onglet descend à son échelle et le four s'arrête en
+// le disant (`sature` + motif) plutôt que de promettre un fichier que le navigateur ne peut
+// pas charrier. Le plafond reste sous celui que le serveur accepte de lire en mémoire
+// (`MAX_GEOM_BYTES` = 2 304 Mo) : lui promettre plus, c'est garantir un 400 à la première
+// publication.
+const GEOM_BUDGET_FRACTION = 0.25;
+const GEOM_BUDGET_PLANCHER_MO = 128;          // ~5 400 tronçons : le proche reste chaud
+const GEOM_BUDGET_PLAFOND_MO = 2048;          // sous MAX_GEOM_BYTES du serveur
+const GEOM_BUDGET_DEFAUT_MO = 1024;           // navigateur muet sur son tas (Safari, headless)
+// Le chiffre ne bouge plus une fois posé : une taille de cache qui oscille serait une
+// taille de cache qui se vide. Seule la reprise en main des suites le fait varier.
+const geomBudget = { mo: 0, force: null, source: '' };
+
+/** Part du tas autorisé laissée au fichier de triangles, en mégaoctets. */
+function dimensionnerBudgetGeom() {
+  if (geomBudget.force !== null) return geomBudget.force;
+  if (geomBudget.mo) return geomBudget.mo;
+  const m = typeof performance !== 'undefined' && performance.memory ? performance.memory : null;
+  if (m && Number.isFinite(m.jsHeapSizeLimit) && m.jsHeapSizeLimit > 0) {
+    const limiteMo = m.jsHeapSizeLimit / 1048576;
+    geomBudget.mo = Math.min(GEOM_BUDGET_PLAFOND_MO,
+      Math.max(GEOM_BUDGET_PLANCHER_MO, Math.round(limiteMo * GEOM_BUDGET_FRACTION)));
+    geomBudget.source = `${Math.round(limiteMo)} Mo de tas autorisé`;
+  } else {
+    geomBudget.mo = GEOM_BUDGET_DEFAUT_MO;
+    geomBudget.source = 'défaut — navigateur muet sur son tas';
+  }
+  return geomBudget.mo;
+}
+/** Ce que le fichier a droit d'occuper, en octets (0 = cache éteint). */
+function budgetGeomOctets() {
+  return (geomBudget.force !== null ? geomBudget.force : dimensionnerBudgetGeom()) * 1048576;
+}
 // Cuisson de fond : ce qu'on prête au mailleur par image quand le joueur a déjà son
 // champ sous les pieds. Assez pour tailler un tronçon par image, pas assez pour que
 // l'image déborde pendant qu'on joue.
@@ -346,15 +386,6 @@ function loadSettings() {
     // La météo se règle comme la durée du jour : « auto » laisse le monde tirer ses
     // averses, les deux autres positions rendent le joueur maître du ciel.
     meteo: METEO_MODES.includes(stored.meteo) ? stored.meteo : 'auto',
-    // Taille laissée au cache de géométrie sur le disque. Une valeur hors liste (ancien
-    // réglage, fichier édité à la main) retombe sur le défaut plutôt que sur un chiffre
-    // que l'écrivain refuserait.
-    geomCacheMo: GEOM_BUDGETS_MO.includes(Number(stored.geomCacheMo))
-      ? Number(stored.geomCacheMo) : GEOM_BUDGET_DEFAUT_MO,
-    // Précuire toute l'île en tâche de fond. Le joueur qui ne veut pas qu'on écrive
-    // des centaines de mégaoctets sans le lui demander le décoche ; la taille du cache
-    // reste le plafond dur dans les deux cas.
-    geomPrecuire: stored.geomPrecuire !== false,
     // Netteté du rendu. Une valeur hors liste (réglage d'un autre appareil, fichier édité
     // à la main) retombe sur « native », c'est-à-dire sur ce que le jeu faisait avant.
     netrete: NETTETES.includes(String(stored.netrete)) ? String(stored.netrete) : NETTETE_DEFAUT,
@@ -367,8 +398,6 @@ function saveSettings() {
       renderDistance: settings.renderDistance,
       dureeJour: settings.dureeJour,
       meteo: settings.meteo,
-      geomCacheMo: settings.geomCacheMo,
-      geomPrecuire: !!settings.geomPrecuire,
       netrete: settings.netrete,
     }));
   } catch (e) {
@@ -847,6 +876,11 @@ class World {
     this.geomDepuis = 0;             // instant du premier élément en attente
     this._signatureAtlas = null;     // change dès qu'une tuile est remplacée
     this.cuissonIle = null;          // plan de cuisson de toute l'île, voir `demarrerCuissonIle`
+    // La pré-cuisson n'est plus un réglage du joueur, mais une suite qui compte les
+    // passages au mailleur doit pouvoir l'éteindre pour la session (`precuireIleMaintenant`).
+    // `cuissonIle === false` ne suffit pas à le dire : c'est aussi l'état « le four n'a pas
+    // pu démarrer », que le voile s'empresse de réarmer (voir la branche `enVeille`).
+    this.cuissonIleVoulue = true;
     this._chauffeGeom = null;        // réchauffement en vol : un seul pompateur à la fois
     this._fileChauffe = new Map();   // cle -> [cx, cz], demandes arrivées pendant le pompage
     // Compteurs de test : ce que le mailleur a réellement payé depuis le dernier relevé,
@@ -863,6 +897,9 @@ class World {
     this._offsetCle = null;          // cached nearest-first offset table, keyed by radius+heading
     this._offsets = [];
     this._centre = null;             // chunk du joueur, pour trier à partir de lui
+    this._camX = 0;                  // pied de la caméra, centre du disque de brume
+    this._camZ = 0;
+    this._brumeCarres = Infinity;    // (far + marge)² : Infinity tant que le ciel n'a pas parlé
     this._dir = { x: 0, z: 0 };      // direction du regard, pour servir l'avant en premier
 
     // ---- eau courante -------------------------------------------------------
@@ -1560,6 +1597,30 @@ class World {
   }
 
   /**
+   * **Ce que la caméra est censée voir** : le carré du champ rendu **et** le disque que la
+   * brume laisse lire. Un seul prédicat pour les trois sites qui décident de mailler,
+   * d'accrocher ou de rendre un tronçon (`_rangerHorsChamp`, `_lacherTronconCuit`, la
+   * garde du four) — deux frontières voisines se contrediraient, et le commentaire de
+   * `MARGE_CHAMP_RENDU` en garde la facture : 36 repeintures par demi-tour.
+   *
+   * La distance se prend au **coin le plus proche** de l'assiette, pas au centre : juger
+   * au centre avancerait la frontière d'un demi-tronçon (11 cubes à `CHUNK_SIZE = 16`) et
+   * culotterait ce qui dépasse encore de la brume.
+   */
+  _montreACamera(cx, cz) {
+    const c = this._centre;
+    if (!c) return true;                       // avant la première image : rien à culotter
+    if (Math.max(Math.abs(cx - c.pcx), Math.abs(cz - c.pcz)) > c.radius + MARGE_CHAMP_RENDU) return false;
+    const CS = CHUNK_SIZE;
+    const x0 = cx * CS, z0 = cz * CS;
+    const camX = this._camX, camZ = this._camZ;
+    const px = camX < x0 ? x0 : (camX > x0 + CS ? x0 + CS : camX);
+    const pz = camZ < z0 ? z0 : (camZ > z0 + CS ? z0 + CS : camZ);
+    const dx = camX - px, dz = camZ - pz;
+    return dx * dx + dz * dz <= this._brumeCarres;
+  }
+
+  /**
    * Met les tronçons en réserve, puis libère ce que le budget ne permet plus de garder.
    * Appelé EN TÊTE de `updateChunks` : c'est lui qui décide ce qui a le droit d'être
    * repeint dans la passe de maillage qui suit. Placé après (mesuré 2026-11-16), un
@@ -1581,7 +1642,7 @@ class World {
         Math.abs(chunk.cx - pcx),
         Math.abs(chunk.cz - pcz)
       );
-      if (dist <= radius + MARGE_CHAMP_RENDU) {
+      if (this._montreACamera(chunk.cx, chunk.cz)) {
         if (chunk.horsVue) {
           chunk.horsVue = 0;
           this._poserMaillages(chunk);
@@ -1738,7 +1799,7 @@ class World {
     // lequel des motifs empêche la pose.
     const motif = (nom) => { this._geomMotifs[nom] = (this._geomMotifs[nom] || 0) + 1; return false; };
     if (!cache) return motif('sansCache');            // pas encore chargé (ou monde sans disque)
-    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return motif('reglages');
+    if (GEOM_MODE === 'ignorer' || !budgetGeomOctets()) return motif('reglages');
     if (!cache.aLeTroncon(chunk.cx, chunk.cz)) return motif('absent');
     const maillages = cache.pret(chunk.cx, chunk.cz);
     if (!maillages) return motif('froid');
@@ -1775,7 +1836,7 @@ class World {
    * d'être jetée par le quota avant la publication, et la compression attendra hors image.
    */
   _cuissonGeom(cx, cz) {
-    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return;
+    if (GEOM_MODE === 'ignorer' || !budgetGeomOctets()) return;
     const key = this.getChunkKey(cx, cz);
     if (this.geomEnAttente.size >= GEOM_EN_ATTENTE_MAX) {
       // La file est pleine : le tronçon n'est pas perdu, il est inscrit sur la liste
@@ -1847,7 +1908,7 @@ class World {
    * après chaque publication, jamais pendant une image déjà chargée.
    */
   cuireCeQuiAttend({ max = 16 } = {}) {
-    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo || !this.geomACuire.size) return 0;
+    if (GEOM_MODE === 'ignorer' || !budgetGeomOctets() || !this.geomACuire.size) return 0;
     let faits = 0;
     for (const key of this.geomACuire) {
       if (faits >= max || this.geomEnAttente.size >= GEOM_EN_ATTENTE_MAX) break;
@@ -1876,7 +1937,7 @@ class World {
    * 2026-11-16 : 320 tronçons taillés, `faits` resté à zéro, aucun octet au fichier).
    */
   demarrerCuissonIle() {
-    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return false;
+    if (GEOM_MODE === 'ignorer' || !budgetGeomOctets()) return false;
     const b = bornesIle(MONDE, CHUNK_SIZE);
     const centre = this._centre || { pcx: 0, pcz: 0 };
     const file = [];
@@ -1954,8 +2015,7 @@ class World {
     if (!chunk || chunk.meshes.length) return false;
     if (this._toucheParLeJoueur(cle)) return false;
     if (this.geomEnAttente.has(cle) || this.geomACuire.has(cle) || this.dirtyKeys.has(cle)) return false;
-    const c = this._centre;
-    if (c && Math.max(Math.abs(cx - c.pcx), Math.abs(cz - c.pcz)) <= c.radius + MARGE_CHAMP_RENDU) return false;
+    if (this._centre && this._montreACamera(cx, cz)) return false;   // la même frontière que le rangeur
     this.chunks.delete(cle);
     return true;
   }
@@ -1991,7 +2051,7 @@ class World {
   cuireIleGeometrie(maxMs = CUISSON_FOND_MS) {
     const s = this.cuissonIle;
     if (!s || !s.enMarche) return 0;
-    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) { s.enMarche = false; return 0; }
+    if (GEOM_MODE === 'ignorer' || !budgetGeomOctets()) { s.enMarche = false; return 0; }
     const debut = performance.now();
     let cuits = 0;
     const epuise = () => performance.now() - debut >= maxMs;
@@ -2000,12 +2060,24 @@ class World {
     // par le flot de rendu, qui pose ses triangles à la scène. Tailler là-bas jetterait la
     // géométrie visible (la cuisson de fond maille hors scène) et effacerait le décor sous
     // le nez du joueur — mesuré le 2026-11-16 sur `tests/geom-cache.mjs`, 131 repeintures
-    // au second demi-tour de caméra pour un monde pourtant posé. La frontière est
-    // exactement celle du rangeur (`MARGE_CHAMP_RENDU`) : une couronne de moins ici, et le
-    // four taille juste derrière ce que la caméra montre, donc le rangeur la rattache et
-    // le mailleur la refait — 36 repeintures par demi-tour mesuré dans le monde du joueur.
+    // au second demi-tour de caméra pour un monde pourtant posé. La frontière reste donc
+    // celle du rangeur (`_montreACamera`), mais rendue d'UN CRAN : le four s'arrête une
+    // couronne avant ce que la caméra montre. Deux factures mesurées pour deux écarts :
+    // une couronne de moins ici et le four taille juste derrière le visible, donc le
+    // rangeur la rattache et le mailleur la refait (36 repeintures par demi-tour dans le
+    // monde du joueur) ; une couronne de trop et `majMurs` — qui avertit les voisins déjà
+    // maillés quand les cloisons d'un tronçon naissent — salit un tronçon vu, et le joueur
+    // voit le décor se refaire en tournant la tête (16 repeintures par demi-tour mesurées
+    // 2026-11-18, dès que la brume, plus serrée que le carré, laisse une couronne à cuire
+    // le long des visibles).
     const c = this._centre;
-    const sousLesYeux = (cx, cz) => !!c && Math.max(Math.abs(cx - c.pcx), Math.abs(cz - c.pcz)) <= c.radius + MARGE_CHAMP_RENDU;
+    const voisineDesYeux = (cx, cz) => {
+      for (let dz = -1; dz <= 1; dz++) {
+        for (let dx = -1; dx <= 1; dx++) if (this._montreACamera(cx + dx, cz + dz)) return true;
+      }
+      return false;
+    };
+    const sousLesYeux = (cx, cz) => !!c && (this._montreACamera(cx, cz) || voisineDesYeux(cx, cz));
     // Tailler un tronçon hors écran. `horsVue` le signale au draineur : sans ce drapeau,
     // la marque sale laissée chez le voisin par `majMurs` lui ferait repeindre à l'image
     // un tronçon que personne ne regarde — et poser à la scène des triangles déjà au fichier.
@@ -2086,7 +2158,7 @@ class World {
    */
   preparerGeom(listeCles, { max = 6, urgente = false } = {}) {
     const cache = this.cacheGeom;
-    if (!cache || GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return Promise.resolve(0);
+    if (!cache || GEOM_MODE === 'ignorer' || !budgetGeomOctets()) return Promise.resolve(0);
     // Deux niveaux dans la file : ce que le mailleur réclame **maintenant** (0) passe
     // devant ce qu'on anticipe (1). En FIFO pur, un tronçon pressé attendait derrière
     // vingt-quatre blocs lointains et finissait par expirer — donc par être maillé pour
@@ -2123,7 +2195,7 @@ class World {
       if (!choisi) break;
       const [cx, cz] = choisi;
       this._fileChauffe.delete(cleChoisie);
-      if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) break;   // le joueur a tranché entre-temps
+      if (GEOM_MODE === 'ignorer' || !budgetGeomOctets()) break;   // le joueur a tranché entre-temps
       if (cache.estChaud(cx, cz)) continue;
       if (await cache.charger(cx, cz)) faites++;
     }
@@ -2446,7 +2518,16 @@ class World {
       // Un tronçon mis en réserve ne se repeint pas pendant qu'il est hors champ : sa
       // peinture attend le retour. Le peindre ici coûterait 2,5–3,2 ms pour un résultat
       // que personne ne voit, et le budget mémoire n'aurait servi à rien.
-      if (chunk.horsVue) {
+      // S'y ajoute le tronçon **hors de la frontière rendue qui ignore qu'il est réservé**
+      // — il naît avec `horsVue = 0`. Sans cette garde, sous pression mémoire il est maillé
+      // (330 Ko), évincé parce qu'il ne se voit pas, recompté manquant à la passe suivante :
+      // né mesuré 2026-11-18, quota forcé à 2 Mo, un mailleur payé à chaque passe et la file
+      // du flot jamais vide. Mais différer aussi hors pression serait payer deux fois — le
+      // pré-maillage d'un tronçon qui entre bientôt en vue est gratuit et rend son
+      // accrochage immédiat (mesuré 171 maillages sur une course contre 219 quand on diffère
+      // systématiquement). La condition porte donc sur la note, pas sur la seule frontière.
+      if (chunk.horsVue || (!this._montreACamera(cx, cz)
+          && this.octetsMailles > this._rafraichirQuota(entree))) {
         chunk.aRefaire = true;
         this.dirtyKeys.delete(cle);
         continue;
@@ -2493,6 +2574,15 @@ class World {
     const pcz = Math.floor(playerZ / CHUNK_SIZE);
     const radius = settings.renderDistance;
     this._centre = { pcx, pcz, radius };
+    // Le disque de la brume, une fois par appel : `_montreACamera` est interrogé des
+    // centaines de fois par image et ne doit pas lire l'objet brume à chaque fois. Jugé sur
+    // la brume sèche, jamais `scene.fog.far` (voir `MARGE_BRUME`). Tant que le ciel n'a
+    // pas parlé, on ne culotte rien.
+    this._camX = playerX;
+    this._camZ = playerZ;
+    this._brumeCarres = Number.isFinite(brumeSere.far) && brumeSere.far > 0
+      ? (brumeSere.far + MARGE_BRUME * CHUNK_SIZE) ** 2
+      : Infinity;
     const norm = Math.hypot(dirX, dirZ);
     this._dir.x = norm > 1e-4 ? dirX / norm : 0;
     this._dir.z = norm > 1e-4 ? dirZ / norm : 0;
@@ -3494,39 +3584,66 @@ const etoiles = (() => {
 // que le joueur pourrait creuser n'a pas de sens.
 const NUAGE_TEXELLE = 256;   // résolution du dessin, en pixels
 
+// Les trois écritures de ciel. Un seul dessin partagé par les deux couches donnait un
+// motif unique répété à deux altitudes (mesuré le 2026-11-18 : les deux nappes portaient
+// la même texture, même `uuid`). Chaque forme règle combien d'amas tiennent sur la tuile,
+// de lobes compte chaque amas, leur rayon, leur éclat de cœur, l'étirement horizontal et
+// — pour le stratus — le nombre de bandes sur lesquelles les amas se rangent.
+const FORMES_NUAGE_DESSIN = {
+  cumulus: { amas: 17, lobes: [4, 9], rayon: [0.05, 0.10], coeur: [0.32, 0.56], etirement: 1, bandes: 0 },
+  // Nappes basses et continues : des amas aplatis dix fois plus larges que hauts, alignés
+  // en quatre rubans, et un cœur moins franc — un stratus n'a pas de bourrelet.
+  stratus: { amas: 12, lobes: [7, 13], rayon: [0.035, 0.06], coeur: [0.20, 0.32], etirement: 3.4, bandes: 4 },
+  // Filaments de haute altitude : beaucoup de traits fins, très étirés, peu lumineux.
+  cirrus: { amas: 24, lobes: [9, 16], rayon: [0.012, 0.030], coeur: [0.16, 0.28], etirement: 6.5, bandes: 0 },
+};
+
 /**
- * Dessine une tuile de ciel déterministe : des amas de halos superposés, étirés à
- * l'horizontale comme des cumulus. Chaque halo est peint sur les neuf positions
+ * Dessine une tuile de ciel déterministe. Chaque halo est peint sur les neuf positions
  * possibles de la tuile, sans quoi la couture d'une répétition se verrait en grille.
  */
-function dessinerTuileDeNuages(sel) {
+function dessinerTuileDeNuages(sel, forme = 'cumulus') {
+  const regle = FORMES_NUAGE_DESSIN[forme] || FORMES_NUAGE_DESSIN.cumulus;
   const c = document.createElement('canvas');
   c.width = NUAGE_TEXELLE; c.height = NUAGE_TEXELLE;
   const g = c.getContext('2d');
   g.clearRect(0, 0, NUAGE_TEXELLE, NUAGE_TEXELLE);
-  for (let i = 0; i < 17; i++) {
+  for (let i = 0; i < regle.amas; i++) {
     const ax = hashRoll(i, sel, 1, 4111) * NUAGE_TEXELLE;
-    const az = hashRoll(i, sel, 2, 4127) * NUAGE_TEXELLE;
-    const coeur = 0.32 + hashRoll(i, sel, 4, 4151) * 0.24;
-    const lobes = 4 + Math.floor(hashRoll(i, sel, 3, 4133) * 5);
+    let az = hashRoll(i, sel, 2, 4127) * NUAGE_TEXELLE;
+    if (regle.bandes) {
+      const pas = NUAGE_TEXELLE / regle.bandes;
+      az = Math.round(az / pas) * pas;
+    }
+    const coeur = regle.coeur[0] + hashRoll(i, sel, 4, 4151) * (regle.coeur[1] - regle.coeur[0]);
+    const lobes = regle.lobes[0]
+      + Math.floor(hashRoll(i, sel, 3, 4133) * (regle.lobes[1] - regle.lobes[0] + 1));
     for (let k = 0; k < lobes; k++) {
       const ang = hashRoll(i, k, sel + 7, 4177) * Math.PI * 2;
       const ecart = hashRoll(i, k, sel + 11, 4201) * 0.34;
-      const r = (0.05 + hashRoll(i, k, sel + 13, 4211) * 0.1) * NUAGE_TEXELLE;
+      const r = (regle.rayon[0] + hashRoll(i, k, sel + 13, 4211)
+        * (regle.rayon[1] - regle.rayon[0])) * NUAGE_TEXELLE;
       const x = ax + Math.cos(ang) * ecart * NUAGE_TEXELLE;
       const y = az + Math.sin(ang) * ecart * NUAGE_TEXELLE * 0.6;
       for (let ox = -1; ox <= 1; ox++) for (let oz = -1; oz <= 1; oz++) {
         const px = x + ox * NUAGE_TEXELLE;
         const py = y + oz * NUAGE_TEXELLE;
-        if (px < -r || px > NUAGE_TEXELLE + r || py < -r || py > NUAGE_TEXELLE + r) continue;
-        const grad = g.createRadialGradient(px, py, 0, px, py, r);
+        const rx = r * regle.etirement;
+        if (px < -rx || px > NUAGE_TEXELLE + rx || py < -r || py > NUAGE_TEXELLE + r) continue;
+        // L'ellipse se fait par transformation, pas par rayon : un gradient radial suivi
+        // d'un `scale` garde son dégradé collé au halo, ce qu'un arc écrasé perdrait.
+        g.save();
+        g.translate(px, py);
+        g.scale(regle.etirement, 1);
+        const grad = g.createRadialGradient(0, 0, 0, 0, 0, r);
         grad.addColorStop(0, `rgba(255,255,255,${coeur.toFixed(3)})`);
         grad.addColorStop(0.55, `rgba(255,255,255,${(coeur * 0.45).toFixed(3)})`);
         grad.addColorStop(1, 'rgba(255,255,255,0)');
         g.fillStyle = grad;
         g.beginPath();
-        g.arc(px, py, r, 0, Math.PI * 2);
+        g.arc(0, 0, r, 0, Math.PI * 2);
         g.fill();
+        g.restore();
       }
     }
   }
@@ -3541,7 +3658,12 @@ function dessinerTuileDeNuages(sel) {
   t.needsUpdate = true;
   return t;
 }
-const NUAGES_TEXTE = dessinerTuileDeNuages(1);
+// Une tuile par forme, dessinée une seule fois : le ciel change d'écriture au fil du
+// temps sans jamais redessiner un canvas image après image.
+const ORDRE_FORMES = Object.keys(FORMES_NUAGE_DESSIN);
+const NUAGES_TUILES = {};
+for (const f of ORDRE_FORMES) NUAGES_TUILES[f] = dessinerTuileDeNuages(1, f);
+const NUAGES_TEXTE = NUAGES_TUILES[ORDRE_FORMES[0]];
 
 // Le fondu se juge sur l'élévation du rayon visuel, jamais sur la brume de scène : la
 // nappe flotte quatre-vingts cubes au-dessus de la tête, donc tout ce qui frôle
@@ -3574,7 +3696,7 @@ const SHADER_NUAGE = /* glsl */`
     gl_FragColor = vec4(versSRGB(uCouleur * (0.82 + 0.18 * corps)), a);
   }`;
 
-function faireNape(nom, altitude, tuile, facteur, vitesse) {
+function faireNape(nom, altitude, tuile, facteur, vitesse, decalForme = 0) {
   const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({
     uniforms: {
       uCarte: { value: NUAGES_TEXTE },
@@ -3616,7 +3738,7 @@ function faireNape(nom, altitude, tuile, facteur, vitesse) {
   // donc à tri égal Three la peindrait en dernier, par-dessus le soleil.
   m.renderOrder = -10;
   m.name = 'nuages';
-  m.userData = { nom, altitude, tuile, facteur, vitesse };
+  m.userData = { nom, altitude, tuile, facteur, vitesse, decalForme };
   PLANETE_CIEL.add(m);
   return m;
 }
@@ -3626,36 +3748,142 @@ const nappes = [
   // cents cubes à la portée par défaut) n'en laissait voir qu'une calotte de vingt
   // degrés autour du zénith. En épousant le relief, la nappe basse reste à quatre-vingt
   // quatre cubes au-dessus de la tête et couvre le ciel jusqu'à vingt-cinq degrés.
-  faireNape('basse', 84, 96, 1, 0.0032),
-  faireNape('haute', 130, 152, 0.62, 0.0019),
+  //
+  // Les vitesses sont celles d'une **dérive de base**, multipliée dans `majCiel` par le
+  // vent du monde. Elles ont été relevées d'un facteur deux et demi le 2026-11-18 : à
+  // 0,0032 tuile par seconde, la couche basse avançait d'un cube toutes les trois secondes
+  // — un ciel peint, pas un ciel qui vit (« fait aussi que les nuages bougent »). La haute
+  // reste plus lente que la basse : c'est ce décalage qui donne deux altitudes au lieu d'un
+  // seul papier peint.
+  faireNape('basse', 84, 96, 1, 0.0075, 0),
+  // La couche haute porte toujours une écriture différente de la basse (`decalForme` 1) :
+  // des cumulus à quatre-vingts cubes coiffés de filaments à cent trente se lisent comme
+  // deux altitudes, deux fois le même dessin se lit comme un seul papier peint.
+  faireNape('haute', 130, 152, 0.62, 0.0048, 1),
 ];
 
+// Dérive des nappes selon le vent. À vent nul il reste une traîne — un ciel immobile se
+// remarque dès qu'on lève les yeux ; à vent plein la couche basse file de deux cubes et
+// demi par seconde, ce qu'un cumulus à quatre-vingts cubes au-dessus de la tête rend bien.
+const NAPPE_SOUFFLE_BASE = 0.35;
+const NAPPE_SOUFFLE_VENT = 2.9;
+
 // ==================== PLUIE ====================
-// Le modèle de l'averse est pur (`meteo.js`), comme celui du ciel : il ne rend rien, il
-// décide d'une intensité. Tout ici la consomme — lumières, brume, nuages, et le rideau
-// de gouttes ci-dessous.
+// Le modèle de la météo est pur (`meteo.js`), comme celui du ciel : il ne rend rien, il
+// décide de plusieurs signaux — `couverture` (le gris, qui précède les gouttes et leur
+// survit), `intensite` (les gouttes seules), `degage` (la journée sans un nuage), `couche`
+// (l'épaisseur des nappes) et `vent` (ce qui les entraîne). Tout ici les consomme.
 const METEO_SEL = (WORLD_SEEDS.trees * 6151) | 0;   // deux mondes différents, deux météos
 const meteo = creerMeteo({ sel: METEO_SEL, mode: settings.meteo });
 // Une suite fige l'averse pour la juger sans attendre vingt minutes d'horloge ; `null`
 // rend la main au monde.
 let pluieForcee = null;
-const intensitePluie = () => (pluieForcee == null ? meteo.etat().intensite : pluieForcee);
+// Même ressort pour le vent : juger que les nuages avancent exige de comparer deux instants
+// à vent tenu, sinon c'est l'amplitude du jour qui répond à la question et non la dérive.
+let ventForce = null;
+
+/**
+ * L'état de la météo tel que la scène doit le rendre, reprise en main des suites incluse.
+ * Forcer l'averse force le gris qui va avec — une averse sous un ciel bleu n'est pas une
+ * averse — et éteint le régime dégagé, qui prétend à l'inverse.
+ */
+function meteoCourante() {
+  const e = meteo.etat();
+  if (pluieForcee == null && ventForce == null) return e;
+  const k = pluieForcee == null ? e.intensite : pluieForcee;
+  const couverture = Math.max(e.couverture, k);
+  const degage = k > 0.05 ? 0 : e.degage;
+  const vent = ventForce == null ? e.vent : Math.min(1, Math.max(0, Number(ventForce) || 0));
+  return {
+    ...e, intensite: k, couverture, degage, vent,
+    couche: pluieForcee == null ? e.couche : Math.max(0.55 + 0.5 * couverture, e.couche),
+  };
+}
+
 
 // ---- le rideau de gouttes ---------------------------------------------------
 // Des points, pas des voxels : une goutte n'a rien à partager avec le monde, et quelques
 // milliers de sprites coûtent moins cher qu'un tronçon. Tout le mouvement vit dans le vertex
-// shader — la chute s'enroule sur `uTemps`, le vent dérive chaque goutte selon sa graine
-// — donc aucun tableau n'est renvoyé au GPU image après image. La densité se règle par
-// seuil sur cette même graine : épaissir l'averse ne reconstruit rien.
-const PLUIE_POINTS = 4500;
-const PLUIE_BOITE = new THREE.Vector3(52, 34, 52);   // le volume de gouttes autour de la tête
+// shader — la chute s'enroule sur `uTemps`, le vent emporte chaque goutte selon sa graine —
+// donc aucun tableau n'est renvoyé au GPU image après image. La densité se règle par seuil
+// sur cette même graine : épaissir l'averse ne reconstruit rien.
+//
+// Deux couches, pas une. La seule boîte de 52 cubes autour de la tête rendait une coquille :
+// mesuré le 2026-11-18, les gouttes s'arrêtaient à ~45 cubes (anneaux de 15 : 674/3245/581/
+// 0/0/0) alors que la brume de pluie rend jusqu'à 60 — la pluie finissait en rond avant le
+// ciel bas. La couche proche garde la densité qui se voit à deux mètres, la couche lointaine
+// remplit jusqu'à la muraille de brume à un prix dérisoire (des sprites de trois pixels).
+const PLUIE_COUCHE_PROCHE = { boite: new THREE.Vector3(56, 44, 56), points: 5200, poids: 1 };
+// La couche lointaine remplit jusqu'au mur de brume mais ne doit pas faire un voile : son poids
+// est ce qui, empilé sur des milliers de points, donnait l'aspect « nappe épaisse » par-dessus
+// les vraies gouttes du premier plan.
+const PLUIE_COUCHE_LOINTAINE = { boite: new THREE.Vector3(96, 80, 96), points: 5200, poids: 0.5 };
+// La fraction du nuage de points réellement tirée à pleine averse. À 1, l'averse peignait
+// 4,6 % du cadre en traits de 9×5 px — un pâté presque carré, large jusqu'à 22 px : le joueur
+// lisait de la neige (`probe-neige.mjs`, 2026-11-18). Ramené à moitié, au quart puis au cinquième :
+// ce qui fait une averse, c'est la longueur des traits, pas le nombre de voiles qui se chevauchent.
+const PLUIE_DENSITE_RIDEAU = 0.2;
+// Vitesse de chute moyenne des gouttes (l'attribut `aVitesse` court de 16 à 28) : c'est le
+// dénominateur de l'inclinaison peinte. Sans lui, la traînée se couchait d'un coefficient
+// arbitraire et se retrouvait inclinée **vent nul**.
+const CHUTE_GOUTTE = 22;
 const COULEUR_PLUIE_NUIT = new THREE.Color(0x6f7f92);
 const COULEUR_PLUIE_JOUR = new THREE.Color(0xdfeaf7);
 
+// ---- les enveloppes intérieures ---------------------------------------------
+// Une maison ne doit pas se remplir de pluie, et pas seulement quand le joueur y tient :
+// le clip de pièce (`sonderChambre`) est centré sur la caméra, donc dehors rien n'était
+// retiré et la pluie tombait visiblement à l'intérieur — le vitrage écrit sa profondeur
+// après le rideau, il ne retient rien. Mesuré le 2026-11-18 depuis le trottoir : six
+// gouttes sur six dans une maison de 12×4, onze sur onze dans un corps de 3×11, quatre sur
+// quatre dans deux maisons de 5×4 et 4×4. Le remède vient des plans du village : une boîte
+// par bâtiment, du plancher à la sous-face du toit, rechargée quand le quartier change.
+// Vingt-quatre boîtes tiennent dans un uniforme ; au-delà, les plus proches gardent la place.
+const ENVELOPPES_MAX = 24;
+const ENVELOPPE_RAYON = 72;          // jusqu'où chercher des bâtiments autour de la tête
+const ENVELOPPE_INTERVALE = 0.5;     // secondes entre deux relevés des plans
+const enveloppesA = [];
+const enveloppesB = [];
+for (let i = 0; i < ENVELOPPES_MAX; i++) {
+  // Hors de portée pour toujours tant qu'elles sont vides : x borné à l'envers, y à l'envers.
+  enveloppesA.push(new THREE.Vector4(0, 1e4, 0, 0));
+  enveloppesB.push(new THREE.Vector4(-1e4, -1e4, -1e4, 0));
+}
+let enveloppeN = 0;
+let dernierReleveEnveloppe = -10;
+
+function majEnveloppes(maintenant, x, z) {
+  if (maintenant - dernierReleveEnveloppe < ENVELOPPE_INTERVALE) return;
+  dernierReleveEnveloppe = maintenant;
+  const brutes = village.enveloppesSur(
+    Math.floor(x - ENVELOPPE_RAYON), Math.floor(z - ENVELOPPE_RAYON),
+    Math.floor(x + ENVELOPPE_RAYON), Math.floor(z + ENVELOPPE_RAYON),
+  );
+  brutes.sort((p, q) => (((p.x0 + p.x1) / 2 - x) ** 2 + ((p.z0 + p.z1) / 2 - z) ** 2)
+    - (((q.x0 + q.x1) / 2 - x) ** 2 + ((q.z0 + q.z1) / 2 - z) ** 2));
+  enveloppeN = Math.min(ENVELOPPES_MAX, brutes.length);
+  for (let i = 0; i < ENVELOPPES_MAX; i++) {
+    const b = brutes[i];
+    if (b) {
+      enveloppesA[i].set(b.x0, b.y0, b.z0, 1);
+      enveloppesB[i].set(b.x1, b.y1, b.z1, 1);
+    } else {
+      enveloppesA[i].set(0, 1e4, 0, 0);
+      enveloppesB[i].set(-1e4, -1e4, -1e4, 0);
+    }
+  }
+}
+
 const SHADER_PLUIE = /* glsl */`
   uniform vec3 uBoite;
+  uniform float uIntN;                      // combien de boîtes d'intérieur sont remplies
+  uniform vec4 uIntA[${ENVELOPPES_MAX}];    // coin bas de chaque enveloppe de bâtiment
+  uniform vec4 uIntB[${ENVELOPPES_MAX}];    // coin haut de la même enveloppe
   uniform float uTemps;
-  uniform float uDerive;
+  uniform float uHoule;
+  uniform vec2 uVent;
+  uniform vec4 uChambre;      // x, plafond y, z, rayon : la pièce close qui ne se mouille pas
+  uniform float uDedans;
   uniform float uTaille;
   uniform float uPortee;
   uniform float uDensite;
@@ -3665,13 +3893,48 @@ const SHADER_PLUIE = /* glsl */`
   void main() {
     vec3 p = position;
     p.y = mod(p.y - uTemps * aVitesse + uBoite.y * 0.5, uBoite.y) - uBoite.y * 0.5;
-    p.x = mod(p.x + uTemps * uDerive * (0.6 + 0.8 * aGraine) + uBoite.x * 0.5, uBoite.x) - uBoite.x * 0.5;
-    vec4 oeil = viewMatrix * modelMatrix * vec4(p, 1.0);
+    // Le vent emporte les gouttes sur ses deux axes horizontaux, dans le **repère du monde** :
+    // une goutte ne sait rien de la caméra. Chaque goutte le ressent selon sa graine, sinon le
+    // rideau entier glisserait d'un bloc comme un papier peint qu'on tire. La houle est une
+    // oscillation, pas une dérive : elle agite l'air calme sans jamais donner de côté préféré
+    // à la pluie (une dérive constante couchait les gouttes vers +x même vent nul, mesuré le
+    // 2026-11-18 — la pluie « changeait de sens » dès qu'on tournait la tête parce que seule
+    // sa traînée, elle, suivait le vent).
+    float g = 0.6 + 0.8 * aGraine;
+    float houle = sin(uTemps * 0.9 + aGraine * 6.2831853) * uHoule;
+    p.x = mod(p.x + uTemps * uVent.x * g + houle + uBoite.x * 0.5, uBoite.x) - uBoite.x * 0.5;
+    p.z = mod(p.z + uTemps * uVent.y * g + houle * 0.7 + uBoite.z * 0.5, uBoite.z) - uBoite.z * 0.5;
+    vec3 monde = (modelMatrix * vec4(p, 1.0)).xyz;
+    vec4 oeil = viewMatrix * vec4(monde, 1.0);
     gl_Position = projectionMatrix * oeil;
     float d = max(-oeil.z, 1.0);
-    // Taille bornée : un point collé à la caméra couvrirait l'écran au lieu de tremper.
-    gl_PointSize = clamp(uTaille * (34.0 / d), 1.0, 22.0);
+    // Taille bornée : un point collé à la caméra couvrirait l'écran au lieu de tremper. Le
+    // plafond peut être haut parce que la LARGEUR ne vient pas d'ici mais du lisseur x du
+    // fragment shader : à 24 px de long le trait fait encore ~5 px de large (allongement ~4,5).
+    // Ce qui faisait le flocon, c'était un carré de 22 px sous un lisseur large (5 px de large
+    // pour 9 de haut, mesuré) — pas la taille en elle-même. Rendre les traits plus longs est
+    // la façon de garder une pluie lisible quand on éclaircit le rideau.
+    gl_PointSize = clamp(uTaille * (34.0 / d), 1.0, 24.0);
     vVoile = (1.0 - smoothstep(uPortee * 0.55, uPortee, d)) * step(aGraine, uDensite);
+    // Une pièce close ne se mouille pas : les gouttes qui y flotteraient sont retirées, mais
+    // le rideau reste vivant — c'est ce qui laisse voir l'averse par les baies vitrées. Le
+    // test de profondeur fait le reste (le plafond masque ce qui est au-dessus de lui).
+    if (uDedans > 0.5) {
+      float dcx = monde.x - uChambre.x, dcz = monde.z - uChambre.z;
+      if (monde.y < uChambre.y && dcx * dcx + dcz * dcz < uChambre.w * uChambre.w) vVoile = 0.0;
+    }
+    // Et la maison entière se tient au sec, que le joueur soit dedans ou dans la rue : les
+    // enveloppes viennent des plans du village (enveloppesSur), rechargées quand le
+    // quartier change. La pièce close ci-dessus reste nécessaire — c'est elle qui abrite
+    // l'abri que le joueur s'est construit lui-même, qu'aucun plan ne connaît.
+    for (int i = 0; i < ${ENVELOPPES_MAX}; i++) {
+      vec4 a = uIntA[i], b = uIntB[i];
+      float dedans = step(a.x, monde.x) * step(monde.x, b.x)
+                   * step(a.y, monde.y) * step(monde.y, b.y)
+                   * step(a.z, monde.z) * step(monde.z, b.z)
+                   * step(float(i) + 0.5, uIntN);   // au-delà du comptage, rien à retirer
+      vVoile *= 1.0 - dedans;
+    }
   }`;
 
 const SHADER_PLUIE_FRAGMENT = /* glsl */`
@@ -3683,43 +3946,54 @@ const SHADER_PLUIE_FRAGMENT = /* glsl */`
   void main() {
     vec2 q = gl_PointCoord - 0.5;
     q.x -= q.y * uPente;                       // la traînée est inclinée, pas verticale
-    // Les deux lisseurs définissent la goutte : une baguette haute et étroite. Étroits,
-    // ils ne laissaient peindre que six centièmes de pour cent de l'image à midi — une
-    // averse qu'on ne voit pas. Mesurés après reprise : quelques pour cents, ce que l'œil
-    // lit comme de la pluie.
-    float trait = (1.0 - smoothstep(0.06, 0.30, abs(q.x)))
+    // Les deux lisseurs définissent la goutte : une baguette haute et **étroite**. Le large
+    // avait dérivé (0,06 → 0,30 en x) : mesuré le 2026-11-18, les traits peints sortaient à
+    // 9 px de haut sur 5 de large, allongement médian 1,67 — le rapport d'un flocon, et le
+    // joueur l'a dit (« on dirait plus de la neige »). À 0,11 le trait restait continu mais
+    // faisait 4–6 px de large ; le joueur a redemandé « plus fin », donc 0,07 — un cheveu de
+    // pluie, tenu par sa longueur plutôt que par sa largeur. C'est ce rapport, pas la surface
+    // mouillée, qui fait la pluie.
+    float trait = (1.0 - smoothstep(0.015, 0.07, abs(q.x)))
                 * (1.0 - smoothstep(0.04, 0.52, abs(q.y)));
     float a = trait * uOpacite * vVoile;
     if (a < 0.01) discard;
     gl_FragColor = vec4(versSRGB(uCouleur), a);
   }`;
 
-function faireRideauDePluie() {
+function faireRideauDePluie(couche) {
   const geo = new THREE.BufferGeometry();
-  const pos = new Float32Array(PLUIE_POINTS * 3);
-  const vitesses = new Float32Array(PLUIE_POINTS);
-  const graines = new Float32Array(PLUIE_POINTS);
-  for (let i = 0; i < PLUIE_POINTS; i++) {
-    pos[i * 3] = (hashRoll(i, 1, 7, 9101) - 0.5) * PLUIE_BOITE.x;
-    pos[i * 3 + 1] = (hashRoll(i, 2, 7, 9103) - 0.5) * PLUIE_BOITE.y;
-    pos[i * 3 + 2] = (hashRoll(i, 3, 7, 9107) - 0.5) * PLUIE_BOITE.z;
+  const pos = new Float32Array(couche.points * 3);
+  const vitesses = new Float32Array(couche.points);
+  const graines = new Float32Array(couche.points);
+  for (let i = 0; i < couche.points; i++) {
+    pos[i * 3] = (hashRoll(i, 1, 7, 9101) - 0.5) * couche.boite.x;
+    pos[i * 3 + 1] = (hashRoll(i, 2, 7, 9103) - 0.5) * couche.boite.y;
+    pos[i * 3 + 2] = (hashRoll(i, 3, 7, 9107) - 0.5) * couche.boite.z;
     vitesses[i] = 16 + hashRoll(i, 4, 7, 9109) * 12;   // cubes par seconde
     graines[i] = hashRoll(i, 5, 7, 9127);               // densité et dérive individuelles
   }
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('aVitesse', new THREE.BufferAttribute(vitesses, 1));
   geo.setAttribute('aGraine', new THREE.BufferAttribute(graines, 1));
-  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), PLUIE_BOITE.length() * 0.6);
+  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), couche.boite.length() * 0.6);
   const m = new THREE.Points(geo, new THREE.ShaderMaterial({
     uniforms: {
-      uBoite: { value: PLUIE_BOITE.clone() },
+      uBoite: { value: couche.boite.clone() },
+      uIntA: { value: enveloppesA },
+      uIntB: { value: enveloppesB },
+      uIntN: { value: 0 },
       uTemps: { value: 0 },
-      uDerive: { value: 3.4 },
-      uTaille: { value: 6.5 },
+      // Houle basse : une oscillation latérale franche faisait dériver chaque goutte de son
+      // côté à elle, ce qui, ajouté aux traits carrés, achevait l'illusion de la neige.
+      uHoule: { value: 0.16 },
+      uVent: { value: new THREE.Vector2(0, 0) },
+      uChambre: { value: new THREE.Vector4(0, 0, 0, 0) },
+      uDedans: { value: 0 },
+      uTaille: { value: 12.5 },
       uPortee: { value: 90 },
       uCouleur: { value: new THREE.Color(0xdfeaf7) },
       uOpacite: { value: 0 },
-      uPente: { value: 0.34 },
+      uPente: { value: 0 },
       uDensite: { value: 0 },
     },
     vertexShader: SHADER_PLUIE,
@@ -3727,8 +4001,9 @@ function faireRideauDePluie() {
     transparent: true,
     depthWrite: false,
     // Test de profondeur actif : la roche devant la caméra doit cacher les gouttes, sinon
-    // une grotte se remplissait de pluie. Le reste du travail se fait dans `majCiel`, qui
-    // éteint le rideau sous un toit.
+    // une grotte se remplissait de pluie. Ce qui reste à faire — ne pas tremper l'intérieur
+    // d'une pièce tout en laissant voir l'averse par ses baies — se juge dans le vertex
+    // shader (`uChambre`) et non plus en éteignant le rideau entier sous un toit.
     depthTest: true,
     fog: false,
   }));
@@ -3736,17 +4011,29 @@ function faireRideauDePluie() {
   // Le volume suit la caméra : le culler sur une boîte locale reviendrait à faire
   // disparaître la pluie dès qu'elle regarde ailleurs.
   m.frustumCulled = false;
-  m.renderOrder = 6;          // après le relief et les blocs translucides
+  // Avant les blocs translucides, pas après : le verre des baies écrit la profondeur, et un
+  // rideau peint après lui était poliment rejeté derrière la vitre — l'averse devenait
+  // invisible depuis l'intérieur d'une maison. Peint avant, il est ensuite recouvert par le
+  // mélange du vitrage, ce qui est exactement ce que veut dire « voir la pluie à travers ».
+  m.renderOrder = -1;
   m.visible = false;
+  m.userData.poids = couche.poids;
   scene.add(m);
   return m;
 }
-const rideauPluie = faireRideauDePluie();
+const rideauxPluie = [
+  faireRideauDePluie(PLUIE_COUCHE_PROCHE),
+  faireRideauDePluie(PLUIE_COUCHE_LOINTAINE),
+];
+const rideauPluie = rideauxPluie[0];         // la couche proche : ce que jugent les gros plans
 
 // Sous terre, les lanternes tiennent allumées en plein jour : c'est la roche au-dessus
 // de la tête qui décide, pas l'heure. Le relevé se paie une fois par quart de seconde,
 // pas par image — c'est une descente de colonne, pas un calcul gratuit.
 const HAUT = new THREE.Vector3(0, 1, 0);
+// Vecteur de travail : l'axe « droite » de la caméra, pour savoir dans quelle mesure le
+// vent traverse l'écran (et donc de combien il couche les gouttes à l'image).
+const droiteCaméra = new THREE.Vector3();
 let lanterneVivet = etatCiel.lampes;
 let dernierReleveToit = -10;
 let toitVu = false;
@@ -3757,6 +4044,42 @@ function sousTerre(maintenant) {
     toitVu = !!hit && hit.t < 48;
   }
   return toitVu;
+}
+
+// ---- la pièce close ----------------------------------------------------------
+// Éteindre le rideau dès qu'un bloc passe au-dessus de la tête supprimait la pluie des
+// maisons comme des sous-bois : on ne voyait plus l'averse par aucune fenêtre. Ce qu'on
+// veut n'est pas « pas de pluie sous un toit » mais « pas de pluie DANS la pièce » : les
+// gouttes qui y flotteraient sont retirées par le vertex shader, tout ce qui tombe dehors
+// reste et se voit par les baies. La pièce se reconnaît à un plafond bas qui n'est pas du
+// feuillage et des murs tout autour — une couronne d'arbre échoue au premier critère, une
+// allée de troncs au second. Un rayon manquant pardonne une porte ouverte.
+const CHAMBRE_RAYONS = 8;
+const CHAMBRE_PORTÉE = 26;
+const CHAMBRE_PLAFOND_MAX = 14;
+const chambre = { close: false, rayon: 0, plafond: 0, relevé: -10 };
+const directionSonde = new THREE.Vector3();
+function sonderChambre(maintenant) {
+  if (maintenant - chambre.relevé < 0.25) return chambre;
+  chambre.relevé = maintenant;
+  const o = camera.position;
+  const haut = raycastVoxel(o, HAUT, CHAMBRE_PLAFOND_MAX + 2, true);
+  const idPlafond = haut ? world.getBlock(haut.x, haut.y, haut.z) : 0;
+  const toit = !!haut && haut.t <= CHAMBRE_PLAFOND_MAX && idPlafond !== BLOCK.LEAVES;
+  let touches = 0, plusLoin = 0;
+  for (let i = 0; i < CHAMBRE_RAYONS; i++) {
+    const a = (i / CHAMBRE_RAYONS) * Math.PI * 2;
+    directionSonde.set(Math.cos(a), 0, Math.sin(a));
+    const mur = raycastVoxel(o, directionSonde, CHAMBRE_PORTÉE, true);
+    if (!mur) continue;
+    if (world.getBlock(mur.x, mur.y, mur.z) === BLOCK.LEAVES) continue;   // un tronc ne clos pas une pièce
+    touches++;
+    if (mur.t > plusLoin) plusLoin = mur.t;
+  }
+  chambre.close = toit && touches >= CHAMBRE_RAYONS - 1;
+  chambre.rayon = Math.min(CHAMBRE_PORTÉE, plusLoin + 1.5);
+  chambre.plafond = toit ? o.y + haut.t : o.y + CHAMBRE_PLAFOND_MAX;
+  return chambre;
 }
 
 // L'altitude d'ancrage des nappes s'appuie sur une **moyenne régionale** du relief,
@@ -3801,8 +4124,14 @@ function majAncrageNappe(delta, maintenant, x, z) {
 const heureEl = document.getElementById('clock');
 
 /** Applique l'état du ciel aux lumières, à la brume et aux objets du ciel. */
-function majCiel(delta, maintenant) {
+function majCiel(delta, maintenant, m = meteoCourante()) {
   const e = etatCiel;
+  // Deux signaux de la météo se partagent le ciel : `couverture` est ce que le dôme porte
+  // de gris (il commence avant les gouttes et finit après elles), `intensite` n'est que le
+  // rideau. Les confondre — un seul nombre pour les deux — rendait l'averse sortie du bleu.
+  const voile = e.couverture != null ? e.couverture : (e.pluie || 0);
+  const averse = e.pluie || 0;
+  const claire = e.degage || 0;
 
   ambientLight.color.setHex(e.ambiante.couleur);
   ambientLight.intensity = e.ambiante.intensite;
@@ -3820,7 +4149,10 @@ function majCiel(delta, maintenant) {
   domeUniformes.uZenith.value.setHex(e.ciel);
   domeUniformes.uHorizon.value.setHex(e.horizon);
   domeUniformes.uDirectionSoleil.value.set(e.soleil[0], e.soleil[1], e.soleil[2]);
-  domeUniformes.uHalo.value = Math.max(0, 1 - Math.abs(e.hauteur) * 2.4) * 0.7;
+  // Le renard autour de l'astre suit le ciel, pas seulement l'heure : une journée sans un
+  // nuage le fait reprendre du nerf (le soleil « brille »), un ciel chargé l'éteint.
+  const renard = Math.max(0, 1 - Math.abs(e.hauteur) * 2.4);
+  domeUniformes.uHalo.value = Math.max(0, renard * (0.7 + 0.35 * claire - 0.45 * voile));
 
   // Les astres se logent juste sous le plan lointain, et non à une distance « commode » :
   // avec leur test de profondeur activé, tout bloc rendu est plus près qu'eux et les
@@ -3830,7 +4162,7 @@ function majCiel(delta, maintenant) {
   const astres = camera.far * 0.995;
   disqueSoleil.position.set(e.soleil[0], e.soleil[1], e.soleil[2]).multiplyScalar(astres);
   disqueSoleil.lookAt(camera.position);
-  disqueSoleil.scale.setScalar(astres * RAYON_SOLEIL_APPARENT);
+  disqueSoleil.scale.setScalar(astres * RAYON_SOLEIL_APPARENT * (1 + 0.06 * claire));
   disqueSoleil.visible = e.hauteur > -0.12;
 
   disqueLune.position.set(e.lune[0], e.lune[1], e.lune[2]).multiplyScalar(astres);
@@ -3845,9 +4177,17 @@ function majCiel(delta, maintenant) {
   // Les nappes suivent la caméra en x/z mais restent **ancrées au monde** : le plan se
   // recentre sur le joueur à chaque image et ses UV compensent exactement ce parcours,
   // sinon le ciel glisserait avec lui comme un plafond peint. L'axe v garde un signe
-  // inversé parce que la rotation envoie l'axe local +y vers −z monde.
+  // inversé parce que la rotation envoie l'axe local +y vers −z monde. À ce glissement
+  // s'ajoute la dérive du vent, sur le cap du monde — les deux couches avancent donc
+  // ensemble, à des vitesses différentes.
   const cote = Math.max(360, camera.far * 2.4);
   const sol = majAncrageNappe(delta, maintenant, camera.position.x, camera.position.z);
+  const souffle = NAPPE_SOUFFLE_BASE + NAPPE_SOUFFLE_VENT * (m.vent || 0);
+  const cap = m.ventDirection || [1, 0];
+  // L'épaisseur que la météo donne au jour ne porte que sur ce que le soleil peut diffuser :
+  // la nuit, un plafond plus épais n'a rien à éclairer et la nappe doit rester aussi éteinte
+  // qu'avant la météo. À midi le facteur vaut un, l'épaisseur s'applique donc telle quelle.
+  const couche = 1 + ((m.couche == null ? 1 : m.couche) - 1) * e.jour;
   for (const nappe of nappes) {
     const u = nappe.userData;
     const mat = nappe.material;
@@ -3855,36 +4195,81 @@ function majCiel(delta, maintenant) {
     nappe.scale.set(cote, cote, 1);
     const rpt = cote / u.tuile;
     mat.uniforms.uTuile.value.set(rpt, rpt);
+    const glisse = maintenant * u.vitesse * souffle;
     mat.uniforms.uDecalage.value.set(
-      camera.position.x / u.tuile + maintenant * u.vitesse,
-      -camera.position.z / u.tuile + maintenant * u.vitesse * 0.6,
+      camera.position.x / u.tuile + glisse * cap[0] * 2,
+      -camera.position.z / u.tuile - glisse * cap[1] * 2,
     );
     mat.uniforms.uCouleur.value.setHex(e.nuages.couleur);
-    mat.uniforms.uOpacite.value = e.nuages.opacite * u.facteur;
+    // `couche` vient du modèle : il tient la nappe à son épaisseur du jour (jours voilés,
+    // jours clairs) et la retire presque entièrement les journées sans un nuage.
+    mat.uniforms.uOpacite.value = Math.min(0.98, e.nuages.opacite * u.facteur * couche);
+    // L'écriture du ciel suit le modèle : `forme` vient d'un bruit lent de la météo et
+    // change l'amas dessiné sous les yeux du joueur. La couche haute décale son choix
+    // d'un cran dans l'ordre des formes pour que les deux altitudes ne portent jamais le
+    // même dessin (elles portaient la même texture avant le 2026-11-18).
+    const indexForme = Math.max(0, ORDRE_FORMES.indexOf(m.forme));
+    const tuileForme = NUAGES_TUILES[
+      ORDRE_FORMES[(indexForme + (u.decalForme || 0)) % ORDRE_FORMES.length]
+    ] || NUAGES_TEXTE;
+    if (mat.uniforms.uCarte.value !== tuileForme) mat.uniforms.uCarte.value = tuileForme;
+    u.forme = ORDRE_FORMES[(indexForme + (u.decalForme || 0)) % ORDRE_FORMES.length];
     mat.uniforms.uCam.value.copy(camera.position);
     // Le fondu lointain meurt sur le plan lointain lui-même, pas sur le bord du plan
     // géométrique : c'est le seul repère qui garantisse que rien n'est tronqué en vol.
     mat.uniforms.uPortee.value = camera.far * 0.99;
+    u.deriveCourante = +(u.vitesse * souffle).toFixed(5);
     nappe.visible = mat.uniforms.uOpacite.value > 0.02;
   }
 
   // ---- l'averse ----
   // Trois choses seulement : la brume se resserre (c'est le ciel bas), les gouttes
   // tombent, et elles s'arrêtent sous un toit. Les lumières et les teintes viennent
-  // déjà grevées du modèle (`cielSousPluie`), rien n'est recompté ici.
-  const averse = e.pluie || 0;
-  const serre = 1 - 0.42 * averse;
+  // déjà grevées du modèle (`cielSousPluie`), rien n'est recompté ici. Le ciel bas se
+  // juge sur la couverture, pas sur les gouttes : il se baisse avant elles et remonte
+  // après — c'est ce qui fait une pluie annoncée plutôt qu'un orage qui tombe du bleu.
+  const serre = 1 - 0.42 * voile;
   scene.fog.near = Math.max(3, brumeSere.near * serre);
   scene.fog.far = brumeSere.far * serre;
-  rideauPluie.position.copy(camera.position);
-  rideauPluie.visible = averse > 0.02 && !sousTerre(maintenant);
-  if (rideauPluie.visible) {
-    const u = rideauPluie.material.uniforms;
+  // Le rideau vit aussi sous un toit : c'est la pièce qui se protège (`sonderChambre`), plus
+  // la pluie qui s'éteint — une couronne d'arbre ne le coupe donc plus.
+  const pleut = averse > 0.02;
+  const ch = sonderChambre(maintenant);
+  if (pleut) majEnveloppes(maintenant, camera.position.x, camera.position.z);
+  // La matrice de CETTE image : `majCiel` tourne avant `render()`, donc lire `matrixWorld`
+  // sans la rafraîchir donnait l'axe droite du tour de tête précédent — la traînée suivait
+  // la caméra avec une image de retard et « changeait de sens » pendant qu'on tournait.
+  camera.updateMatrixWorld();
+  droiteCaméra.setFromMatrixColumn(camera.matrixWorld, 0);
+  const force = 1.2 + 4.2 * (m.vent || 0);
+  const travers = cap[0] * droiteCaméra.x + cap[1] * droiteCaméra.z;
+  // L'inclinaison peinte est la vitesse RÉELLE des gouttes projetée sur l'axe droite de la
+  // caméra, rapportée à leur vitesse de chute : le même vecteur que celui que suit le vertex
+  // shader. Un coefficient libre couchait les gouttes vent nul et faisait virer la traînée
+  // avec la tête au lieu de la laisser suivre le vent du monde.
+  const pente = Math.max(-0.8, Math.min(0.8, (travers * force) / CHUTE_GOUTTE));
+  for (const rideau of rideauxPluie) {
+    rideau.position.copy(camera.position);
+    rideau.visible = pleut;
+    if (!pleut) continue;
+    const u = rideau.material.uniforms;
     u.uTemps.value = maintenant;
-    u.uDensite.value = averse;
-    u.uOpacite.value = 0.40 + 0.28 * averse;
-    u.uPortee.value = Math.min(90, camera.far * 0.5);
+    // Le seuil sur la graine ne tire qu'une fraction du nuage : à pleine averse, un quart des
+    // gouttes, pas 90 %. L'opacité unitaire monte d'autant — ce que le joueur doit lire, c'est
+    // une pluie franche et lisible, non une brume de points. Et c'est ce contraste, pas le
+    // nombre de voiles, qui fait voir l'averse à travers les baies vitrées (contrôle de la baie).
+    u.uDensite.value = +(averse * PLUIE_DENSITE_RIDEAU).toFixed(4);
+    u.uOpacite.value = +((0.62 + 0.32 * averse) * rideau.userData.poids).toFixed(4);
     u.uCouleur.value.copy(COULEUR_PLUIE_NUIT).lerp(COULEUR_PLUIE_JOUR, e.jour);
+    u.uVent.value.set(cap[0] * force, cap[1] * force);
+    // Le fondu meurt sur la muraille de brume rendue, pas sur le bord de la boîte : c'est ce
+    // qui fait une pluie qui s'enfonce dans l'averse plutôt qu'une coquille qui s'arrête net
+    // à vingt-six cubes (mesuré le 2026-11-18 : rien au-delà de quarante-cinq).
+    u.uPortee.value = Math.max(24, Math.min(scene.fog.far * 1.12, u.uBoite.value.x * 0.62));
+    u.uPente.value = pente;
+    u.uDedans.value = ch.close ? 1 : 0;
+    u.uChambre.value.set(camera.position.x, ch.plafond, camera.position.z, ch.rayon);
+    u.uIntN.value = enveloppeN;
   }
 
   // Lanternes : franches la nuit et sous terre, éteintes en plein jour. La montée est
@@ -3906,8 +4291,9 @@ function majCiel(delta, maintenant) {
 // la valeur dans la foulée : `delta` petit garde l'allumage des lanternes amorti, seul
 // canal qui le soit.
 function rafraichirCiel(delta = 1 / 60, maintenant = performance.now() / 1000) {
-  etatCiel = cielSousPluie(etatDuCiel(horloge.heure()), intensitePluie());
-  majCiel(delta, maintenant);
+  const m = meteoCourante();
+  etatCiel = habillerCiel(etatDuCiel(horloge.heure()), m);
+  majCiel(delta, maintenant, m);
   return etatCiel;
 }
 
@@ -4701,6 +5087,7 @@ function setMeteoMode(value) {
   settings.meteo = next;
   meteo.reglerMode(next);
   pluieForcee = null;   // une reprise en main de test ne survit pas à un changement de réglage
+  ventForce = null;     // idem pour le vent figé d'une suite
   rafraichirCiel();     // l'aperçu derrière le panneau doit changer tout de suite
   syncMeteoControl();
   saveSettings();
@@ -5280,25 +5667,19 @@ if (ileRefaireBtn) ileRefaireBtn.addEventListener('click', async () => {
 // accroché à l'économise du monde), et le jeter quand le joueur n'en veut plus.
 
 const geomNoteEl = document.getElementById('geom-note');
-const geomTailleSel = document.getElementById('geom-taille');
-const geomTailleValue = document.getElementById('geom-taille-value');
 const geomJeterBtn = document.getElementById('geom-jeter');
-const geomPrecuireEl = document.getElementById('geom-precuire');
-const geomPrecuireValue = document.getElementById('geom-precuire-value');
 
 const geomEtat = { octets: 0, publies: 0, motif: '', enCours: false, etape: '', depuis: 0, migrationEssai: 0 };
 
 // ---- la barre de progression des triangles, sur l'écran d'accueil ----
 // Elle ne bloque pas l'entrée en jeu : reposer un tronçon depuis le fichier coûte 0,29 ms
-// contre 6,94 ms au mailleur, donc attendre l'île entière n'a d'intérêt que si le joueur le
-// demande. D'où le bouton, qui prête alors au four le crédit qu'aucune image ne vient lui
-// disputer (l'écran posé ne rend rien).
+// contre 6,94 ms au mailleur, donc attendre l'île entière n'a jamais d'intérêt à être
+// *demandé* — elle se taille seule. Le voile posé ne rend rien : c'est là que le four
+// rapporte le plus, et c'est pourquoi il y reçoit un crédit qu'aucune image ne lui dispute.
 const geomBlocEl = document.getElementById('geom');
 const geomBarreEl = document.getElementById('geom-barre');
 const geomRemplissageEl = document.getElementById('geom-remplissage');
 const geomTexteEl = document.getElementById('geom-texte');
-const geomPrecuireBtnEl = document.getElementById('geom-precuire-ile');
-let precuisonDemandee = false;              // pour cette session, le joueur veut l'île gravie
 
 // Le compte des tronçons de l'île, une seule fois : la barre de l'accueil doit dire où
 // on en est AVANT même que le four soit armé (sinon le joueur voit un bloc vide et ne
@@ -5332,7 +5713,7 @@ function tronconsPrets() {
 
 function syncGeomBarre() {
   if (!geomBlocEl || !geomRemplissageEl) return;
-  const actif = settings.geomCacheMo > 0 && GEOM_MODE !== 'ignorer';
+  const actif = budgetGeomOctets() > 0 && GEOM_MODE !== 'ignorer';
   geomBlocEl.hidden = !actif;
   if (!actif) return;
   const c = world.etatCuissonIle();
@@ -5349,35 +5730,28 @@ function syncGeomBarre() {
         + (geomEtat.etape ? ` · ${geomEtat.etape}` : '')
         + (c?.attenteProlongee ? ' · en attente d’une tranche du relief' : '');
   }
-  if (geomPrecuireBtnEl) {
-    geomPrecuireBtnEl.textContent = precuisonDemandee ? '⏸ Suspendre la pré-cuisson' : '⚙ Pré-cuire l’île';
-  }
 }
 
 function syncGeomControl() {
-  if (geomTailleSel) geomTailleSel.value = String(settings.geomCacheMo);
-  if (geomTailleValue) {
-    geomTailleValue.textContent = settings.geomCacheMo
-      ? `${settings.geomCacheMo} Mo · ${decrireOctets(geomEtat.octets)} écrits`
-      : 'désactivé';
-  }
-  if (geomPrecuireEl) geomPrecuireEl.checked = !!settings.geomPrecuire;
-  if (geomPrecuireValue) {
+  if (geomNoteEl) {
     const c = world.etatCuissonIle();
-    geomPrecuireValue.textContent = !settings.geomCacheMo ? 'cache éteint'
-      : !settings.geomPrecuire ? 'au fil des pas'
-      : !c ? 'plan en cours…'
-      : c.sature ? `arrêté à ${c.faits}/${c.attendus} — taille atteinte`
+    const s = world.cacheGeom ? world.cacheGeom.stats() : null;
+    // Le joueur ne choisit plus la taille : il a le droit de savoir d'où elle vient, sinon
+    // un fichier qui s'arrête à mi-île ressemble à une panne.
+    const four = !c ? 'plan en cours…'
+      : c.sature ? `arrêtée à ${c.faits}/${c.attendus} — ${c.motif || 'taille du disque atteinte'}`
       : c.attenteProlongee ? `${c.faits}/${c.attendus} · en attente d'une tranche d'île`
       : c.enMarche ? `${c.faits}/${c.attendus} tronçons taillés`
       : `île taillée · ${c.faits}/${c.attendus}`;
-  }
-  if (geomNoteEl) {
-    const s = world.cacheGeom ? world.cacheGeom.stats() : null;
-    geomNoteEl.textContent = geomEtat.motif || (s
-      ? `${s.troncons} tronçons sur le disque (${s.codec}) · ${s.decompresse} reposés sans recalcul`
-      + (world.geomEnAttente.size ? ` · ${world.geomEnAttente.size} en file` : '')
-      : (GEOM_MODE === 'ignorer' ? 'Cache laissé de côté pour cette session.' : ''));
+    const place = budgetGeomOctets();
+    geomNoteEl.textContent = geomEtat.motif || (GEOM_MODE === 'ignorer'
+      ? 'Cache laissé de côté pour cette session.'
+      : !place ? 'Cache éteint : rien n\'est écrit sur le disque.'
+      : `${decrireOctets(place)} admis sur le disque, calculés depuis `
+        + `${geomBudget.source} · cuisson ${four}`
+        + (s ? ` · ${s.troncons} tronçons (${s.codec}) · ${s.decompresse} reposés sans recalcul`
+             + (world.geomEnAttente.size ? ` · ${world.geomEnAttente.size} en file` : '')
+             + ` · ${decrireOctets(geomEtat.octets)} écrits` : ''));
   }
   syncGeomBarre();          // la barre de l'accueil lit le même état, jamais un autre compte
 }
@@ -5389,7 +5763,7 @@ async function chargerCacheGeom() {
   // du monde resterait suspendue jusqu'au plafond horaire.
   world.cacheGeomEnCours = performance.now();
   try {
-    if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return false;
+    if (GEOM_MODE === 'ignorer' || !budgetGeomOctets()) return false;
     return await lireCacheGeom();
   } finally {
     world.cacheGeomEnCours = 0;
@@ -5424,7 +5798,7 @@ async function lireCacheGeom() {
   // c'est ce qui lui permet d'ajouter des blocs sans jamais déplacer les anciens. L'île
   // borne le nombre de tronçons possibles, donc la réservation ne grossira pas en route.
   world.ecrivainGeom = new EcrivainGeom({
-    ...attendu, maxOctets: settings.geomCacheMo * 1048576, existant: octets,
+    ...attendu, maxOctets: budgetGeomOctets(), existant: octets,
     capaciteEntrees: totalTronconsIle(),
   });
   geomEtat.octets = octets.length;
@@ -5446,7 +5820,7 @@ function lireEnTeteGeom(octets, attendu) {
  * deux awaited pour ne jamais manger une image.
  */
 async function publierGeometrie() {
-  if (GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return false;
+  if (GEOM_MODE === 'ignorer' || !budgetGeomOctets()) return false;
   if (geomEtat.enCours) return false;
   if (!world.geomEnAttente.size) return false;
   // Un fichier écrit avant la table réservée ne peut pas grossir par ajout : il faudrait
@@ -5472,7 +5846,7 @@ async function publierGeometrie() {
     const aPublier = [...world.geomEnAttente.entries()];
     if (!world.ecrivainGeom) {
       world.ecrivainGeom = new EcrivainGeom({
-        ...attendu, maxOctets: settings.geomCacheMo * 1048576, capaciteEntrees: totalTronconsIle(),
+        ...attendu, maxOctets: budgetGeomOctets(), capaciteEntrees: totalTronconsIle(),
       });
     }
     for (const [cle, e] of aPublier) {
@@ -5622,7 +5996,7 @@ async function publierGeometrie() {
 
 /** Ce que l'économise du monde nous autorise à écrire sans peser sur l'image. */
 function verifierPublicationGeom() {
-  if (!worldReady || GEOM_MODE === 'ignorer' || !settings.geomCacheMo) return false;
+  if (!worldReady || GEOM_MODE === 'ignorer' || !budgetGeomOctets()) return false;
   // D'abord remettre en file ce qui avait été refusé faute de place, ensuite seulement
   // juger si le moment d'écrire est venu.
   world.cuireCeQuiAttend();
@@ -5650,11 +6024,18 @@ async function jeterGeometrie() {
   return true;
 }
 
-/** Le joueur change la taille du cache : on reporte immédiatement, sans redémarrer. */
+/**
+ * Reprise en main de la taille du fichier — par les suites, plus par le joueur : le budget
+ * se calcule (`dimensionnerBudgetGeom`). `null` rend la main au calcul. La reprise reporte
+ * immédiatement, sans redémarrer : le fichier est rouvert à la nouvelle taille.
+ */
 async function reglerBudgetGeom(valeur) {
-  const next = GEOM_BUDGETS_MO.includes(Number(valeur)) ? Number(valeur) : GEOM_BUDGET_DEFAUT_MO;
-  settings.geomCacheMo = next;
-  saveSettings();
+  // `Number(null)` vaut 0 : la main rendue au calcul se déclare AVANT conversion. Rendue,
+  // elle efface aussi l'empreinte gardée — une suite qui change le tas annoncé doit voir le
+  // chiffre suivre, sinon rien ne distingue un budget calculé d'un budget gravé dans le marbre.
+  const brut = valeur === undefined || valeur === null || valeur === '' ? null : Number(valeur);
+  geomBudget.force = brut === null || Number.isNaN(brut) ? null : Math.max(0, Math.floor(brut));
+  if (geomBudget.force === null) { geomBudget.mo = 0; geomBudget.source = ''; }
   world.cacheGeom = null;
   world.ecrivainGeom = null;
   world.geomEnAttente.clear();
@@ -5662,36 +6043,17 @@ async function reglerBudgetGeom(valeur) {
   world._fileChauffe.clear();
   world.cuissonIle = null;             // le plan de cuisson suit la nouvelle taille
   geomEtat.octets = 0;
-  if (next) await chargerCacheGeom(); else syncGeomControl();
-  return next;
+  if (budgetGeomOctets()) await chargerCacheGeom(); else syncGeomControl();
+  return dimensionnerBudgetGeom();
 }
 
-/** Le joueur décide si l'île se taille toute seule en tâche de fond. */
-function precuireIle(vrai = true) {
-  settings.geomPrecuire = !!vrai;
-  saveSettings();
-  world.cuissonIle = null;                 // le plan se refait sur la nouvelle volonté
-  return settings.geomPrecuire;
-}
-
-if (geomTailleSel) geomTailleSel.addEventListener('change', () => reglerBudgetGeom(geomTailleSel.value));
-if (geomPrecuireEl) geomPrecuireEl.addEventListener('change', () => { precuireIle(geomPrecuireEl.checked); syncGeomControl(); });
-if (geomPrecuireBtnEl) geomPrecuireBtnEl.addEventListener('click', () => {
-  precuisonDemandee = !precuisonDemandee;
-  if (precuisonDemandee) {
-    // Le hook d'animation refuse d'armer le four quand le réglage est éteint ; demander la
-    // pré-cuisson depuis le menu l'engage donc nécessairement — sinon le bouton n'aurait
-    // aucun effet et la barre resterait à « plan en cours… » sans que rien ne l'explique.
-    settings.geomPrecuire = true;
-    saveSettings();
-    if (!world.cuissonIle) world.demarrerCuissonIle();
-  }
-  syncGeomControl();
-});
 if (geomJeterBtn) geomJeterBtn.addEventListener('click', () => jeterGeometrie());
 // Le monde sait qu'il a produit des blocs à écrire mais ne connaît pas le magasin : c'est
 // ici que la file pleine devient une écriture.
 world._demanderPublicationGeom = verifierPublicationGeom;
+// Le panneau ouvre avec son chiffre déjà dessus : la taille n'étant plus un réglage, un
+// panneau vide serait la seule réponse du jeu à « combien ça prend, et pourquoi ? ».
+syncGeomControl();
 
 async function bootWorld() {
   startBtn.disabled = true;
@@ -5724,7 +6086,7 @@ async function bootWorld() {
     const ileIgnoree = ILE_MODE === 'ignorer';
     // Tenir la file de maillage dès ici : la lecture du cache d'île qui suit est un `await`,
     // donc une fenêtre d'images pendant laquelle le mailleur pourrait partir sans rien savoir.
-    if (GEOM_MODE !== 'ignorer' && settings.geomCacheMo) world.cacheGeomEnCours = performance.now();
+    if (GEOM_MODE !== 'ignorer' && budgetGeomOctets()) world.cacheGeomEnCours = performance.now();
     const ilePret = ileIgnoree ? false : await chargerCacheIle();
     // Les triangles du disque se relisent avant la première pierre posée par le boot :
     // les passages d'`updateChunks` ci-dessous maileraient sans savoir que le fichier sait
@@ -6186,15 +6548,18 @@ function animate() {
   }
   if (enVeille) {
     // Le voile est opaque : rien ne se dessine, aucune physique, aucune horloge. Une seule
-    // chose a le droit de continuer, si le joueur l'a demandée depuis le menu — graver des
-    // triangles. Elle maille HORS scène, ne touche ni la caméra ni le rendu, et son crédit
-    // n'est disputé par aucune image : c'est là qu'il rapporte le plus (mesuré 19,6 tronçons
-    // par seconde contre 8,6 pendant qu'on joue).
-    if (precuisonDemandee && !ileEtat.cuisson && settings.geomCacheMo > 0 && GEOM_MODE !== 'ignorer') {
-      // Un four désarmé avant l'appel du bouton (`cuissonIle === false`, posé par l'accroche
-      // d'image sous `?precuire=ignorer` ou quand la file était vide) ne doit pas rendre le
-      // bouton muet : la demande explicite prime sur ce défaut et le réarme — sinon la barre
-      // resterait à zéro sans jamais dire pourquoi.
+    // chose a le droit de continuer — graver des triangles. Elle maille HORS scène, ne touche
+    // ni la caméra ni le rendu, et son crédit n'est disputé par aucune image : c'est là qu'il
+    // rapporte le plus (mesuré 19,6 tronçons par seconde contre 8,6 pendant qu'on joue).
+    // Personne ne le demande plus : tant que le joueur n'est pas dans le monde, l'île se
+    // taille. Seule la session peut l'éteindre (`?precuire=ignorer`, les suites qui comptent
+    // les passages au mailleur).
+    if (!ileEtat.cuisson && budgetGeomOctets() > 0 && GEOM_MODE !== 'ignorer'
+        && PRECUIRE_MODE !== 'ignorer' && world.cuissonIleVoulue) {
+      // Un four qui n'a pas pu démarrer (`cuissonIle === false`, posé quand la file était
+      // vide) ne doit pas rendre le voile muet : on le réarme ici, sinon la barre resterait
+      // à zéro sans jamais dire pourquoi. Le désarmement demandé (`precuireIleMaintenant(false)`)
+      // passe par `cuissonIleVoulue` et n'est pas remis en cause par cette garde.
       if (!world.cuissonIle && !world.demarrerCuissonIle()) world.cuissonIle = false;
       if (world.cuissonIle) {
         world.cuireIleGeometrie(CUISSON_PRECUISON_MS);
@@ -6237,8 +6602,7 @@ function animate() {
   // les averses — c'est le seul rythme que le joueur règle.
   horloge.avancer(deltaTime);
   meteo.avancer(deltaTime, horloge.duree());
-  etatCiel = cielSousPluie(etatDuCiel(horloge.heure()), intensitePluie());
-  majCiel(deltaTime, now / 1000);
+  rafraichirCiel(deltaTime, now / 1000);
 
   if (controls.isLocked) {
     player.update(deltaTime);
@@ -6284,8 +6648,8 @@ function animate() {
   // blocs cuisent (il les affamait et le fichier d'île restait à zéro octet), et il suit
   // le joueur — un plan trié depuis la plage ne doit pas s'obstiner à tailler l'autre
   // bout du monde pendant qu'on attend sous les pieds.
-  if (world.cuissonIle === null && !ileEtat.cuisson) {
-    if (!settings.geomPrecuire || PRECUIRE_MODE === 'ignorer' || !world.demarrerCuissonIle()) world.cuissonIle = false;
+  if (world.cuissonIleVoulue && world.cuissonIle === null && !ileEtat.cuisson) {
+    if (PRECUIRE_MODE === 'ignorer' || !world.demarrerCuissonIle()) world.cuissonIle = false;
   }
   if (world.cuissonIle && world._centre) {
     const c = world._centre, o = world.cuissonIle.centre;
@@ -6697,6 +7061,10 @@ window.__mc = {
     world.quotaForce = Number.isFinite(octets) && octets > 0 ? Math.floor(octets) : null;
     return world.quotaForce;
   },
+  // La frontière telle que le jeu la juge : une suite qui rejoue la formule de la brume
+  // de son côté mesurerait un autre disque que celui que le rangeur applique.
+  montreACamera: (cx, cz) => world._montreACamera(cx, cz),
+  porteeBrume: () => ({ near: brumeSere.near, far: brumeSere.far, x: world._camX, z: world._camZ }),
   // ---- géométrie prête pour la carte ----
   // Ce que jugent les suites : un tronçon reposé depuis le disque ne doit rien au
   // mailleur, et un bloc touché par le joueur ne doit jamais revenir du fichier.
@@ -6711,7 +7079,14 @@ window.__mc = {
     enCours: geomEtat.enCours,
     etape: geomEtat.etape,
     etapeDepuis: geomEtat.enCours ? Math.round(performance.now() - geomEtat.depuis) : 0,
-    budgetMo: settings.geomCacheMo,
+    budgetMo: dimensionnerBudgetGeom(),
+    budgetCalcule: geomBudget.source,
+    // Les règles du calcul, exposées pour qu'une suite juge la dépendance à la mémoire au
+    // lieu de rejouer des chiffres magic.
+    reglesBudget: {
+      fraction: GEOM_BUDGET_FRACTION, plancherMo: GEOM_BUDGET_PLANCHER_MO,
+      plafondMo: GEOM_BUDGET_PLAFOND_MO, defautMo: GEOM_BUDGET_DEFAUT_MO,
+    },
     stats: world.cacheGeom ? world.cacheGeom.stats() : null,
     version: MAILLE_VERSION,
     cuisson: world.etatCuissonIle(),
@@ -6734,7 +7109,6 @@ window.__mc = {
     if (world.cuissonIle === null) world.demarrerCuissonIle();   // la sonde n'attend pas l'image
     return world.cuireIleGeometrie(maxMs);
   },
-  precuireIle: (vrai = true) => precuireIle(vrai),
   // ---- cache d'île ----
   // Ce que jugent les suites de chargement : l'état de la barre, ce que le cache sait
   // déjà, et de quoi vider ou relancer une cuisson sans passer par la souris.
@@ -6763,15 +7137,15 @@ window.__mc = {
         aria: geomBarreEl?.getAttribute('aria-valuenow') ?? null, prets: tronconsPrets(),
       }
     : null),
+  // Levier de suite : armer ou désarmer le four de fond. Le joueur n'a plus de prise ici —
+  // la pré-cuisson est automatique, c'est la session qui l'éteint (`?precuire=ignorer`) —
+  // mais une suite qui compte des mailleurs doit pouvoir le faire sans recharger la page.
   precuireIleMaintenant: (vrai = true) => {
-    precuisonDemandee = !!vrai;
-    if (precuisonDemandee) {
-      settings.geomPrecuire = true;
-      saveSettings();
-      if (!world.cuissonIle) world.demarrerCuissonIle();
-    }
+    world.cuissonIleVoulue = !!vrai;
+    world.cuissonIle = vrai ? null : false;
+    if (vrai && !world.demarrerCuissonIle()) world.cuissonIle = false;
     syncGeomControl();
-    return precuisonDemandee;
+    return !!world.cuissonIle;
   },
   ileCuire: () => cuireIle(),
   ileRelire: () => chargerCacheIle(),
@@ -6926,24 +7300,41 @@ window.__mc = {
   // La couche de nuages telle qu'elle est rendue. Une suite juge qu'ils ne sont pas des
   // cubes (géométrie), qu'ils tiennent au monde quand le joueur marche (le décalage d'UV
   // compense exactement sa course) et qu'ils s'éteignent avec le jour.
-  nuages: () => nappes.map((n) => ({
-    nom: n.userData.nom,
-    altitude: n.userData.altitude,
-    tuile: n.userData.tuile,
-    vitesse: n.userData.vitesse,
-    visible: n.visible,
-    geometrie: n.geometry.type,
-    opacite: +n.material.uniforms.uOpacite.value.toFixed(4),
-    couleur: '#' + n.material.uniforms.uCouleur.value.getHexString(),
-    repeat: +n.material.uniforms.uTuile.value.x.toFixed(4),
-    offsetU: n.material.uniforms.uDecalage.value.x,
-    offsetV: n.material.uniforms.uDecalage.value.y,
-    // L'ancrage régional tel qu'il est appliqué (identique pour les deux couches) : une
-    // suite juge qu'il ne tressaute pas quand le joueur marche sur un gradin.
-    solAncre: +(solNappe ?? 0).toFixed(3),
-    camX: camera.position.x,
-    camZ: camera.position.z,
-  })),
+  nuages: () => {
+    // Le vent et l'épaisseur du jour sont lus une fois pour les deux couches : ils sortent
+    // du même état météo que celui que la scène vient d'appliquer.
+    const m = meteoCourante();
+    return nappes.map((n) => ({
+      nom: n.userData.nom,
+      altitude: n.userData.altitude,
+      tuile: n.userData.tuile,
+      vitesse: n.userData.vitesse,
+      // La dérive réellement appliquée cette image (tuiles par seconde), base × vent : c'est
+      // elle que juge une suite qui veut prouver que le ciel bouge, et non la constante de
+      // fabrication — une nappe à la bonne constante mais dont le vent ne monte jamais à
+      // rien resterait peinte immobile.
+      derive: +(n.userData.deriveCourante ?? n.userData.vitesse).toFixed(5),
+      vent: m.vent,
+      couche: m.couche,
+      cap: m.ventDirection,
+      visible: n.visible,
+      geometrie: n.geometry.type,
+      opacite: +n.material.uniforms.uOpacite.value.toFixed(4),
+      couleur: '#' + n.material.uniforms.uCouleur.value.getHexString(),
+      repeat: +n.material.uniforms.uTuile.value.x.toFixed(4),
+      // Le dessin réellement posé sur cette couche, et la texture qui le porte : deux
+      // nappes portant le même `carte` seraient le même nuage peint deux fois.
+      forme: n.userData.forme || null,
+      carte: n.material.uniforms.uCarte.value?.uuid || null,
+      offsetU: n.material.uniforms.uDecalage.value.x,
+      offsetV: n.material.uniforms.uDecalage.value.y,
+      // L'ancrage régional tel qu'il est appliqué (identique pour les deux couches) : une
+      // suite juge qu'il ne tressaute pas quand le joueur marche sur un gradin.
+      solAncre: +(solNappe ?? 0).toFixed(3),
+      camX: camera.position.x,
+      camZ: camera.position.z,
+    }));
+  },
   // `delta` et `maintenant` se figent pour qu'une suite puisse dérouler la marche du
   // joueur image par image plutôt que de voir l'amortissement sauter comme à la
   // télécommande (sans quoi le contrôle jugerait un ciel instantané, pas celui du jeu).
@@ -6956,31 +7347,80 @@ window.__mc = {
   // attendre vingt minutes d'horloge pour juger une averse : `reglerPluie` la fige et
   // force `majCiel`, exactement comme `reglerHeure` le fait pour l'heure.
   pluie: () => {
-    const e = meteo.etat();
+    const brut = meteo.etat();
+    const m = meteoCourante();
     return {
-      ...e,
+      ...m,
       // `intensite` est celle que la scène rend — avec une reprise en main de test, ce
       // n'est pas celle de l'automate ; elle reste lisible sous `automate`.
-      intensite: intensitePluie(),
-      automate: e.intensite,
+      automate: brut.intensite,
       force: pluieForcee,
-      rendu: {
-        visible: rideauPluie.visible,
-        points: rideauPluie.geometry.attributes.position.count,
-        peints: renderer.info.render.points || 0,
-        densite: +rideauPluie.material.uniforms.uDensite.value.toFixed(3),
-        opacite: +rideauPluie.material.uniforms.uOpacite.value.toFixed(3),
-        couleur: '#' + rideauPluie.material.uniforms.uCouleur.value.getHexString(),
-        brume: [+scene.fog.near.toFixed(1), +scene.fog.far.toFixed(1)],
-        // Même arrondi que `brume` : la suite compare les deux et jugerait une différence
-        // de lecture là où il n'y a qu'une différence de virgule flottante.
-        brumeSere: [+brumeSere.near.toFixed(1), +brumeSere.far.toFixed(1)],
-      },
+      rendu: (() => {
+        // La couche proche porte les gros plans jugés par les suites ; `points` et `peints`
+        // comptent les deux rideaux, sinon « toutes les gouttes sont dessinées » ne voudrait
+        // plus rien dire depuis que le volume a une deuxième couche.
+        const u = rideauPluie.material.uniforms;
+        let points = 0, allumes = 0;
+        for (const r of rideauxPluie) {
+          points += r.geometry.attributes.position.count;
+          if (r.visible) allumes++;
+        }
+        return {
+          visible: allumes > 0,
+          rideaux: allumes,
+          points,
+          peints: renderer.info.render.points || 0,
+          densite: +u.uDensite.value.toFixed(3),
+          opacite: +u.uOpacite.value.toFixed(3),
+          couleur: '#' + u.uCouleur.value.getHexString(),
+          // L'inclinaison réellement peinte cette image : juger qu'un vent couche bien les
+          // gouttes se fait sur l'uniforme consommé par le fragment shader, pas sur le cap.
+          pente: +u.uPente.value.toFixed(3),
+          vent: [+u.uVent.value.x.toFixed(2), +u.uVent.value.y.toFixed(2)],
+          houle: +u.uHoule.value.toFixed(2),
+          portee: +u.uPortee.value.toFixed(1),
+          boites: rideauxPluie.map((r) => [
+            r.material.uniforms.uBoite.value.x, r.material.uniforms.uBoite.value.y,
+            r.material.uniforms.uBoite.value.z,
+          ]),
+          // Ce que le relevé de pièce a décidé : la suite juge avec ces chiffres ce qui doit
+          // rester au sec, sans rejouer les rayons dans son coin.
+          piece: {
+            close: chambre.close,
+            rayon: +chambre.rayon.toFixed(2),
+            plafond: +chambre.plafond.toFixed(2),
+            clip: u.uDedans.value,
+          },
+          // Les enveloppes réellement poussées au shader image après image : la suite rejoue
+          // le retrait des gouttes avec ces boîtes-là, jamais avec une liste reconstituée
+          // dans son coin — c'est la différence entre juger le jeu et juger son propre code.
+          enveloppes: Array.from({ length: enveloppeN }, (_, i) => [
+            +enveloppesA[i].x.toFixed(2), +enveloppesA[i].y.toFixed(2), +enveloppesA[i].z.toFixed(2),
+            +enveloppesB[i].x.toFixed(2), +enveloppesB[i].y.toFixed(2), +enveloppesB[i].z.toFixed(2),
+          ]),
+          brume: [+scene.fog.near.toFixed(1), +scene.fog.far.toFixed(1)],
+          // Même arrondi que `brume` : la suite compare les deux et jugerait une différence
+          // de lecture là où il n'y a qu'une différence de virgule flottante.
+          brumeSere: [+brumeSere.near.toFixed(1), +brumeSere.far.toFixed(1)],
+        };
+      })(),
     };
   },
   reglerPluie: (v, delta = 10, maintenant = performance.now() / 1000) => {
     pluieForcee = v == null ? null : Math.min(1, Math.max(0, Number(v) || 0));
     return rafraichirCiel(delta, maintenant).pluie || 0;
+  },
+  /** Fige le vent (suites) : `null` rend la main au monde. */
+  reglerVent: (v, delta = 1 / 60, maintenant = performance.now() / 1000) => {
+    ventForce = v == null ? null : Math.min(1, Math.max(0, Number(v) || 0));
+    rafraichirCiel(delta, maintenant);
+    return meteoCourante().vent;
+  },
+  /** Téléporte la pendule météo à `journees` journées depuis l'ouverture (suites). */
+  reglerMeteoTemps: (journees, delta = 1 / 60, maintenant = performance.now() / 1000) => {
+    meteo.reglerTemps(Number(journees) || 0);
+    rafraichirCiel(delta, maintenant);
+    return meteoCourante();
   },
   /** Fait défiler la pendule météo de `journees` journées (suites). */
   avancerMeteo: (journees, delta = 1 / 60, maintenant = performance.now() / 1000) => {
@@ -6998,7 +7438,12 @@ window.__mc = {
   lampesInterieuresSur: (x0, z0, x1, z1) => village.lampesInterieuresSur(x0, z0, x1, z1),
   appliquesMuralesSur: (x0, z0, x1, z1) => village.appliquesMuralesSur(x0, z0, x1, z1),
   couloirsSur: (x0, z0, x1, z1) => village.couloirsSur(x0, z0, x1, z1),
+  piecesDImmeubleSur: (x0, z0, x1, z1) => village.piecesDImmeubleSur(x0, z0, x1, z1),
+  piecesDeMaisonSur: (x0, z0, x1, z1) => village.piecesDeMaisonSur(x0, z0, x1, z1),
+  enveloppesSur: (x0, z0, x1, z1) => village.enveloppesSur(x0, z0, x1, z1),
   lampesDuTroncon: (cx, cz) => world.lampesAutour(cx, cz),
   bloc: (x, y, z) => world.getBlock(x, y, z),
+  // Le prédicat du culling : ce qui cache vraiment ce qu'il y a derrière (une vitre ne cache rien).
+  blocOpaque: (id) => !!BLOCK_INFO[id]?.opaque,
   playerState: () => player.saveState(),
 };

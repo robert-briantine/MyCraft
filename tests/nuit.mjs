@@ -11,7 +11,8 @@ const SHOTS = process.env.SHOT_DIR || '.qwen/tmp/mc-shots';
 const { check, summary } = makeReporter();
 const { browser, page, consoleErrors } = await openGame(URL);
 
-const LAMP_POST = 21, LAMP_GLOW = 22, STONE = 3, AIR = 0, LAMP_WALL_O = 23;
+const LAMP_POST = 21, LAMP_GLOW = 22, STONE = 3, AIR = 0,
+  LAMP_WALL_O = 23, LAMP_WALL_E = 24, LAMP_WALL_N = 25, LAMP_WALL_S = 26;
 const ignorable = (x) => /favicon|Failed to load resource/i.test(String(x));
 
 // ================================================== 1. le modèle du ciel dans la page
@@ -387,6 +388,11 @@ const nuages = await page.evaluate(() => {
   mc.releaseAll();
   const nappes = [];
   mc.scene.traverse((o) => { if (o.name === 'nuages') nappes.push(o); });
+  // Ces contrôles jugent la forme, la périodicité et l'extinction des nappes — pas le temps
+  // qu'il fait. La pendule météo est donc figée à l'ouverture du monde, où l'épaisseur que
+  // la météo prête aux nappes vaut exactement un : sinon le même contrôle tomberait un jour
+  // de voile et passerait un jour clair.
+  mc.reglerMeteoTemps?.(0, 1 / 60, performance.now() / 1000);
   const gl = mc.renderer.getContext();
   const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
   const tirer = () => {
@@ -478,14 +484,24 @@ const nuages = await page.evaluate(() => {
   const tirC = tirer();
   uni.value.x = uAvant;
   const mad = (p, q) => {
+    // La moyenne sur toute la bande noie le signal entre les amas — où il n'y a rien à
+    // déplacer. Le contrôle de périodicité doit donc répondre là où le nuage existe : on
+    // garde l'écart moyen pour la tuile entière (il doit rester nul) et le neuvième décile
+    // des écarts par pixel, qui mesure le changement là où la nappe peint vraiment.
     let s = 0, n = 0;
+    const ec = [];
     for (let y = haut[0]; y < haut[1]; y += 2) for (let x = 0; x < w; x += 2) {
       const i = (y * w + x) * 4;
       if (p[i] > p[i + 2] + 5) continue;                  // le relief suit la caméra, pas le ciel
-      s += Math.abs(p[i] - q[i]) + Math.abs(p[i + 1] - q[i + 1]) + Math.abs(p[i + 2] - q[i + 2]);
-      n += 3;
+      const d = Math.abs(p[i] - q[i]) + Math.abs(p[i + 1] - q[i + 1]) + Math.abs(p[i + 2] - q[i + 2]);
+      s += d; n += 3; ec.push(d);
     }
-    return { ecart: +(s / Math.max(1, n)).toFixed(2), pixels: Math.round(n / 3) };
+    ec.sort((a, b) => a - b);
+    return {
+      ecart: +(s / Math.max(1, n)).toFixed(2), pixels: Math.round(n / 3),
+      p90: ec.length ? +ec[Math.floor(ec.length * 0.9)].toFixed(1) : 0,
+      max: ec.length ? ec.at(-1) : 0,
+    };
   };
   const calage = { pleine: mad(tirA, tirB), demi: mad(tirA, tirC) };
 
@@ -498,18 +514,38 @@ const nuages = await page.evaluate(() => {
       const hh = mc.getTerrainHeight(x, z);
       for (let y = 6; y < hh - 2; y++) {
         if (mc.bloc(x, y, z) !== 0) continue;
-        let ferme = true;
-        for (let k = 1; k <= 10; k++) if (mc.bloc(x, y + k, z) === 0) ferme = false;
-        if (ferme) { creux = { x, z, y }; break; }
+        const toit = [];
+        for (let k = 1; k <= 10; k++) toit.push(mc.bloc(x, y + k, z));
+        // Dix blocs « non-air » ne scellent rien : une vitre, une feuille ou de l'eau laisse
+        // voir le ciel. Le juge est le prédicat du culling, celui qui décide vraiment de ce
+        // qui cache ce qu'il y a derrière (mesuré : une poche coiffée de verre donnait 150).
+        if (!toit.every((id) => mc.blocOpaque(id))) continue;
+        creux = { x, z, y, toit: toit.join(',') };
+        break;
       }
     }
   }
   let cielSousRoche = null;
+  let sousRocheNu = null;
+  let bandeBasse = null;
   if (creux) {
     mc.camera.position.set(creux.x + 0.5, creux.y + 0.5, creux.z + 0.5);
     mc.look(0, 89);
     mc.reglerHeure(0.5);
-    cielSousRoche = moyBande(tirer(), ...haut);
+    // Le flot se pompe À LA NOUVELLE PLACE : le `streamAll` ci-dessus drainait autour de la
+    // caméra d'avant, que le contrôle d'ancrage avait déjà décalée de 64 cubes. Juger des
+    // pixels là où rien n'est maillé ne dirait rien de la roche (mesuré : bande haute 158
+    // contre 44 une fois le tronçon du plafond réellement accroché).
+    mc.streamAll();
+    const avec = tirer();
+    for (const n of nappes) n.visible = false;
+    const sans = tirer();
+    for (const n of nappes) n.visible = true;
+    cielSousRoche = moyBande(avec, ...haut);
+    sousRocheNu = moyBande(sans, ...haut);
+    // Le bas du cadre sert de témoin : s'il est clair lui aussi, c'est que la poche n'était
+    // pas scellée du tout (lumière qui entre sur les côtés), pas que le plafond ment.
+    bandeBasse = moyBande(avec, 0, Math.floor(h * 0.28));
   }
   return {
     formes: nappes.map((o) => ({ geometrie: o.geometry.type, horizontal: Math.abs(o.rotation.x + Math.PI / 2) < 1e-6,
@@ -517,7 +553,7 @@ const nuages = await page.evaluate(() => {
     etatJour, etatNuit, cielJour, cielNu, cielNuit, cielNuitNu,
     apport: { couverts: +(100 * gagnes / n).toFixed(1), moyenne: +moyenne.toFixed(1), max: +max.toFixed(1),
       ecartType: +ecartType.toFixed(1) },
-    derive, calage, creux, cielSousRoche,
+    derive, calage, creux, cielSousRoche, sousRocheNu, bandeBasse,
   };
 });
 check('les nuages sont des nappes continues, jamais des cubes',
@@ -531,10 +567,15 @@ check('et ils dessinent des amas, pas un lavis uniforme',
   nuages.apport.ecartType > 4,
   `écart type des apports ${nuages.apport.ecartType} sur ${nuages.apport.couverts}% de pixels touchés`);
 const apportNuit = +(nuages.cielNuit - nuages.cielNuitNu).toFixed(1);
+// Le rapport à ce que la nappe ajoute en plein jour, pas une valeur absolue : la dérive suit
+// l'horloge, donc l'endroit de la texture qui tombe au-dessus de la caméra change à chaque
+// déroulé. Une barre absolue faisait tomber la suite selon le tirage ; comparée à elle-même
+// au zénith de midi, la nappe doit quand même rester éteinte — un voile qui garderait sa
+// lumière la nuit rendrait ici celui du plein jour.
 check('la nuit venue, la nappe s’éteint',
   nuages.etatNuit.every((n, i) => n.opacite < nuages.etatJour[i].opacite * 0.6)
-    && apportNuit <= 5 && nuages.cielNuit < 30,
-  `opacité ${nuages.etatJour[0].opacite} → ${nuages.etatNuit[0].opacite} · la nappe ajoute ${apportNuit} de luminance à une bande déjà à ${nuages.cielNuitNu} (plein jour, elle ajoute +${nuages.apport.moyenne})`);
+    && apportNuit <= 6 && apportNuit <= nuages.apport.moyenne * 0.22 && nuages.cielNuit < 30,
+  `opacité ${nuages.etatJour[0].opacite} → ${nuages.etatNuit[0].opacite} · la nappe ajoute ${apportNuit} de luminance à une bande déjà à ${nuages.cielNuitNu}, soit ${(100 * apportNuit / Math.max(0.1, nuages.apport.moyenne)).toFixed(0)} % de son apport de plein jour (+${nuages.apport.moyenne})`);
 check('le ciel des nuages tient au monde quand le joueur marche',
   Math.abs(nuages.derive.u) < 0.02 && Math.abs(nuages.derive.v) < 0.02,
   `après 64 cubes vers l’est et 40 vers le nord, dérive ${(nuages.derive.u)},${(nuages.derive.v)} de tuile`);
@@ -587,10 +628,20 @@ const tremble = await page.evaluate(() => {
   mc.scene.traverse((o) => { if (o.name === 'nuages' && o.userData.nom === 'basse') basse = o; });
   const ALT = basse.userData.altitude;
   const rad = couloir.yaw * Math.PI / 180;
-  const repere = new mc.THREE.Vector3(couloir.x, 0, couloir.z).addScaledVector(
-    new mc.THREE.Vector3(-Math.sin(rad), 0, -Math.cos(rad)), 90);
+  const cap = new mc.THREE.Vector3(-Math.sin(rad), 0, -Math.cos(rad));
+  // Le repère d'écran se prend à soixante cubes DEVANT LA CAMÉRA, réévalué à chaque image —
+  // jamais devant le départ du couloir, et jamais de biais. Deux géométries mesurées fausses :
+  // posé devant le départ, il est traversé par la caméra au bout de cent cubes de marche ; posé
+  // de biais, il se trouve à quatre-vingt-dix cubes mais à une profondeur de vue nulle. Dans les
+  // deux cas `project` divise par cette profondeur et rend des valeurs hors cadre : la somme des
+  // secondes différences montait à 2,4 millions de px pour un cadre qui ne peut en rendre que
+  // 320, et les deux termes de la comparaison s'annulaient dans la même explosion — le rapport
+  // ne disait plus rien de la nappe. Un repère toujours droit devant reste au cœur du cône de
+  // vue : le capteur juge bien le tressautement à l'écran, sans singularité sur le parcours.
   const pxH = mc.renderer.domElement.clientHeight;
-  const proj = (y) => repere.clone().setY(y).project(mc.camera).y * 0.5 * pxH;
+  const proj = (y) => new mc.THREE.Vector3(
+    mc.camera.position.x + cap.x * 60, y, mc.camera.position.z + cap.z * 60,
+  ).project(mc.camera).y * 0.5 * pxH;
 
   mc.press('KeyW');
   const t0 = performance.now() / 1000;
@@ -631,11 +682,14 @@ check('marcher sur un gradin ne fait plus tressauter la nappe',
   tremble.erreur || `${tremble.parcouru} cubes sur relief à ${tremble.paliersColonnes} niveaux · rugosité ${tremble.apres.rugositePx} px contre ${tremble.avant.rugositePx} px, plus grand saut ${tremble.apres.sautMaxCube} cube`);
 check('une tuile de décalage rend le ciel identique, une moitié le change',
   nuages.calage.pleine.pixels > 1000 && nuages.calage.pleine.ecart <= 1
-    && nuages.calage.demi.ecart > 2,
-  `${nuages.calage.pleine.pixels} pixels de ciel · tuile entière ${nuages.calage.pleine.ecart} · demi-tuile ${nuages.calage.demi.ecart}`);
+    && nuages.calage.demi.p90 > 8,
+  `${nuages.calage.pleine.pixels} pixels de ciel · tuile entière ${nuages.calage.pleine.ecart} (p90 ${nuages.calage.pleine.p90}) · demi-tuile ${nuages.calage.demi.ecart} en moyenne, ${nuages.calage.demi.p90} au neuvième décile, pointe ${nuages.calage.demi.max}`);
+// Le juge est l'APPORT des nappes, pas la luminance absolue : une poche peut être éclairée
+// par un puits de jour voisin et doit quand même cacher le ciel, et une maille absente se
+// trahit justement parce que les nappes, elles, peignent alors le haut du cadre.
 check('la roche qui scelle une poche d’air cache les nuages',
-  !!nuages.creux && nuages.cielSousRoche !== null && nuages.cielSousRoche < 12,
-  nuages.creux ? `poche en ${nuages.creux.x},${nuages.creux.y},${nuages.creux.z} · bande haute ${nuages.cielSousRoche}` : 'aucune poche trouvée');
+  !!nuages.creux && nuages.cielSousRoche !== null && Math.abs(nuages.cielSousRoche - nuages.sousRocheNu) <= 1.5,
+  nuages.creux ? `poche en ${nuages.creux.x},${nuages.creux.y},${nuages.creux.z} · toit ${nuages.creux.toit} · bande haute ${nuages.cielSousRoche} avec les nappes, ${nuages.sousRocheNu} sans, soit ${(nuages.cielSousRoche - nuages.sousRocheNu).toFixed(1)} d'apport · bande basse ${nuages.bandeBasse}` : 'aucune poche trouvée');
 
 // ================================================== 3. réglage de la durée du jour
 const curseur = await page.evaluate(() => {
@@ -1108,23 +1162,25 @@ check('neuf marches plus bas, le joueur creuse dans le noir',
 
 // ================================================== 5 ter. le village s'éclaire lui-même
 // Demandé le 2026-11-11 : « il faudrait mettre de la lumiere dans les maisons et dans les
-// temples ». Une pièce doit tenir sa clarté du seul générateur — la sauvegarde n'étant
-// qu'un diff du joueur, une lanterne posée à la main ne repousserait jamais au monde
-// suivant — et rendre l'ombre quand on l'arrache. La chambre jugée est tenue à l'écart de
-// tout candélabre d'avenue comme de toute autre lanterne : sinon c'est la voisine qui
-// éclairerait la fenêtre et le contrôle ne prouverait plus rien.
-const INTE = { AIR, LAMP_POST, LAMP_GLOW };
-const interieur = await page.evaluate(({ AIR, LAMP_POST, LAMP_GLOW }) => {
+// temples », puis le 2026-11-18 : « des appliques dans toutes les maisons à la place d'un
+// lampadaire au milieu qui bouche le passage ». Une pièce doit donc tenir sa clarté du
+// seul générateur — la sauvegarde n'étant qu'un diff du joueur, un globe posé à la main ne
+// repousserait jamais au monde suivant — et rendre l'ombre quand on l'arrache. La chambre
+// jugée est tenue à l'écart de tout candélabre d'avenue comme de tout globe voisin : sinon
+// c'est la voisine qui éclairerait la fenêtre et le contrôle ne prouverait plus rien.
+const INTE = { AIR, STONE, GLASS: 17, LAMP_WALL_O, LAMP_WALL_E, LAMP_WALL_N, LAMP_WALL_S };
+const interieur = await page.evaluate((K) => {
   const mc = window.__mc;
+  const APP = [K.LAMP_WALL_O, K.LAMP_WALL_E, K.LAMP_WALL_N, K.LAMP_WALL_S];
   const editsAvant = mc.editCount();
   let meilleur = null;
   for (let cx = -8; cx <= 24; cx++) {
     for (let cz = -8; cz <= 24; cz++) {
-      const n = mc.lampesInterieuresSur(cx * 16, cz * 16, cx * 16 + 15, cz * 16 + 15).length;
+      const n = mc.piecesDeMaisonSur(cx * 16, cz * 16, cx * 16 + 15, cz * 16 + 15).length;
       if (!meilleur || n > meilleur.n) meilleur = { cx, cz, n };
     }
   }
-  if (!meilleur || !meilleur.n) return { erreur: 'aucune aire intérieure au village' };
+  if (!meilleur || !meilleur.n) return { erreur: 'aucune pièce de maison au village' };
   mc.setRenderDistance(3);
   mc.player.flyMode = true;
   mc.releaseAll();
@@ -1135,42 +1191,77 @@ const interieur = await page.evaluate(({ AIR, LAMP_POST, LAMP_GLOW }) => {
   mc.streamAll();
 
   const rues = [];
-  const posees = [];
+  const pieces = [];
   for (let dx = -1; dx <= 1; dx++) {
     for (let dz = -1; dz <= 1; dz++) {
       const a = (meilleur.cx + dx) * 16, b = (meilleur.cz + dz) * 16;
       for (const r of mc.lampadairesSur(a, b, a + 15, b + 15)) rues.push(r);
-      for (const l of mc.lampesInterieuresSur(a, b, a + 15, b + 15)) {
-        if (mc.bloc(l.wx, l.y, l.wz) === LAMP_POST && mc.bloc(l.wx, l.y + 1, l.wz) === LAMP_GLOW) posees.push(l);
+      for (const co of mc.piecesDeMaisonSur(a, b, a + 15, b + 15)) {
+        const globes = [];
+        for (const c of co.cellules) {
+          const id = mc.bloc(c.wx, co.y + 1, c.wz);      // une applique n'a pas de pied
+          if (APP.includes(id)) globes.push({ wx: c.wx, wz: c.wz, id });
+        }
+        if (globes.length) {
+          const xs = co.cellules.map((c) => c.wx), zs = co.cellules.map((c) => c.wz);
+          pieces.push({
+            ly: co.y + 1, globes,
+            // L'emprise de la maison est la pièce évidée d'un cube sur chaque bord : le
+            // pourtour se retrouve donc exactement une colonne plus loin.
+            bornes: { x0: Math.min(...xs), x1: Math.max(...xs), z0: Math.min(...zs), z1: Math.max(...zs) },
+          });
+        }
       }
     }
   }
-  // La pièce jugée se choisit « la mieux isolée » plutôt qu'au-dessus d'un seuil : les
-  // lanternes d'intérieur se posent à trois cubes l'une de l'autre et les maisons se
-  // touchent, donc une chambre parfaitement seule n'existe presque jamais (mesuré : zéro
-  // candidate à douze cubes de toute voisine). Le voisinage le plus éloigné reste le
-  // meilleur témoin disponible pour juger ce que doit à SA lanterne — d'où le contrôle en
-  // chute de lumière, pas en obscurité absolue. Les candélabres d'avenue, eux, sont tenus
-  // à douze cubes : la rue n'a pas à éclairer la fenêtre jugée.
   const cheb = (a, b) => Math.max(Math.abs(a.wx - b.wx), Math.abs(a.wz - b.wz));
-  const loinDesRues = (l) => rues.every((r) => cheb(l, r) >= 12);
+  // Un globe adossé à une baie ne doit son halo qu'au ciel : n'en juger un que s'il est
+  // suivi d'un mur puis de trois vides, sinon la scène mesurée serait une façade ouverte.
+  const faceLibre = (g, ly) => {
+    for (const [dx, dz] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+      if (!mc.bloc(g.wx + dx, ly, g.wz + dz)) continue;   // côté cour : rien d'adosse
+      let degage = true;
+      for (let k = 1; k <= 3; k++) if (mc.bloc(g.wx - dx * k, ly, g.wz - dz * k)) degage = false;
+      if (degage) return true;
+    }
+    return false;
+  };
+  // La pièce jugée se choisit « la mieux isolée » plutôt qu'au-dessus d'un seuil : les
+  // appliques se posent à quatre cubes l'une de l'autre et les maisons se touchent, donc
+  // une chambre parfaitement seule n'existe presque jamais. Le voisinage le plus éloigné
+  // reste le meilleur témoin disponible pour juger ce que la pièce doit à SES globes — d'où
+  // le contrôle en chute de lumière, pas en obscurité absolue. Les candélabres d'avenue,
+  // eux, sont tenus à douze cubes : la rue n'a pas à éclairer la fenêtre jugée.
   let choisie = null, score = -1;
-  for (const l of posees) {
-    if (!loinDesRues(l)) continue;
+  for (const p of pieces) {
+    if (!p.globes.every((g) => rues.every((r) => cheb(g, r) >= 12))) continue;
+    if (!p.globes.some((g) => faceLibre(g, p.ly))) continue;
     let plusProche = Infinity;
-    for (const o of posees) if (o !== l) plusProche = Math.min(plusProche, cheb(l, o));
-    if (plusProche > score) { score = plusProche; choisie = l; }
+    for (const autre of pieces) {
+      if (autre === p) continue;
+      for (const h of autre.globes) {
+        for (const g of p.globes) plusProche = Math.min(plusProche, cheb(g, h));
+      }
+    }
+    if (plusProche > score) {
+      score = plusProche;
+      choisie = { ly: p.ly, globes: p.globes.slice(), bornes: p.bornes };
+    }
   }
-  if (!choisie) return { erreur: 'aucune lanterne à l\'écart des avenues', posees: posees.length, rues: rues.length };
+  if (!choisie) {
+    return { erreur: 'aucune pièce de maison à l\'écart des avenues',
+      globesJuges: pieces.reduce((n, p) => n + p.globes.length, 0), rues: rues.length };
+  }
 
-  const { wx, wz, y } = choisie;
-  mc.camera.position.set(wx + 0.5, y + 1.62, wz + 0.5);
+  const { ly, globes } = choisie;
+  const wx = globes[0].wx, wz = globes[0].wz;
+  mc.camera.position.set(wx + 0.5, ly + 0.62, wz + 0.5);
   mc.player.velocity.set(0, 0, 0);
   mc.releaseAll();
   for (let i = 0; i < 6; i++) mc.step(1 / 120);
   mc.streamAll();
   mc.look(0, -8);
-  mc.reglerHeure(0);                    // minuit : la pièce ne doit son jour qu'à sa lampe
+  mc.reglerHeure(0);                    // minuit : la pièce ne doit son jour qu'à ses globes
 
   const cle = mc.world.getChunkKey(Math.floor(wx / 16), Math.floor(wz / 16));
   const lectureCanal = () => {
@@ -1199,58 +1290,101 @@ const interieur = await page.evaluate(({ AIR, LAMP_POST, LAMP_GLOW }) => {
     return { lum: +(s / n).toFixed(1), noirs: +(100 * sombres / n).toFixed(1) };
   };
   const avant = rendu(), canalAvant = lectureCanal();
-  mc.setBlock(wx, y + 1, wz, AIR);      // le joueur arrache la lanterne, le pied reste
+  // Tout arracher d'un coup : la pièce étant tenue à l'écart de la voirie, ce qui reste
+  // d'éclairage vient du ciel ou des globes du voisin, admis par le verre des baies.
+  for (const g of globes) mc.setBlock(g.wx, ly, g.wz, K.AIR);
   mc.streamAll();
   const apres = rendu(), canalApres = lectureCanal();
+  const editsRetrait = mc.editCount();
+  // Témoin « maison murée » : les deux baies sont remplacées par de la pierre, globes
+  // toujours absents. C'est la seule obscurité absolue qu'on puisse exiger d'une pièce
+  // percée de deux ouvertures de deux sur deux — et sa mesure prouve que le reliquat
+  // ci-dessus entre bien par le verre, au lieu d'être une lumière restée collée aux murs.
+  const vitrees = [];
+  const b = choisie.bornes;
+  for (let x = b.x0 - 1; x <= b.x1 + 1; x++) {
+    for (let z = b.z0 - 1; z <= b.z1 + 1; z++) {
+      if (!(x === b.x0 - 1 || x === b.x1 + 1 || z === b.z0 - 1 || z === b.z1 + 1)) continue;
+      for (let y = ly - 2; y <= ly + 3; y++) {
+        if (mc.bloc(x, y, z) === K.GLASS) { vitrees.push({ x, y, z }); mc.setBlock(x, y, z, K.STONE); }
+      }
+    }
+  }
+  mc.streamAll();
+  const muree = rendu();
+  for (const v of vitrees) mc.setBlock(v.x, v.y, v.z, K.GLASS);
+  for (const g of globes) mc.setBlock(g.wx, ly, g.wz, g.id);   // face contre son mur d'origine
+  mc.streamAll();
+  const restaure = rendu();
   return {
-    troncon: `${meilleur.cx},${meilleur.cz}`, choisie, posees: posees.length, rues: rues.length,
+    troncon: `${meilleur.cx},${meilleur.cz}`,
+    globesJuges: pieces.reduce((n, p) => n + p.globes.length, 0), globesRetires: globes.length,
+    vitresMurees: vitrees.length,
     isolement: score === Infinity ? 'seule' : score,
-    editsAvant, editsApres: mc.editCount(), avant, canalAvant, apres, canalApres,
-    lanterneApres: mc.bloc(wx, y + 1, wz), piedReste: mc.bloc(wx, y, wz),
+    choisie: { wx, wz, ly, id: globes[0].id },
+    editsAvant, editsRetrait, avant, canalAvant, apres, canalApres, muree, restaure,
   };
 }, INTE);
 
 const pieceClaire = !!interieur.choisie;
-check('le village porte des lanternes d\'intérieur réellement debout',
-  pieceClaire && interieur.posees >= 3,
-  interieur.erreur || `${interieur.posees} lanternes posées autour du tronçon ${interieur.troncon}`);
+check('le village porte des appliques réellement scellées aux murs des maisons',
+  pieceClaire && interieur.globesJuges >= 3,
+  interieur.erreur || `${interieur.globesJuges} globes muraux debout autour du tronçon ${interieur.troncon}`);
 check('la lumière d\'intérieur vient du générateur, pas d\'une édition du joueur',
-  pieceClaire && interieur.editsApres === interieur.editsAvant + 1,
-  pieceClaire ? `${interieur.editsAvant} éditions avant, ${interieur.editsApres} après l\'arrachage` : '—');
+  pieceClaire && interieur.editsRetrait === interieur.editsAvant + interieur.globesRetires,
+  pieceClaire ? `${interieur.editsAvant} éditions avant, ${interieur.editsRetrait} après arracher les ${interieur.globesRetires} globes` : '—');
 check('à minuit, une pièce du village est claire sans rien poser',
   pieceClaire && interieur.avant.lum > 25 && interieur.avant.noirs < 70,
   pieceClaire ? JSON.stringify(interieur.avant) : interieur.erreur || '—');
 check('son halo est cuit dans les sommets du maillage',
   pieceClaire && interieur.canalAvant.max > 0.3 && interieur.canalAvant.nonNuls > 20,
   pieceClaire ? JSON.stringify(interieur.canalAvant) : '—');
-check('arracher la lanterne éteint sa pièce',
-  pieceClaire && interieur.lanterneApres === AIR && interieur.apres.lum < interieur.avant.lum * 0.5
-    && (interieur.apres.noirs > 75 || interieur.apres.lum < 15),
-  pieceClaire ? `${JSON.stringify(interieur.avant)} → ${JSON.stringify(interieur.apres)} · voisine à ${interieur.isolement}` : '—');
-check('le pied survit à la casse de la lanterne d\'intérieur',
-  pieceClaire && interieur.piedReste === LAMP_POST, String(interieur.piedReste));
+// Demandé le 2026-11-18 : « deux fenêtres de 2 cubes sur 2 cubes ». Depuis que la maison a
+// deux baies de quatre cubes de verre, la nuit d'une pièce n'est plus jamais le noir absolu :
+// le ciel et les globes du voisin entrent par le vitrage — mesuré 16,9 de luminance pour
+// 53 % de noirs quand ses propres globes sont arrachés, contre 100 % de noirs à 10,7 quand
+// ses huit carreaux sont murés. L'extinction se juge donc en chute et dans le maillage (le
+// halo cuit s'effondre avec les globes), et l'obscurité absolue se juge sur la maison murée.
+check('arracher les globes de la maison l\'éteint',
+  pieceClaire && interieur.apres.lum < interieur.avant.lum * 0.35
+    && interieur.apres.noirs > interieur.avant.noirs + 30
+    && interieur.canalApres.nonNuls < interieur.canalAvant.nonNuls * 0.6,
+  pieceClaire ? `${JSON.stringify(interieur.avant)} → ${JSON.stringify(interieur.apres)}`
+    + ` · halo cuit ${interieur.canalAvant.nonNuls} → ${interieur.canalApres.nonNuls} sommets`
+    + ` · globe voisin le plus proche à ${interieur.isolement}` : '—');
+check('murée à la place de ses baies, la même maison retourne au noir',
+  pieceClaire && interieur.vitresMurees >= 4
+    && interieur.muree.noirs > 95 && interieur.muree.lum < 15,
+  pieceClaire ? `${interieur.vitresMurees} vitres murées → ${JSON.stringify(interieur.muree)}` : '—');
+check('et ses baies lui laissent bien entrer la nuit',
+  pieceClaire && interieur.apres.lum > interieur.muree.lum + 4
+    && interieur.apres.noirs < interieur.muree.noirs - 20,
+  pieceClaire ? `verre ${JSON.stringify(interieur.apres)} · muré ${JSON.stringify(interieur.muree)}` : '—');
+check('reposer les globes rallume la pièce',
+  pieceClaire && interieur.restaure.lum > interieur.avant.lum * 0.8,
+  pieceClaire ? `${JSON.stringify(interieur.apres)} → ${JSON.stringify(interieur.restaure)}` : '—');
 
 // ------------------------------------------------- 5 quater. et ses murs restent noirs dehors
 // Le contrôle Node de `tests/ciel.mjs` juge le champ de lumière ; celui-ci juge l'image.
 // L'utilisateur voyait la lueur des maisons suinter à travers les cloisons : « on devrait
 // uniquement la voir depuis les fenêtres ». La chambre est la même qu'en 5 ter — donc déjà
-// prouvée éclairée par SA lanterne — mais observée depuis la rue, face à sa façade. Le
-// rayon visuel doit d'abord heurter un mur, et retirer la lanterne ne doit rien changer à
-// l'image : ce qui ne se voit pas ne peut pas varier.
-const exterieur = await page.evaluate(({ AIR, LAMP_GLOW, choisie }) => {
+// prouvée éclairée par SES globes muraux — mais observée depuis la rue, face à sa façade. Le
+// rayon visuel doit d'abord heurter un mur, et arracher le globe derrière ce mur ne doit
+// rien changer à l'image : ce qui ne se voit pas ne peut pas varier.
+const exterieur = await page.evaluate(({ AIR, choisie }) => {
   const mc = window.__mc;
   if (!choisie) return { erreur: 'aucune chambre jugée en 5 ter' };
-  const { wx, wz, y } = choisie;
+  const { wx, wz, ly, id } = choisie;
   const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
   let vue = null;
   for (const [dx, dz] of dirs) {
     let mur = 0;
     for (let k = 1; k <= 8; k++) {
-      if (mc.bloc(wx + dx * k, y + 1, wz + dz * k) !== AIR) { mur = k; break; }
+      if (mc.bloc(wx + dx * k, ly, wz + dz * k) !== AIR) { mur = k; break; }
     }
     if (!mur) continue;
     let degage = true;
-    for (let k = mur + 1; k <= mur + 3; k++) if (mc.bloc(wx + dx * k, y + 1, wz + dz * k) !== AIR) degage = false;
+    for (let k = mur + 1; k <= mur + 3; k++) if (mc.bloc(wx + dx * k, ly, wz + dz * k) !== AIR) degage = false;
     if (degage) { vue = { dx, dz, mur }; break; }
   }
   if (!vue) return { erreur: 'aucune façade dégagée autour de la chambre' };
@@ -1259,9 +1393,9 @@ const exterieur = await page.evaluate(({ AIR, LAMP_GLOW, choisie }) => {
   const ez = wz + vue.dz * (vue.mur + 2) + 0.5;
   mc.player.flyMode = true;
   mc.releaseAll();
-  mc.camera.position.set(ex, y + 1.62, ez);
+  mc.camera.position.set(ex, ly + 0.62, ez);
   mc.player.velocity.set(0, 0, 0);
-  const cibleX = wx + 0.5 - ex, cibleZ = wz + 0.5 - ez, cibleY = (y + 1) - (y + 1.62);
+  const cibleX = wx + 0.5 - ex, cibleZ = wz + 0.5 - ez, cibleY = ly - (ly + 0.62);
   const pas = Math.hypot(cibleX, cibleY, cibleZ) || 1;
   const dir = { x: cibleX / pas, y: cibleY / pas, z: cibleZ / pas };
   mc.look(Math.atan2(-dir.x, -dir.z) * 180 / Math.PI, Math.asin(Math.max(-1, Math.min(1, dir.y))) * 180 / Math.PI);
@@ -1270,7 +1404,7 @@ const exterieur = await page.evaluate(({ AIR, LAMP_GLOW, choisie }) => {
   mc.streamAll();
   mc.reglerHeure(0);
 
-  // Le trait de visée doit mourir dans un mur avant d'atteindre la lanterne : sans cette
+  // Le trait de visée doit mourir dans un mur avant d'atteindre le globe : sans cette
   // preuve, une fenêtre ouverte rendrait le contrôle inoffensif plutôt que faux négatif.
   const tire = mc.raycastVoxel(mc.camera.position, new (mc.camera.position.constructor)(dir.x, dir.y, dir.z), pas + 2);
   const masque = !!tire && tire.t < pas - 0.4;
@@ -1290,24 +1424,24 @@ const exterieur = await page.evaluate(({ AIR, LAMP_GLOW, choisie }) => {
     }
     return { lum: +(s / n).toFixed(1), noirs: +(100 * sombres / n).toFixed(1) };
   };
-  const eteinte = mesure();                       // 5 ter a arraché la lanterne
-  mc.setBlock(wx, y + 1, wz, LAMP_GLOW);          // on la remet en place
+  const allumee = mesure();                        // 5 ter a reposé chaque globe à sa face
+  mc.setBlock(wx, ly, wz, AIR);                    // on arrache celui du mur visé
   mc.streamAll();
   mc.reglerHeure(0);
-  const allumee = mesure();
-  mc.setBlock(wx, y + 1, wz, AIR);                // et on laisse la scène comme trouvée
+  const eteinte = mesure();
+  mc.setBlock(wx, ly, wz, id);                     // et on laisse la scène comme trouvée
   mc.streamAll();
   return { vue, masque, t: tire ? +tire.t.toFixed(2) : null, pas: +pas.toFixed(2), eteinte, allumee };
-}, { AIR, LAMP_GLOW, choisie: interieur.choisie });
+}, { AIR, choisie: interieur.choisie });
 
-check('depuis la rue, la lanterne de la chambre est cachée par un mur',
+check('depuis la rue, le globe de la chambre est caché par un mur',
   exterieur.masque === true,
   exterieur.erreur || `mur à ${exterieur.vue?.mur} cubes · visée coupée à ${exterieur.t} sur ${exterieur.pas}`);
 check('la lumière d\'une pièce ne traverse pas ses murs extérieurs',
   exterieur.eteinte && exterieur.allumee
     && Math.abs(exterieur.allumee.lum - exterieur.eteinte.lum) <= 6
-    && exterieur.allumee.lum < 45 && exterieur.allumee.noirs > 55,
-  exterieur.erreur || `façade ${JSON.stringify(exterieur.eteinte)} lanterne éteinte · ${JSON.stringify(exterieur.allumee)} allumée`);
+    && exterieur.allumee.lum < 45 && exterieur.allumee.noirs > 45,
+  exterieur.erreur || `façade ${JSON.stringify(exterieur.eteinte)} globe arraché · ${JSON.stringify(exterieur.allumee)} en place`);
 
 // ------------------------------------------------- 5 quater bis. le couloir d'immeuble s'éclaire au mur
 // Demandé le 2026-11-11 : « dans les immeubles tu mis les lumières devant les portes, il

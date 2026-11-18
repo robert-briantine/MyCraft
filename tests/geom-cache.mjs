@@ -292,6 +292,41 @@ check(
   `à 0 : cache libéré=${reglages.sansCache} · à 64 Mo : budget=${reglages.budget} · relu=${reglages.relu}`,
 );
 
+// ---- la place du fichier se calcule depuis la mémoire ----------------------
+// Ce n'est plus un réglage, donc ce qui doit se lire ici c'est la DÉPENDANCE : trois tas
+// fabriqués de toutes pièces, et à chaque fois le chiffre que les règles du jeu promettent
+// pour ce tas-là — plancher et plafond compris, sinon un budget gravé dans le marbre
+// passerait aussi bien.
+const taille = await page.evaluate(async () => {
+  const mc = window.__mc;
+  const vrai = Object.getOwnPropertyDescriptor(performance, 'memory');
+  const r = mc.geomEtat().reglesBudget;
+  const attendu = (mo) => Math.min(r.plafondMo, Math.max(r.plancherMo, Math.round(mo * r.fraction)));
+  const juges = [];
+  for (const mo of [400, 4096, 16384]) {
+    Object.defineProperty(performance, 'memory', {
+      configurable: true,
+      value: {
+        jsHeapSizeLimit: mo * 1048576,
+        usedJSHeapSize: Math.round(mo * 1048576 * 0.03),
+        totalJSHeapSize: Math.round(mo * 1048576 * 0.05),
+      },
+    });
+    juges.push({ tas: mo, obtenu: await mc.reglerBudgetGeom(null), attendu: attendu(mo) });
+  }
+  // Le vrai tas rendu, la main rendue au calcul : les blocs suivants de la suite doivent
+  // juger le jeu tel qu'il démarre, pas tel que ce contrôle l'a laissé.
+  if (vrai) Object.defineProperty(performance, 'memory', vrai); else delete performance.memory;
+  const relu = await mc.reglerBudgetGeom(null);
+  return { regles: r, juges, relu, note: document.getElementById('geom-note')?.textContent || '' };
+});
+check(
+  "la place du fichier suit la mémoire de l'onglet, palier par palier",
+  taille.juges.every((j) => j.obtenu === j.attendu) && /calculés depuis/.test(taille.note),
+  taille.juges.map((j) => `tas ${j.tas} Mo → ${j.obtenu} Mo (attendu ${j.attendu})`).join(' · ')
+    + ` · rendu ${taille.relu} Mo · « ${taille.note.slice(0, 88)} »`,
+);
+
 // ---- le four de fond taille l'île sans rien peindre à la scène --------------
 // Le joueur veut l'île entière au fichier, taillée derrière lui. Trois promesses se
 // tiennent ou se démentent ici : le four avance vraiment (`faits` compte ce qui est gravé,
@@ -308,6 +343,35 @@ const renduFour = await four.page.evaluate(async () => {
     await new Promise((r) => setTimeout(r, 16));
   }
   mc.cuireGeometrieFond(50);                                   // arme le plan
+  // Le four doit connaître la FRONTIÈRE rendue, pas le carré du champ. S'il ne se défend
+  // que du carré (`radius + MARGE_CHAMP_RENDU`), il refuse de tailler les coins de ce
+  // carré — la zone que la brume efface déjà mais que le rangeur, lui, laisse ouverte — et
+  // le joueur repaie le mailleur (2,5–3,2 ms) dès qu'il y entre, alors que le fichier avait
+  // ces triangles. Jugé sur CET ensemble-là uniquement : compter tout ce qui se grave
+  // au-delà de la brume ne distingue rien, les anneaux loin derrière le joueur étant
+  // taillés par les deux versions (mesuré — le sabotage « carré seul » restait vert).
+  const cuites = { coinsDuCarre: 0, sousLaFrontiere: 0, total: 0 };
+  const rebuildSonde = w.rebuildChunk.bind(w);
+  w.rebuildChunk = (cx, cz, o = {}) => {
+    if (o.horsScene) {
+      const CS = mc.CHUNK_SIZE;
+      const c = w._centre;
+      const borne = c ? c.radius + mc.MARGE_CHAMP_RENDU : -1;
+      const d = c ? Math.max(Math.abs(cx - c.pcx), Math.abs(cz - c.pcz)) : -1;
+      const x0 = cx * CS, z0 = cz * CS;
+      const px = w._camX < x0 ? x0 : (w._camX > x0 + CS ? x0 + CS : w._camX);
+      const pz = w._camZ < z0 ? z0 : (w._camZ > z0 + CS ? z0 + CS : w._camZ);
+      const auCoin = Math.hypot(w._camX - px, w._camZ - pz);
+      const rayon = Number.isFinite(w._brumeCarres) ? Math.sqrt(w._brumeCarres) : Infinity;
+      // Garde : le jeu s'arrête une couronne avant la frontière, donc un tronçon à peine
+      // dehors n'est taillé par PERSONNE (la couronne d'un tronçon vaut 16 cubes le long
+      // d'un axe, 22,6 en diagonale). On ne compte que ce qui est franchement dehors.
+      cuites.total++;
+      if (d >= 0 && d <= borne && auCoin > rayon + 2 * CS) cuites.coinsDuCarre++;
+      else if (auCoin <= rayon) cuites.sousLaFrontiere++;
+    }
+    return rebuildSonde(cx, cz, o);
+  };
   const depart = mc.geomEtat().cuisson?.faits ?? -1;
   const attendus = mc.geomEtat().cuisson?.attendus ?? 0;
   // 70 tours plutôt que 40 : la borne est une patience de harnais, pas une exigence du
@@ -326,7 +390,15 @@ const renduFour = await four.page.evaluate(async () => {
   // Le cumul du four est relevé ICI : plus bas le plan est réarmé pour le geste, et un
   // `faits` lu après l'arme repart de zéro (mesuré « -338 gravés », qui faisait tomber le
   // contrôle de gravure pour une raison de comptabilité, pas de produit).
+  // Les coins du carré sont servis en dernier de leur couronne (la file trie par couronne
+  // puis par distance Manhattan). S'ils manquent encore, on pousse le four jusqu'à un
+  // plafond : sous la panne le compteur ne bougera jamais et la fenêtre reste courte.
+  for (let t = 0; t < 30 && cuites.coinsDuCarre === 0; t++) {
+    mc.cuireGeometrieFond(200);
+    await new Promise((r) => setTimeout(r, 16));
+  }
   const faitsApresBoucle = mc.geomEtat().cuisson?.faits ?? -1;
+  w.rebuildChunk = rebuildSonde;            // la sonde des tailles est rendue avant le geste
   const c = w._centre || { pcx: 0, pcz: 0, radius: 4 };
   let peintsHorsChamp = 0;
   let horsChamp = 0;
@@ -430,7 +502,7 @@ const renduFour = await four.page.evaluate(async () => {
   }
   const sature = mc.geomEtat().cuisson;
   return {
-    depart, attendus, faits: faitsApresBoucle, tours,
+    depart, attendus, faits: faitsApresBoucle, tours, cuites,
     peintsHorsChamp, horsChamp, plusGrosRetenu,
     publies: apres.publies, octets: apres.octets,
     sature: !!sature?.sature, motifSature: sature?.motif || '',
@@ -449,6 +521,18 @@ check(
   'rien de ce que taille le four n\'est peint à la scène',
   renduFour.peintsHorsChamp === 0 && renduFour.horsChamp > 50,
   `${renduFour.peintsHorsChamp} tronçon(s) hors champ avec des triangles sur ${renduFour.horsChamp}`,
+);
+// Le four se défend de la frontière RENDUE (`_montreACamera`), pas du seul carré du champ :
+// sans cette distinction il laisse les coins du carré sans les graver, et le joueur les paie
+// au mailleur en y entrant. Jugé à ce que le four a réellement taillé, pas à son compteur de
+// progression (`faits`, qui compte aussi les sauts).
+check(
+  'le four connaît la frontière rendue : il grave les coins du carré sous la brume',
+  renduFour.cuites.total > 100 && renduFour.cuites.coinsDuCarre > 0
+    && renduFour.cuites.sousLaFrontiere === 0,
+  `${renduFour.cuites.coinsDuCarre} taille(s) dans les coins du carré (hors frontière rendue)`
+    + ` sur ${renduFour.cuites.total} · ${renduFour.cuites.sousLaFrontiere} sous la frontière`
+    + ` (attendu 0 : le flot de rendu les tient)`,
 );
 check(
   'et le four rend la mémoire des tronçons dépassés',
@@ -477,32 +561,32 @@ check(
 );
 
 // ---- la barre de pré-cuisson du menu ---------------------------------------
-// Le joueur a demandé à pouvoir graver l'île PENDANT qu'il attend à l'accueil, avec une
-// barre qui le dit. Ce contexte ne joue donc jamais « Jouer » et rend le voile à son
-// sommeil : la promesse doit tenir sans une seule image rendue.
+// L'île se grave toute seule PENDANT que le joueur attend à l'accueil, avec une barre qui
+// le dit. Ce contexte ne joue donc jamais « Jouer » et rend le voile à son sommeil : la
+// promesse doit tenir sans une seule image rendue — et sans un seul clic, depuis que la
+// pré-cuisson n'est plus un réglage.
 //
 // Deux pièges vérifiés sur place, qui ont rendu ce contexte vert pour rien à la première
 // tentative (il est resté PASS alors que le four du menu était désarmé à la main) :
 //  — `waitForBoot` réveille l'image, et le four d'image en profite pour tailler un lot que
-//    la publication étale APRÈS le coucher du voile : la barre montait toute seule. D'où
-//    `precuire=ignorer` (le four d'image ne s'arme jamais) et un socle pris file vide ;
+//    la publication étale APRÈS le coucher du voile : la barre montait toute seule. D'où un
+//    socle pris file vide ;
 //  — juger le seul compteur de la barre laisserait passer une publication héritée : on
 //    exige aussi que le compteur propre au four (`faits`) ait bougé pendant la fenêtre.
-const menu = await openGame(`${URL}/?geom=auto&precuire=ignorer`);
+const menu = await openGame(`${URL}/?geom=auto&precuire=auto`);
 await menu.page.evaluate(() => window.__mc.image(false));   // waitForBoot réveille : ici on veut dormir
 const barreMenu = await menu.page.evaluate(async () => {
   const mc = window.__mc, w = mc.world;
   const frame = () => new Promise((r) => requestAnimationFrame(() => r()));
   const attendre = async (ms) => { const t0 = performance.now(); while (performance.now() - t0 < ms) await frame(); };
-  const bouton = document.getElementById('geom-precuire-ile');
   let garde = 0;                                            // socle : plus rien en route vers le disque
   while ((w.geomEnAttente.size || mc.geomEtat().enCours) && garde++ < 60) await attendre(250);
   const avant = mc.geomBarre();
   const socle = avant?.prets ?? -1;
   const faitsSocle = w.etatCuissonIle()?.faits ?? 0;
   const imagesAvant = mc.framesRendues();
-  bouton?.click();                                          // le geste du joueur, pas un hook
-  const arme = mc.geomBarre();
+  // Rien n'est pressé, aucun crochet n'arme le four : cette fenêtre juge précisément
+  // qu'il part seul. Il ne reste à juger que l'arrêt, par le levier des suites.
   const t0 = performance.now();
   let imagesFigees = true;
   let horsJeuToujours = true;
@@ -514,15 +598,23 @@ const barreMenu = await menu.page.evaluate(async () => {
   const pendant = mc.geomBarre();
   const cuisson = w.etatCuissonIle();
   const faitsPendantFenetre = (cuisson?.faits ?? 0) - faitsSocle;
-  bouton?.click();                                          // suspendre
+  const arme = mc.precuireIleMaintenant(false);             // l'équivalent du second clic
   const faitsAlSuspension = w.etatCuissonIle()?.faits ?? 0;
   await attendre(6000);
   // Le cumul se lit AVANT d'éteindre le cache : `reglerBudgetGeom(0)` met le plan à néant,
   // et un `faits` lu après coup vaudrait 0 — mesuré « -289 gravés après le second clic »,
   // qui faisait tomber le contrôle pour une raison de comptabilité, pas de produit.
   const faitsApresSuspension = (w.etatCuissonIle()?.faits ?? 0) - faitsAlSuspension;
-  // Et si le joueur ne veut pas du cache du tout, la barre doit se retirer plutôt que
-  // de traîner un 0 % sans explication.
+  // La place et sa phrase se lisent AVANT d'éteindre le cache : `reglerBudgetGeom(0)` fait
+  // retomber `budgetMo` à zéro et la note sur « Cache éteint », qui ne dit plus rien de la
+  // règle censée calculer la place depuis le tas autorisé.
+  const place = {
+    budget: mc.geomEtat().budgetMo,
+    budgetCalcule: mc.geomEtat().budgetCalcule,
+    note: document.getElementById('geom-note')?.textContent || '',
+  };
+  // Et si le cache n'a plus de place du tout, la barre doit se retirer plutôt que de
+  // traîner un 0 % sans explication.
   await mc.reglerBudgetGeom(0);
   const sansCache = mc.geomBarre();
   return {
@@ -534,7 +626,7 @@ const barreMenu = await menu.page.evaluate(async () => {
     imagesFigees, horsJeuToujours,
     secondes: +((performance.now() - t0) / 1000).toFixed(1),
     octets: mc.geomEtat().octets,
-    libelle: bouton?.textContent.trim(),
+    ...place,
     faitsApresSuspension,
   };
 });
@@ -553,15 +645,14 @@ check(
   `aria=${barreMenu.avant?.aria} · ${barreMenu.avant?.texte}`,
 );
 check(
-  'pré-cuire depuis l\'accueil grave l\'île sans jamais rendre une image',
+  'posé à l\'accueil, le four grave l\'île tout seul sans jamais rendre une image',
   barreMenu.delta >= 48 && barreMenu.faitsPendantFenetre > 0
-    && barreMenu.imagesPendantFenetre === 0 && barreMenu.imagesFigees && barreMenu.horsJeuToujours
-    && barreMenu.arme?.pleine === barreMenu.avant?.pleine,
+    && barreMenu.imagesPendantFenetre === 0 && barreMenu.imagesFigees && barreMenu.horsJeuToujours,
   `${barreMenu.socle} → ${barreMenu.pendant?.prets} tronçons prêts (+${barreMenu.delta}) en `
     + `${barreMenu.secondes} s · le four a compté ${barreMenu.faitsPendantFenetre} gravure(s)`
     + ` · ${(barreMenu.octets / 1024) | 0} Ko au fichier`
     + ` · ${barreMenu.imagesPendantFenetre} image(s) rendue(s) pendant la fenêtre`
-    + ` · hors-jeu=${barreMenu.horsJeuToujours} · au clic ${barreMenu.arme?.pleine}`,
+    + ` · hors-jeu=${barreMenu.horsJeuToujours}`,
 );
 check(
   'la barre affiche ce que porte le disque',
@@ -572,9 +663,17 @@ check(
     + ` · disque ${barreMenu.pendant?.prets} · ${barreMenu.pendant?.texte}`,
 );
 check(
-  'le même bouton suspend la pré-cuisson',
-  barreMenu.libelle.startsWith('⚙') && barreMenu.faitsApresSuspension === 0,
-  `bouton « ${barreMenu.libelle} » · ${barreMenu.faitsApresSuspension} tronçon(s) gravé(s) après le second clic`,
+  'désarmé, le four de fond ne grave plus un tronçon',
+  barreMenu.arme === false && barreMenu.faitsApresSuspension === 0,
+  `four désarmé=${barreMenu.arme} · ${barreMenu.faitsApresSuspension} tronçon(s) gravé(s) après l'arrêt`,
+);
+// La taille du fichier n'est plus un réglage : elle sort du tas autorisé par le navigateur,
+// comme celle des géométries en RAM. Le joueur doit pouvoir lire d'où vient le chiffre —
+// sinon un cache qui s'arrête à mi-île ressemble à une panne.
+check(
+  'la place du fichier est calculée depuis la mémoire de l\'onglet et le dit',
+  barreMenu.budget > 0 && /calculés depuis/.test(barreMenu.note) && !!barreMenu.budgetCalcule,
+  `${barreMenu.budget} Mo · ${barreMenu.budgetCalcule} · « ${barreMenu.note.slice(0, 96)} »`,
 );
 check(
   'cache éteint : la barre de pré-cuisson se retire du menu',

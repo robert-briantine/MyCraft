@@ -141,6 +141,11 @@ const VILLAGE_DEFS = {
   // normalisée, la catégorie est refusée et le tirage retombe sur la plus basse.
   towerUrbanGate: [0, 0.1, 0.18, 0.28, 0.38, 0.5],
   houseMinH: 3, houseMaxH: 6,
+  // Les deux baies que porte chaque maison, demandées le 2026-11-18 : « deux fenêtres de
+  // 2 cubes sur 2 cubes comme dans les pièces d'immeuble et pas des petites fenêtres de
+  // 1 cube ». La hauteur se compte avec son appui et son linteau : deux cubes de vitre
+  // encadrés de deux cubes de mur, ce qui interdit de percer la dernière rangée.
+  maisonBaieLargeur: 2, maisonBaieHauteur: 2,
   cityCell: 176,     // maille basse fréquence où l'on tire l'emplacement des villes
   cityChance: 0.5,   // part des mailles qui reçoivent un centre-bourg
   // Trois types de ville — demandé le 2026-11-11 : « tu pourrais ajouter 3 type de ville
@@ -1125,6 +1130,115 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
   }
 
   /**
+   * Les deux baies que porte une maison, en coordonnées locales du plan. Demandé le
+   * 2026-11-18 : « revoie la construction des maisons pour avoir deux fenêtres de 2 cubes
+   * sur 2 cubes comme dans les pièces d'immeuble et pas des petites fenêtres de 1 cube ».
+   * Le quinconce qui perçait un cube sur deux à partir de la deuxième rangée ne dessinait
+   * aucune fenêtre : depuis la rue, une façade criblée de trous ponctuels, et la pièce
+   * éclairée par six soupiraux au lieu de deux ouvertures.
+   *
+   * Trois règles tiennent le dessin, dans l'ordre où elles cèdent :
+   *  - les deux baies se posent sur la **façade sur rue**, de part et d'autre de la porte ;
+   *  - une baie ne touche **pas un angle** et ne jouxte **pas la colonne de la porte**, qui
+   *    sinon ne garderait qu'un montant d'un cube entre le battant et la vitre — mais ces
+   *    deux gardes sont des préférences : une façade de cinq ou six colonnes ne peut pas
+   *    les tenir toutes les deux autour d'une porte centrale, et la laisser tomber jusqu'au
+   *    pignon coûtait plus cher que l'angle lâché (mesuré : 122 maisons sur 139 sans aucune
+   *    baie sur leur façade sur rue). La colonne de la porte, elle, reste toujours pleine ;
+   *  - sa tablette tombe **à hauteur d'yeux** (deux cubes au-dessus du plancher), sous une
+   *    rangée pleine qui fait linteau jusqu'au toit — la dernière rangée reste donc mur,
+   *    comme le juge déjà la batterie ;
+   *  - faute de place sur la façade sur rue, la baie manquante descend sur un **pignon**,
+   *    puis sur la façade arrière : c'est le nombre qui est demandé, pas l'endroit.
+   */
+  function planBaiesMaison({ x0, z0, w, d, siteH, height, doorSide, door }) {
+    const L = VILLAGE.maisonBaieLargeur, H = VILLAGE.maisonBaieHauteur;
+    const faces = {
+      0: { cle: 0, n: w, cell: (j) => ({ lx: x0 + j, lz: z0 }) },
+      2: { cle: 2, n: w, cell: (j) => ({ lx: x0 + j, lz: z0 + d - 1 }) },
+      1: { cle: 1, n: d, cell: (j) => ({ lx: x0, lz: z0 + j }) },
+      3: { cle: 3, n: d, cell: (j) => ({ lx: x0 + w - 1, lz: z0 + j }) },
+    };
+    const faceRue = faces[doorSide];
+    const jPorte = (doorSide === 0 || doorSide === 2 ? door.lx : door.lz) - (doorSide === 0 || doorSide === 2 ? x0 : z0);
+    // Les départs de baie possibles d'une face, du plus tenus au plus souple : jamais sur
+    // un angle ni contre un interdit d'abord, puis en laissant l'angle si la façade est
+    // courte. Une façade de cinq colonnes avec sa porte au centre ne peut pas aligner
+    // deux baies de deux sans toucher l'angle — exiger l'angle plein la condamnait au
+    // pignon (mesuré : 122 maisons sur 139), ce qui vide la demande de son sens.
+    const portees = (f, interdits, anglesLibres = false) => {
+      const hors = new Set(interdits);
+      const out = [];
+      for (let j = 0; j + L <= f.n; j++) {
+        if (!anglesLibres && (j === 0 || j + L === f.n)) continue;
+        let libre = true;
+        for (let k = j; k < j + L; k++) if (hors.has(k)) libre = false;
+        if (libre) out.push(j);
+      }
+      return out;
+    };
+    // Tablette à hauteur d'yeux — une rangée pleine sous la vitre fait l'appui, une autre
+    // au-dessus fait linteau, et la dernière rangée du mur reste pleine comme le juge déjà
+    // la batterie. Une maison de trois cubes n'a qu'une rangée entre les deux : elle prend
+    // celle-là plutôt que de rester aveugle.
+    const yBas = siteH + 2;
+    const yHaut = Math.min(siteH + 1 + H, siteH + height - 1);
+    const candidats = [];
+    // Trois paliers sur la façade sur rue : montant gardé des deux côtés de la porte, puis
+    // angle lâché, puis montant lâché — la colonne de la porte elle-même reste toujours
+    // pleine. Les paliers sont explorés dans cet ordre, donc la lecture tenue gagne dès
+    // qu'elle tient ; c'est le repli qui coûte, jamais la règle.
+    const paliers = [
+      { interdits: [jPorte - 1, jPorte, jPorte + 1], angles: false },
+      { interdits: [jPorte - 1, jPorte, jPorte + 1], angles: true },
+      { interdits: [jPorte], angles: true },
+    ];
+    for (const t of paliers) {
+      const toutes = portees(faceRue, t.interdits, t.angles);
+      const gauche = toutes.filter((j) => j + L - 1 < jPorte).sort((a, b) => b - a);
+      const droite = toutes.filter((j) => j > jPorte);
+      // D'abord un cadre de chaque côté de la porte — la lecture demandée —, ensuite les
+      // portées suivantes du même côté, jamais collées à la première.
+      candidats.push(
+        ...[gauche[0], droite[0]].filter((j) => j !== undefined).map((j) => ({ f: faceRue, j })),
+        ...gauche.slice(1).map((j) => ({ f: faceRue, j })),
+        ...droite.slice(1).map((j) => ({ f: faceRue, j })),
+      );
+    }
+    // Pignons d'abord, puis la façade arrière : chacun centré sur sa portée la plus tenue.
+    for (const cle of [(doorSide + 1) % 4, (doorSide + 3) % 4, (doorSide + 2) % 4]) {
+      const f = faces[cle];
+      const milieu = (f.n - L) / 2;
+      for (const j of portees(f, []).sort((a, b) => Math.abs(a - milieu) - Math.abs(b - milieu))) {
+        candidats.push({ f, j });
+      }
+    }
+    const retenues = [];
+    const percees = new Set();
+    for (const c of candidats) {
+      if (retenues.length >= 2) break;
+      const cleFace = `${c.f.cle}`;
+      let genante = false;
+      for (const deja of retenues) {
+        if (deja.f !== c.f) continue;
+        // Sur une même face, deux baies doivent garder un montant entre elles.
+        if (Math.abs(deja.j - c.j) < L + 1) genante = true;
+      }
+      if (genante || percees.has(`${cleFace}:${c.j}`)) continue;
+      percees.add(`${cleFace}:${c.j}`);
+      retenues.push(c);
+    }
+    const cellules = [];
+    for (const c of retenues) {
+      for (let k = c.j; k < c.j + L; k++) {
+        const p = c.f.cell(k);
+        cellules.push({ lx: p.lx, lz: p.lz, yBas, yHaut, face: c.f.cle });
+      }
+    }
+    return cellules;
+  }
+
+  /**
    * La pente d'amont enterre-t-elle ce gabarit ? Le plancher se cale sur la médiane du
    * relief de la bande, donc la colline qui domine le bâtiment n'est jamais bornée par
    * `reliefPorteur`, qui ne regarde que l'intérieur de l'emprise : mesuré sur la carte du
@@ -1481,6 +1595,11 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
         if (height + 2 <= gravissable) height += roll(baseX + i, 6, baseZ, SALT_HEIGHT) < 0.5 ? 1 : 2;
       } else {
         height = between(VILLAGE.houseMinH, VILLAGE.houseMaxH, baseX + i, 5, baseZ, SALT_HEIGHT);
+        // Une maison se hausse d'un cran si son tirage ne laissait pas la place de ses deux
+        // baies de deux sur deux : deux cubes de vitre demandent un appui dessous et un
+        // linteau dessus, soit quatre cubes de mur. Rabaisser la baie à une lucarne aurait
+        // fait exactement ce que la demande refuse (« pas des petites fenêtres de 1 cube »).
+        height = Math.max(height, VILLAGE.maisonBaieHauteur + 2);
       }
       height = Math.min(height, ceiling);
       if (height < VILLAGE.houseMinH) return null;
@@ -1577,6 +1696,9 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
         window: BLOCK.GLASS,
         doorSide,
         door,
+        // Les deux baies de deux sur deux de la maison ; l'immeuble a déjà ses baies de
+        // quatre par pièce (`appartements.pieces[].baie`) et garde son quinconce d'angle.
+        baies: estTour ? null : planBaiesMaison({ x0, z0, w, d, siteH, height, doorSide, door }),
         stair,
         appartements,
         stairBlock: BLOCK.PLANKS,
@@ -2053,20 +2175,31 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
       }
     }
 
-    // 2) Murs d'enceinte, avec fenêtres en quinconce.
+    // 2) Murs d'enceinte. La maison se perce de ses deux baies de deux sur deux
+    //    (`plan.baies`, voir `planBaiesMaison`) ; l'immeuble garde le quinconce d'angle,
+    //    qui habille ses tours là où les pièces ont déjà leur baie de quatre.
+    const vitrages = plan.kind === 'house' && plan.baies && plan.baies.length
+      ? new Map(plan.baies.map((b) => [`${b.lx},${b.lz}`, b]))
+      : null;
     for (let lx = x0; lx < x0 + w; lx++) {
       for (let lz = z0; lz < z0 + d; lz++) {
         if (!isPerimeter(lx, lz)) continue;
+        const baie = vitrages && vitrages.get(`${lx},${lz}`);
         for (let y = siteH + 1; y <= siteH + height; y++) {
           const storey = y - siteH;
           // La rangée qui repose sur une dalle reste pleine : depuis la rue elle se lit
           // comme le plancher, et les étages d'une tour de dix niveaux sont comptables
           // de l'extérieur au lieu d'un damier continu.
           const underSlab = (storey - 1) % VILLAGE.floorPitch === 0;
-          const glazed = storey >= 2
-            && storey <= height - 1
-            && !underSlab
-            && ((lx + lz + storey) % 2 === 0);
+          // Une maison qui porte ses baies ne se perce nulle part ailleurs : le quinconce
+          // rendait à ses deux ouvertures un champ de trous ponctuels autour d'elles.
+          const glazed = baie
+            ? y >= baie.yBas && y <= baie.yHaut
+            : !vitrages
+              && storey >= 2
+              && storey <= height - 1
+              && !underSlab
+              && ((lx + lz + storey) % 2 === 0);
           set(lx, y, lz, glazed ? plan.window : plan.wall);
         }
       }
@@ -2458,6 +2591,61 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
   }
 
   /**
+   * Les pièces d'une maison qui doivent leur lumière au mur, comme celles de l'immeuble.
+   * Demandé le 2026-11-18 : « mets des appliques dans toutes les maisons à la place d'un
+   * lampadaire au milieu qui bouche le passage ». Le poteau occupe **toute** sa case à la
+   * marche — la collision se juge à la cellule, jamais à la silhouette fine du bloc — et
+   * la pose exigeait les quatre voisins libres au niveau du pied : il ne pouvait donc
+   * jamais s'adosser à un mur et se retrouvait fatalement au centre, où le joueur butait
+   * en traversant la pièce.
+   *
+   * Une maison n'a pas de plan de pièces (contrairement à l'appartement) : son emprise
+   * intérieure, évidée d'un cube sur chaque bord, tient lieu de pièce, à chaque hauteur où
+   * l'on marche. En restent exclues, comme pour `airesInterieures`, la volée de l'escalier
+   * et les trois cases de l'ébrasement de la porte — une applique y pendrait devant le
+   * battant.
+   */
+  function piecesDeMaisonSur(x0, z0, x1, z1) {
+    const groupes = [];
+    for (let cx = Math.floor(x0 / CHUNK_SIZE); cx <= Math.floor(x1 / CHUNK_SIZE); cx++) {
+      for (let cz = Math.floor(z0 / CHUNK_SIZE); cz <= Math.floor(z1 / CHUNK_SIZE); cz++) {
+        // `plan.x0` est relatif au tronçon qui a conçu le plan : c'est l'origine du
+        // propriétaire qu'il faut ajouter, jamais celle du tronçon parcouru ici.
+        const ox = cx * CHUNK_SIZE, oz = cz * CHUNK_SIZE;
+        for (const p of buildingAt(cx, cz)) {
+          if (p.appartements) continue;   // l'immeuble a déjà ses couloirs et ses pièces
+          const fenetre = p.window ?? BLOCK.GLASS;
+          const interdits = new Set();
+          if (p.stair) for (const c of p.stair.cells) interdits.add(`${ox + c.lx},${oz + c.lz}`);
+          if (p.door) {
+            for (const c of [p.door.baie, p.door.front, p.door.in]) {
+              if (c) interdits.add(`${ox + c.lx},${oz + c.lz}`);
+            }
+          }
+          for (const y of niveauxDeMarche(p)) {
+            const cellules = [];
+            let xa = Infinity, xb = -Infinity, za = Infinity, zb = -Infinity;
+            for (let lx = p.x0 + 1; lx < p.x0 + p.w - 1; lx++) {
+              for (let lz = p.z0 + 1; lz < p.z0 + p.d - 1; lz++) {
+                const wx = ox + lx, wz = oz + lz;
+                if (interdits.has(`${wx},${wz}`)) continue;
+                cellules.push({ wx, wz });
+                if (wx < xa) xa = wx;
+                if (wx > xb) xb = wx;
+                if (wz < za) za = wz;
+                if (wz > zb) zb = wz;
+              }
+            }
+            if (!cellules.length) continue;
+            groupes.push({ cellules, y, w: xb - xa + 1, d: zb - za + 1, fenetre });
+          }
+        }
+      }
+    }
+    return groupes;
+  }
+
+  /**
    * Toutes les cases où une applique murale pourrait tenir, en coordonnées monde. Comme
    * `lampesInterieuresSur`, c'est une liste de **candidates** : le halo du maillage la
    * filtre à la cellule réellement occupée par un luminaire. Le `y` rendu est déjà la
@@ -2466,7 +2654,11 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
   function appliquesMuralesSur(x0, z0, x1, z1) {
     const vus = new Set();
     const trouves = [];
-    const espaces = [...couloirsSur(x0, z0, x1, z1), ...piecesDImmeubleSur(x0, z0, x1, z1)];
+    const espaces = [
+      ...couloirsSur(x0, z0, x1, z1),
+      ...piecesDImmeubleSur(x0, z0, x1, z1),
+      ...piecesDeMaisonSur(x0, z0, x1, z1),
+    ];
     for (const co of espaces) {
       for (const c of co.cellules) {
         if (c.wx < x0 || c.wx > x1 || c.wz < z0 || c.wz > z1) continue;
@@ -2480,50 +2672,20 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
   }
 
   /**
-   * Les pièces à éclairer, en coordonnées monde : emprise intérieure de chaque bâtiment
-   * à chaque niveau où l'on marche, plus la nef des temples. Un cube de retrait sur
-   * chaque bord — jamais de poteau dans une cloison ni dans le battant d'une porte.
-   * Rien n'est tiré au sort ici : la place se juge case par case, et le tirage ne sert
-   * qu'à décaler l'ordre d'arpentage (`stampLamps`), donc deux maisons voisines ne
-   * s'éclairent pas au même quart de cube.
+   * Les places où un **candélabre** (poteau + lanterne) peut encore se dresser : la nef
+   * des temples, du naos à la première colonnade. Rien d'autre.
+   *
+   * Les maisons y avaient droit depuis le 2026-11-11 et s'en plaignaient depuis : le
+   * poteau occupe toute sa case à la marche et la pose exige ses quatre voisins libres,
+   * donc il tombait fatalement au milieu de la pièce et barrait le passage (demandé le
+   * 2026-11-18 : « des appliques dans toutes les maisons à la place d'un lampadaire au
+   * milieu qui bouche le passage »). Elles sont passées aux appliques murales, comme les
+   * immeubles avant elles (`piecesDeMaisonSur`, `piecesDImmeubleSur`). Le temple garde son
+   * candélabre : sa nef est large, son axe de porte est tenu libre, et le contrôle en
+   * marche (`on entre dans un temple en marchant`) n'a jamais signalé de blocage.
    */
   function airesInterieures(x0, z0, x1, z1) {
     const aires = [];
-    for (let cx = Math.floor(x0 / CHUNK_SIZE); cx <= Math.floor(x1 / CHUNK_SIZE); cx++) {
-      for (let cz = Math.floor(z0 / CHUNK_SIZE); cz <= Math.floor(z1 / CHUNK_SIZE); cz++) {
-        // `plan.x0` est relatif au tronçon qui a conçu le plan (voir `stampBuilding`) :
-        // c'est l'origine de ce propriétaire qu'il faut ajouter, jamais celle du tronçon
-        // parcouru ici — sinon les pièces chercheraient leur lumière à côté du bâti.
-        const ox = cx * CHUNK_SIZE, oz = cz * CHUNK_SIZE;
-        for (const p of buildingAt(cx, cz)) {
-          // L'immeuble en appartements ne se meuble pas de candélabres : ses pièces font
-          // quatre cases libres et le poteau occupe toute la sienne à la marche, donc il
-          // condamnait l'entrée d'une porte après l'autre. Il ne porte que des appliques
-          // (`piecesDImmeubleSur`), qui ne touchent pas au passage.
-          if (p.appartements) continue;
-          const niveaux = niveauxDeMarche(p);
-          // Les circulations sont hors d'atteinte. Une marche offre exactement le profil
-          // qu'exige la pose — dalle dessous, vide au-dessus, voisins libres, puisque la
-          // volée monte en diagonale — et le poteau qui s'y asseoit barre l'escalier
-          // (mesuré : `bloqué à la marche 17`, `sous une voûte=2`). Idem pour le seuil :
-          // la colonne où l'on se tient en entrant n'est pas une place de candélabre.
-          const interdits = new Set();
-          if (p.stair) for (const c of p.stair.cells) interdits.add(`${ox + c.lx},${oz + c.lz}`);
-          if (p.door) {
-            for (const c of [p.door.baie, p.door.front, p.door.in]) {
-              if (c) interdits.add(`${ox + c.lx},${oz + c.lz}`);
-            }
-          }
-          for (const y of niveaux) {
-            aires.push({
-              ax: ox + p.x0 + 1, az: oz + p.z0 + 1,
-              w: p.w - 2, d: p.d - 2, y, interdits,
-              cle: `${ox + p.x0},${oz + p.z0},${y}`,
-            });
-          }
-        }
-      }
-    }
     // Temples : la nef, du naos à la première colonnade, sur le dallage du socle.
     for (const t of templesSur(x0, z0, x1, z1)) {
       const demi = VILLAGE.templeCellaHalf + 1;
@@ -2624,16 +2786,17 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
       if (lx < 0 || lx >= CHUNK_SIZE || lz < 0 || lz >= CHUNK_SIZE) continue;
       if (poseLibre(lx, lz, l.y, false)) { poses++; posees.push({ wx: l.wx, wz: l.wz, y: l.y }); }
     }
-    // Lumière d'intérieur, après la voirie : là où les deux prétendent à la même case,
-    // c'est le candélabre de rue qui garde la place, la pièce en trouvant une autre.
+    // Candélabres des temples, après la voirie : là où les deux prétendent à la même case,
+    // c'est le lampadaire de rue qui garde la place (voir `airesInterieures` — maisons et
+    // immeubles ne passent plus par ici, ils sont éclairés du mur).
     //
-    // La pièce est arpentée case par case et la première conforme gagne la lanterne,
-    // plutôt qu'un treillis posé sur le plan entier. Un treillis de trois cubes dans une
-    // pièce de quatre cases libres n'en propose qu'une sur neuf (mesuré sur 139 maisons :
-    // toutes comptaient de 2 à 19 cases conformes, mais 85 ne voyaient jamais leur
-    // treillis en rencontrer une) — la maisonnée restait noire sans qu'aucune règle ne
-    // le lui interdise. L'ordre d'arpentage seul se tire au sort, donc deux pièces
-    // semblables ne portent pas leur lampe au même quart de cube.
+    // La nef est arpentée case par case et la première conforme gagne la lanterne, plutôt
+    // qu'un treillis posé sur le plan entier. Un treillis de trois cubes dans une pièce de
+    // quatre cases libres n'en propose qu'une sur neuf (mesuré sur 139 maisons : toutes
+    // comptaient de 2 à 19 cases conformes, mais 85 ne voyaient jamais leur treillis en
+    // rencontrer une) — la pièce restait noire sans qu'aucune règle ne le lui interdise.
+    // L'ordre d'arpentage seul se tire au sort, donc deux nefs semblables ne portent pas
+    // leur lampe au même quart de cube.
     for (const a of airesInterieures(baseX, baseZ, baseX + CHUNK_SIZE - 1, baseZ + CHUNK_SIZE - 1)) {
       if (a.w <= 0 || a.d <= 0) continue;
       const rX = Math.floor(roll(a.ax, 5, a.az, SALT_LAMPE_INTE) * a.w);
@@ -2650,13 +2813,13 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
         }
       }
     }
-    // Appliques murales des immeubles : couloirs, pièces et hall. Le poteau est banni de
-    // ces bâtiments (voir `airesInterieures`) — il fait deux cubes de large là où le
-    // passage en fait deux, et sa case compte pleine à la marche — donc toute la lumière
-    // d'un immeuble vient du mur : une applique toutes les `appliquePas` colonnes, scellée
-    // face au mur qui la porte. L'ébrasement d'une porte est creusé sur trois cubes : le
-    // voisin du fond n'y est pas plein, la case renonce donc d'elle-même et aucune applique
-    // ne se retrouve jamais dans un passage de porte.
+    // Appliques murales : couloirs, pièces et halls d'immeuble, puis les pièces des
+    // maisons. Le poteau est banni de tout bâti (voir `airesInterieures`) — il occupe toute
+    // sa case à la marche, là où le passage en fait deux, et se retrouvait au centre des
+    // pièces — donc toute la lumière intérieure vient du mur : une applique toutes les
+    // `appliquePas` colonnes, scellée face au mur qui la porte. L'ébrasement d'une porte
+    // est creusé sur trois cubes : le voisin du fond n'y est pas plein, la case renonce
+    // donc d'elle-même et aucune applique ne se retrouve jamais dans un passage de porte.
     let appliques = 0;
     if (desAppliques) {
       const pasA = VILLAGE.appliquePas;
@@ -2664,6 +2827,7 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
       const espaces = [
         ...couloirsSur(baseX, baseZ, baseX + CHUNK_SIZE - 1, baseZ + CHUNK_SIZE - 1),
         ...piecesDImmeubleSur(baseX, baseZ, baseX + CHUNK_SIZE - 1, baseZ + CHUNK_SIZE - 1),
+        ...piecesDeMaisonSur(baseX, baseZ, baseX + CHUNK_SIZE - 1, baseZ + CHUNK_SIZE - 1),
       ];
       for (const co of espaces) {
         if (!co.cellules.length) continue;
@@ -4803,10 +4967,52 @@ export function createVillageGen({ BLOCK, CHUNK_SIZE, CHUNK_HEIGHT, heightAt, ro
     return ecrits;
   }
 
+  /**
+   * Les volumes d'intérieur d'un quartier, en coordonnées monde continues : une boîte par
+   * bâtiment, du plancher à la sous-face du toit. Ce ne sont pas des pièces — les cloisons
+   * traversent la boîte — mais l'enveloppe que le toit abrite. Le client y retire la pluie
+   * image après image : le clip de pièce, centré sur la caméra, ne protégeait que la pièce
+   * où le joueur tient, et depuis la rue la maison entière se mettait à tremper sous ses
+   * yeux (mesuré le 2026-11-18 : six gouttes sur six dans une maison de 12×4 vue du
+   * trottoir, onze sur onze dans un corps de 3×11 — le vitrage écrivant sa profondeur
+   * après le rideau, rien ne les retenait).
+   */
+  function enveloppesSur(x0, z0, x1, z1) {
+    const boites = [];
+    const vues = new Set();
+    for (let cx = Math.floor(x0 / CHUNK_SIZE); cx <= Math.floor(x1 / CHUNK_SIZE); cx++) {
+      for (let cz = Math.floor(z0 / CHUNK_SIZE); cz <= Math.floor(z1 / CHUNK_SIZE); cz++) {
+        // Comme pour les pièces : `p.x0` est relatif au tronçon propriétaire du plan.
+        const ox = cx * CHUNK_SIZE, oz = cz * CHUNK_SIZE;
+        for (const p of buildingAt(cx, cz)) {
+          if (!p.w || !p.d || !Number.isFinite(p.siteH) || !Number.isFinite(p.height)) continue;
+          const bx0 = ox + p.x0, bz0 = oz + p.z0;
+          const cle = `${bx0},${bz0},${p.w},${p.d},${p.siteH}`;
+          if (vues.has(cle)) continue;           // un plan se déclare depuis ses quatre tronçons voisins
+          vues.add(cle);
+          boites.push({
+            x0: bx0, y0: p.siteH + 1, z0: bz0,
+            x1: bx0 + p.w, y1: p.siteH + p.height + 1, z1: bz0 + p.d,
+            type: p.appartements ? 'immeuble' : 'maison',
+          });
+        }
+      }
+    }
+    const demi = VILLAGE.templeCellaHalf + 1;
+    for (const t of templesSur(x0, z0, x1, z1)) {
+      boites.push({
+        x0: t.ex - demi, y0: t.socle + 1, z0: t.ez - demi,
+        x1: t.ex + demi + 1, y1: t.socle + VILLAGE.templeHeight + 1, z1: t.ez + demi + 1,
+        type: 'temple',
+      });
+    }
+    return boites;
+  }
+
   return {
     roadKind, buildingAt, stampBuilding, stampRoads, stampStructures, structuresAt,
     stampLamps, lampadairesSur, lampesInterieuresSur, appliquesMuralesSur, couloirsSur,
-    piecesDImmeubleSur,
+    piecesDImmeubleSur, piecesDeMaisonSur, enveloppesSur,
     bridgeAt, archAt, templeAt, templesSur, bridgeUnderside, isOccupied, blocksVegetation,
     templeLePlusProche, pointDansTemple, apparitionDansTemple,
     templeStone, statueStone, statueAt, statuesSur, statueGenantSur, cityInfluence, cityTypeAt, VILLAGE, alpage,
